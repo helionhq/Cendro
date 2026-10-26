@@ -138,11 +138,23 @@ describe("task evidence", () => {
       taskId: jdId,
       evidence: { text: "Admin proof." },
     })).rejects.toThrow("This task was already completed with different evidence.");
+    // A matching retry must not bump the task row when it already matches.
+    const jdUpdatedAt = Date.now() - 60_000;
+    await f.t.run(async (ctx) => ctx.db.patch(jdId, { updatedAt: jdUpdatedAt }));
     await expect(employee.mutation(api.tasks.completeJd, {
       companyId: f.companyA,
       taskId: jdId,
       evidence: { text: "Employee proof." },
     })).resolves.toBeNull();
+    expect(await f.t.run(async (ctx) => ctx.db.get(jdId))).toMatchObject({ status: "completed", updatedAt: jdUpdatedAt });
+    // A drifted status is still repaired by the same retry.
+    await f.t.run(async (ctx) => ctx.db.patch(jdId, { status: "due" }));
+    await employee.mutation(api.tasks.completeJd, {
+      companyId: f.companyA,
+      taskId: jdId,
+      evidence: { text: "Employee proof." },
+    });
+    expect((await f.t.run(async (ctx) => ctx.db.get(jdId)))?.status).toBe("completed");
     const jdEvidence = await evidenceFor("jd", jdId);
     expect(jdEvidence).toHaveLength(1);
     expect(jdEvidence[0].text).toBe("Employee proof.");

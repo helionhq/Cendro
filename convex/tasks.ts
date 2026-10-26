@@ -1317,7 +1317,11 @@ async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId:
     await deleteActiveTaskEvidence(ctx, "jd", taskId, cycle.start);
     if (existing) await ctx.db.delete(existing._id);
   }
-  await ctx.db.patch(taskId, { status, statusCycleStart: cycle.start, updatedAt: now });
+  // A retry against a task row that already carries this status and cycle is
+  // a no-op; only inconsistent rows (e.g. a drifted status) need the write.
+  if (task.status !== status || task.statusCycleStart !== cycle.start) {
+    await ctx.db.patch(taskId, { status, statusCycleStart: cycle.start, updatedAt: now });
+  }
   if (previousStatus !== status) await logTaskActivity(ctx, { companyId, taskType: "jd", taskId, actorMembershipId: membership._id, event: "status_changed", fromStatus: previousStatus, toStatus: status, createdAt: now });
 }
 
