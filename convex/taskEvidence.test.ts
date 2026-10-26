@@ -68,6 +68,74 @@ describe("task evidence", () => {
     expect(oneTimeEvidence.page[0]).toMatchObject({ text: "Receipt filed.", cycleStart: null });
   });
 
+  test("a different evidence submission against an already-completed task is rejected, while the recorded one retries safely", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    const employee = f.asUser("employeeA1");
+    const evidenceFor = async (taskType: "jd" | "one_time", taskId: string) => (await admin.query(api.tasks.getTaskEvidence, {
+      companyId: f.companyA,
+      taskType,
+      taskId,
+      paginationOpts: { numItems: 10, cursor: null },
+    })).page;
+
+    // Both members opened the completion dialog; the employee submitted first.
+    const oneTimeId = await admin.mutation(api.tasks.createOneTime, {
+      companyId: f.companyA,
+      title: "Two reviewers",
+      dueDate: Date.now() + 86_400_000,
+      priority: "medium",
+      assigneeMembershipIds: [f.employee1M, f.adminM],
+      evidenceRequired: true,
+    });
+    await employee.mutation(api.tasks.completeOneTime, {
+      companyId: f.companyA,
+      taskId: oneTimeId,
+      evidence: { text: "Employee proof." },
+    });
+    // The admin's later dialog is told its evidence was not saved.
+    await expect(admin.mutation(api.tasks.completeOneTime, {
+      companyId: f.companyA,
+      taskId: oneTimeId,
+      evidence: { text: "Admin proof." },
+    })).rejects.toThrow("This task was already completed with different evidence.");
+    // Replaying the submission that was recorded stays idempotent.
+    await expect(employee.mutation(api.tasks.completeOneTime, {
+      companyId: f.companyA,
+      taskId: oneTimeId,
+      evidence: { text: "Employee proof." },
+    })).resolves.toBeNull();
+    const oneTimeEvidence = await evidenceFor("one_time", oneTimeId);
+    expect(oneTimeEvidence).toHaveLength(1);
+    expect(oneTimeEvidence[0].text).toBe("Employee proof.");
+
+    const jdId = await admin.mutation(api.tasks.createJd, {
+      companyId: f.companyA,
+      title: "Two reviewers",
+      recurrence: "daily",
+      assigneeMembershipIds: [f.employee1M, f.adminM],
+      evidenceRequired: true,
+    });
+    await employee.mutation(api.tasks.completeJd, {
+      companyId: f.companyA,
+      taskId: jdId,
+      evidence: { text: "Employee proof." },
+    });
+    await expect(admin.mutation(api.tasks.completeJd, {
+      companyId: f.companyA,
+      taskId: jdId,
+      evidence: { text: "Admin proof." },
+    })).rejects.toThrow("This task was already completed with different evidence.");
+    await expect(employee.mutation(api.tasks.completeJd, {
+      companyId: f.companyA,
+      taskId: jdId,
+      evidence: { text: "Employee proof." },
+    })).resolves.toBeNull();
+    const jdEvidence = await evidenceFor("jd", jdId);
+    expect(jdEvidence).toHaveLength(1);
+    expect(jdEvidence[0].text).toBe("Employee proof.");
+  });
+
   test("reopening a task deletes its evidence row and unreferenced blob", async () => {
     const f = await createAuthzFixture();
     const admin = f.asUser("adminA");

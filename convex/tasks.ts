@@ -17,6 +17,7 @@ import {
   deleteActiveTaskEvidence,
   deleteTaskEvidenceBatch,
   evidenceInputValidator,
+  evidenceMatchesSubmission,
   isBlobReferenced,
   retireTaskEvidenceAtCycle,
   storeTaskEvidence,
@@ -1295,12 +1296,18 @@ async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId:
   const previousStatus: ManualStatus = alreadyCompleted ? "completed" : task.statusCycleStart === cycle.start ? task.status : "due";
   if (status === "completed") {
     const activeEvidence = await activeTaskEvidence(ctx, "jd", taskId, cycle.start);
-    // A retry of an already-recorded completion keeps its evidence and must
-    // not re-validate claims that the first attempt already consumed.
-    if (evidence && !activeEvidence) {
+    if (activeEvidence) {
+      // Two members can finish the same cycle from dialogs opened before
+      // either saved. A retry of the recorded submission is an idempotent
+      // no-op, but a different submission must not be reported as saved when
+      // nothing was recorded (its uploads are discarded by the client).
+      if (evidence && !evidenceMatchesSubmission(activeEvidence, evidence)) {
+        throw new ConvexError("This task was already completed with different evidence.");
+      }
+    } else if (evidence) {
       const validated = await validateEvidenceInput(ctx, { companyId, membershipId: membership._id, evidence, now });
       await storeTaskEvidence(ctx, { companyId, taskType: "jd", taskId, cycleStart: cycle.start, createdByMembershipId: membership._id, now, evidence: validated });
-    } else if (!activeEvidence && task.evidenceRequired === true && !alreadyCompleted) {
+    } else if (task.evidenceRequired === true && !alreadyCompleted) {
       // Reaffirming Completed is an idempotent no-op, so enabling the flag
       // after the fact must not strand the task in an unchangeable state.
       throw new ConvexError("Evidence is required to complete this task.");
@@ -1785,10 +1792,16 @@ async function setOneTimeStatus(ctx: MutationCtx, companyId: Id<"companies">, ta
   const previousStatus = state.rawStatus as ManualStatus;
   if (status === "completed") {
     const activeEvidence = await activeTaskEvidence(ctx, "one_time", taskId);
-    if (evidence && !activeEvidence) {
+    if (activeEvidence) {
+      // Keep a retry idempotent, but never report a different submission as
+      // saved when the task already holds someone else's evidence.
+      if (evidence && !evidenceMatchesSubmission(activeEvidence, evidence)) {
+        throw new ConvexError("This task was already completed with different evidence.");
+      }
+    } else if (evidence) {
       const validated = await validateEvidenceInput(ctx, { companyId, membershipId: membership._id, evidence, now });
       await storeTaskEvidence(ctx, { companyId, taskType: "one_time", taskId, createdByMembershipId: membership._id, now, evidence: validated });
-    } else if (!activeEvidence && task.evidenceRequired === true && previousStatus !== "completed") {
+    } else if (task.evidenceRequired === true && previousStatus !== "completed") {
       // Reaffirming Completed is an idempotent no-op, so enabling the flag
       // after the fact must not strand the task in an unchangeable state.
       throw new ConvexError("Evidence is required to complete this task.");

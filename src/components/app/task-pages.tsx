@@ -1472,8 +1472,9 @@ function EvidenceCompletionDialog({ kind, task, onOpenChange, onComplete }: { ki
   return (
     <Dialog.Root open onOpenChange={(next) => { if (!submitting) onOpenChange(next); }}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-40 bg-black/40 backdrop-blur-[2px]" />
+        <Dialog.Overlay className="fixed inset-0 z-40 bg-black/40 backdrop-blur-[2px]" data-interactive="true" />
         <Dialog.Content
+          data-interactive="true"
           onPointerDownOutside={(event) => event.preventDefault()}
           onInteractOutside={(event) => event.preventDefault()}
           className="fixed left-1/2 top-1/2 z-50 flex max-h-[min(680px,92dvh)] w-[min(520px,calc(100vw-24px))] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-[var(--hairline)] bg-[var(--surface)] shadow-[var(--shadow-elevated)]"

@@ -12,7 +12,10 @@ export const MAX_EVIDENCE_TEXT_LENGTH = 5_000;
 // submitted long after the URL stopped working.
 export const TASK_UPLOAD_CLAIM_TTL_MS = 2 * 60 * 60 * 1000;
 
-const EVIDENCE_DELETE_BATCH = 500;
+// Deleting one evidence row costs up to two index queries per file plus one
+// blob-ref query (11 at the 5-file cap), and a transaction may read 4,096
+// index ranges. 50 rows keeps the worst case near 550; the purge re-schedules.
+const EVIDENCE_DELETE_BATCH = 50;
 const ACTIVE_EVIDENCE_LIMIT = 10;
 
 export const evidenceFileInputValidator = v.object({
@@ -27,6 +30,19 @@ export const evidenceInputValidator = v.object({
 
 export type EvidenceInput = Infer<typeof evidenceInputValidator>;
 type EvidenceFile = Doc<"taskEvidence">["files"][number];
+
+/**
+ * True when a submission carries the evidence already recorded for the task,
+ * so a retried completion stays idempotent. Upload claims are consumed on save,
+ * so identity is the normalized text plus the stored blobs.
+ */
+export function evidenceMatchesSubmission(row: Doc<"taskEvidence">, evidence: EvidenceInput) {
+  if ((row.text ?? "") !== (evidence.text?.trim() ?? "")) return false;
+  const files = evidence.files ?? [];
+  if (files.length !== row.files.length) return false;
+  const stored = new Set(row.files.map((file) => file.storageId));
+  return files.every((file) => stored.has(file.storageId));
+}
 
 export type ValidatedEvidence = {
   text?: string;

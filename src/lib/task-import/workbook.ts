@@ -307,7 +307,7 @@ function makeDraft(kind: TaskImportKind, sourceSheet: string, sourceRow: number,
   const activeCellText = activeColumn.state === "absent" ? "" : sourceText(valueAt(row, activeColumn.index));
   const isActiveText = activeColumn.state === "present" ? activeCellText : "";
   const isActive = isActiveText ? normalizeYesNo(isActiveText) : null;
-  const evidenceCellText = evidenceColumn.state === "absent" ? "" : sourceText(valueAt(row, evidenceColumn.index));
+  const evidenceCellText = sourceText(valueAt(row, evidenceColumn.index));
   const evidenceText = evidenceColumn.state === "present" ? evidenceCellText : "";
   const evidenceRequired = evidenceText ? normalizeYesNo(evidenceText) : null;
   const warnings = [
@@ -319,7 +319,7 @@ function makeDraft(kind: TaskImportKind, sourceSheet: string, sourceRow: number,
     ...(isActiveText && isActive === null ? ["Is active must be Yes or No."] : []),
     ...(activeColumn.state === "unrecognized" && activeCellText ? [`Column ${activeColumn.index + 1} has a value but its header is not "Is Active"; the value was ignored.`] : []),
     ...(evidenceText && evidenceRequired === null ? ["Evidence required must be Yes or No."] : []),
-    ...(evidenceColumn.state === "unrecognized" && evidenceCellText ? [`Column ${evidenceColumn.index + 1} has a value but its header is not "Evidence Required"; the value was ignored.`] : []),
+    ...(evidenceColumn.state !== "present" && evidenceCellText ? [`Column ${evidenceColumn.index + 1} has a value but its header is not "Evidence Required"; the value was ignored.`] : []),
     ...(isFormulaLikeValue(valueAt(row, 0)) || isFormulaLikeValue(valueAt(row, 1)) ? ["Formula-like text was rejected as an input value."] : []),
   ];
   const presentFields = [

@@ -196,6 +196,22 @@ describe("task workbook pure helpers", () => {
     expect(parsed.rows[1].warnings).toHaveLength(0);
   });
 
+  test("warns when a tenth-column value sits under a missing Evidence Required header", () => {
+    const parsed = parseCendroWorkbookSheets([
+      { sheet: "Cendro Metadata", data: [["Format identifier", "cendro-task-export"], ["Schema version", 1], ["Task kind", "one_time"], ["Source company ID", "company-1"], ["Source company name", "Acme"], ["Export timestamp", "2026-01-01T00:00:00.000Z"]] },
+      { sheet: "One-Time Tasks", data: [
+        ["Code", "Title", "Description", "Notes", "Due Date", "Priority", "Time", "Quantity", "Assignee Emails"],
+        ["TSK-001", "Dropped value", "", "", "", "medium", "", "", "admin@example.com", "Yes"],
+        ["TSK-002", "Empty value", "", "", "", "medium", "", "", "admin@example.com", ""],
+      ] },
+    ], "company-1", "one_time");
+    // The absent column is still not imported, but its dropped value is surfaced.
+    expect(parsed.rows[0]).toMatchObject({ evidenceRequired: null });
+    expect(parsed.rows[0].presentFields).not.toContain("evidenceRequired");
+    expect(parsed.rows[0].warnings).toContain("Column 10 has a value but its header is not \"Evidence Required\"; the value was ignored.");
+    expect(parsed.rows[1].warnings).toHaveLength(0);
+  });
+
   test("handles sheets with trailing empty rows like Google Sheets exports and ignores an old Status column", () => {
     const emptyRows = Array.from({ length: 998 }, () => [null, null, null, null, null, null, null, null, null]);
     const parsed = parseCendroWorkbookSheets([
