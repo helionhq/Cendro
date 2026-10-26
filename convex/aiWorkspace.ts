@@ -72,14 +72,14 @@ export const performanceSummary = query({
     if (oneTimeResult.isTruncated) isTruncated = true;
     const visibleOneTime = oneTimeResult.rows.filter((task) => taskHasVisibleAssignee(task, scoped));
     const completed = visibleOneTime.filter((task) => task.status === "completed").length;
-    const overdue = visibleOneTime.filter((task) => task.status !== "completed" && (task.overdueAt || (task.dueDate && task.dueDate < Date.now()))).length;
+    const overdue = visibleOneTime.filter((task) => task.status !== "completed" && (task.overdueAt || (task.status !== "awaiting_confirmation" && task.dueDate && task.dueDate < Date.now()))).length;
     const people = await peopleRows(ctx, args.companyId, scoped, performancePeopleLimit);
     const peopleTruncated = scoped.size > performancePeopleLimit;
     if (peopleTruncated) isTruncated = true;
     const byPerson = people.map((person) => {
       const assigned = visibleOneTime.filter((task) => task.assigneeMembershipIds.includes(person.membershipId));
       const personCompleted = assigned.filter((task) => task.status === "completed").length;
-      const personOverdue = assigned.filter((task) => task.status !== "completed" && (task.overdueAt || (task.dueDate && task.dueDate < Date.now()))).length;
+      const personOverdue = assigned.filter((task) => task.status !== "completed" && (task.overdueAt || (task.status !== "awaiting_confirmation" && task.dueDate && task.dueDate < Date.now()))).length;
       return { name: person.name, role: person.role, assignedOneTimeTasks: assigned.length, completedOneTimeTasks: personCompleted, overdueOneTimeTasks: personOverdue };
     });
     return {

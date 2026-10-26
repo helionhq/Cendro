@@ -84,8 +84,8 @@ type Kind = "jd" | "one";
 type Priority = "low" | "medium" | "high" | "critical";
 type Frequency = "daily" | "every_other_day" | "weekly" | "semimonthly" | "monthly" | "quarterly" | "semiannually" | "annually";
 type ManualStatus = "due" | "in_progress" | "completed";
-type StatusFilter = ManualStatus | "overdue";
-type TaskView = "all" | "my" | "custom";
+type StatusFilter = ManualStatus | "overdue" | "awaiting_confirmation";
+type TaskView = "all" | "my" | "custom" | "awaiting";
 type PriorityFilter = "all" | Priority;
 type FrequencyFilter = Frequency | "all";
 
@@ -100,6 +100,8 @@ type TaskFormValues = {
   quantity: string;
   time: string;
   evidenceRequired: boolean;
+  confirmationRequired: boolean;
+  confirmerMembershipId: string | null;
   files: File[];
 };
 
@@ -123,6 +125,19 @@ type AssignableUsersResult = {
   isTruncated: boolean;
 };
 
+type AwaitingConfirmationRow = {
+  _id: string;
+  taskId: string;
+  taskType: "jd" | "one_time";
+  reference: string;
+  title: string;
+  assignees: TaskRowAssignee[];
+  submittedBy: TaskRowAssignee | null;
+  submittedAt: number;
+  cycleStart: number | null;
+  cycleEnd: number | null;
+};
+
 type TaskRow = TaskListOrderingRow & {
   reference: string;
   title: string;
@@ -139,9 +154,10 @@ type TaskRow = TaskListOrderingRow & {
   createdAt: number;
   assigneeMembershipIds: string[];
   assignees: TaskRowAssignee[];
+  confirmerMembershipId?: string;
   state?: {
     status?: string;
-    rawStatus?: ManualStatus | "overdue" | "paused";
+    rawStatus?: ManualStatus | "overdue" | "paused" | "awaiting_confirmation";
   } | string;
   canUpdate?: boolean;
   canDelete?: boolean;
@@ -173,9 +189,12 @@ const statusOptions: { value: StatusFilter; label: string }[] = [
   { value: "due", label: "Pending" },
   { value: "in_progress", label: "In progress" },
   { value: "completed", label: "Completed" },
+  { value: "awaiting_confirmation", label: "Awaiting confirmation" },
   { value: "overdue", label: "Overdue" },
 ];
 const allStatusFilters = statusOptions.map((option) => option.value);
+// One-time tasks keep overdue hidden by default; awaiting work stays visible.
+const oneTimeDefaultStatusFilters: StatusFilter[] = [...manualStatuses.map((option) => option.value), "awaiting_confirmation"];
 
 const taskListPreferenceMessages: ListPreferenceControllerOptions = {
   conflict: "Task order changed in another session. Please repeat the move.",
@@ -191,7 +210,7 @@ const toneClasses: Record<string, string> = {
 };
 
 function emptyForm(kind: Kind): TaskFormValues {
-  return { title: "", description: "", notes: "", assigneeMembershipIds: [], recurrence: "daily", priority: "medium", dueDate: kind === "one" ? toDateField(Date.now() + 86_400_000) : "", quantity: "", time: "", evidenceRequired: false, files: [] };
+  return { title: "", description: "", notes: "", assigneeMembershipIds: [], recurrence: "daily", priority: "medium", dueDate: kind === "one" ? toDateField(Date.now() + 86_400_000) : "", quantity: "", time: "", evidenceRequired: false, confirmationRequired: false, confirmerMembershipId: null, files: [] };
 }
 
 function formFromTask(kind: Kind, task: any): TaskFormValues {
@@ -206,6 +225,8 @@ function formFromTask(kind: Kind, task: any): TaskFormValues {
     quantity: task.quantity != null ? String(task.quantity) : "",
     time: task.time ?? "",
     evidenceRequired: task.evidenceRequired === true,
+    confirmationRequired: Boolean(task.confirmerMembershipId),
+    confirmerMembershipId: task.confirmerMembershipId ?? null,
     files: [],
   };
 }
@@ -279,9 +300,9 @@ function quantityFromInput(value: string) { const parsed = Number(value); return
 function frequencyLabel(value?: Frequency) { return frequencies.find((frequency) => frequency.value === value)?.label ?? "—"; }
 function priorityLabel(value?: Priority) { return value ? value[0].toUpperCase() + value.slice(1) : "—"; }
 function statusText(task: any) { return typeof task.state === "string" ? task.state : task.state?.status ?? "Pending"; }
-function rawStatus(task: any): ManualStatus | "overdue" | "paused" { return task.state?.rawStatus ?? (statusText(task) === "Completed" ? "completed" : statusText(task) === "In Progress" ? "in_progress" : statusText(task) === "Overdue" ? "overdue" : statusText(task) === "Pending" ? "due" : "due"); }
-function statusTone(status: string) { if (status === "Overdue") return "red"; if (status === "Completed") return "green"; if (status === "In Progress") return "blue"; return "neutral"; }
-function statusDotClass(status: ManualStatus | "overdue" | "paused") { return status === "completed" ? "bg-[var(--badge-green-fg)]" : status === "in_progress" ? "bg-[var(--badge-blue-fg)]" : status === "overdue" ? "bg-[var(--badge-red-fg)]" : "bg-[var(--badge-neutral-fg)]"; }
+function rawStatus(task: any): ManualStatus | "overdue" | "paused" | "awaiting_confirmation" { return task.state?.rawStatus ?? (statusText(task) === "Completed" ? "completed" : statusText(task) === "In Progress" ? "in_progress" : statusText(task) === "Awaiting confirmation" ? "awaiting_confirmation" : statusText(task) === "Overdue" ? "overdue" : statusText(task) === "Pending" ? "due" : "due"); }
+function statusTone(status: string) { if (status === "Overdue") return "red"; if (status === "Completed") return "green"; if (status === "Awaiting confirmation") return "yellow"; if (status === "In Progress") return "blue"; return "neutral"; }
+function statusDotClass(status: ManualStatus | "overdue" | "paused" | "awaiting_confirmation") { return status === "completed" ? "bg-[var(--badge-green-fg)]" : status === "awaiting_confirmation" ? "bg-[var(--badge-yellow-fg)]" : status === "in_progress" ? "bg-[var(--badge-blue-fg)]" : status === "overdue" ? "bg-[var(--badge-red-fg)]" : "bg-[var(--badge-neutral-fg)]"; }
 function taskTypeFor(kind: Kind) { return kind === "jd" ? "jd" : "one_time"; }
 function hasAnyCapability(active: { capabilities: string[] } | null | undefined, capabilities: string[]) { return capabilities.some((capability) => active?.capabilities.includes(capability)); }
 function canCreateTasks(active: { capabilities: string[] } | null | undefined, kind: Kind) { return active?.capabilities.includes(kind === "jd" ? "tasks:jd:create" : "tasks:one_time:create") ?? false; }
@@ -310,7 +331,7 @@ function statusMatches(task: TaskRow, filters: StatusFilter[]) {
 }
 function taskHasAssignee(task: any, membershipId?: string) { return Boolean(membershipId && Array.isArray(task.assigneeMembershipIds) && task.assigneeMembershipIds.includes(membershipId)); }
 function assigneeDisplayName(assignee: any) { return assignee?.user?.name || assignee?.user?.email || "Unknown user"; }
-function manualStatusLabel(status?: ManualStatus | null) { return manualStatuses.find((option) => option.value === status)?.label ?? "status"; }
+function manualStatusLabel(status?: string | null) { if (status === "awaiting_confirmation") return "awaiting confirmation"; return manualStatuses.find((option) => option.value === status)?.label ?? "status"; }
 function activityActorName(item: any) { return item.actor?.user.name || item.actor?.user.email || "Someone"; }
 function activityLogText(item: any) {
   const name = activityActorName(item);
@@ -319,6 +340,7 @@ function activityLogText(item: any) {
   if (item.event === "resumed") return `${name} made this task active`;
   if (item.event === "status_changed") {
     if (item.toStatus === "completed") return `${name} marked this task complete`;
+    if (item.toStatus === "awaiting_confirmation") return `${name} sent this task for confirmation`;
     if (item.toStatus === "in_progress") return `${name} moved this task to in progress`;
     if (item.toStatus === "due") return `${name} marked this task pending`;
     if (item.fromStatus && item.toStatus) return `${name} changed status from ${manualStatusLabel(item.fromStatus)} to ${manualStatusLabel(item.toStatus)}`;
@@ -453,6 +475,17 @@ function optimisticTaskState(task: any, status: ManualStatus) {
   return { ...state, status: taskStateLabel(status), rawStatus: status, isOverdue: false };
 }
 
+// A completion on someone else's behalf lands in Awaiting confirmation, so the
+// row reports the submitted state instead of briefly claiming Completed.
+function optimisticAwaitingState(task: any) {
+  const state = typeof task.state === "object" && task.state ? task.state : {};
+  return { ...state, status: "Awaiting confirmation", rawStatus: "awaiting_confirmation", isOverdue: false };
+}
+
+function sendForConfirmation(task: any, status: ManualStatus, membershipId?: string) {
+  return status === "completed" && Boolean(task.confirmerMembershipId) && task.confirmerMembershipId !== membershipId;
+}
+
 function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger = false }: { kind: Kind; task: any; size?: "sm" | "md"; canUpdateOverride?: boolean; cellTrigger?: boolean }) {
   const { activeCompanyId, active } = useCompany();
   // Patch the loaded list/detail queries so every view of this task — the row,
@@ -461,13 +494,19 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
     // Evidence completions wait for the server so a rejected upload is never
     // shown as completed first.
     if (args.evidence) return;
-    const patch = (row: any) => ({ ...row, state: optimisticTaskState(row, args.status), ...(args.status === "completed" ? { completedAt: Date.now() } : {}) });
+    const patch = (row: any) => {
+      if (sendForConfirmation(row, args.status, active?.membership._id)) return { ...row, state: optimisticAwaitingState(row) };
+      return { ...row, state: optimisticTaskState(row, args.status), ...(args.status === "completed" ? { completedAt: Date.now() } : {}) };
+    };
     updateInListPages(localStore, api.tasks.listJdRows, args.taskId, patch);
     updateInDetailQueries(localStore, api.tasks.getJd, args.taskId, patch);
   });
   const updateOneStatus = useMutation(api.tasks.updateOneTimeStatus).withOptimisticUpdate((localStore, args) => {
     if (args.evidence) return;
-    const patch = (row: any) => ({ ...row, state: optimisticTaskState(row, args.status), ...(args.status === "completed" ? { completedAt: Date.now() } : {}) });
+    const patch = (row: any) => {
+      const awaiting = sendForConfirmation(row, args.status, active?.membership._id);
+      return { ...row, state: awaiting ? optimisticAwaitingState(row) : optimisticTaskState(row, args.status), ...(args.status === "completed" && !awaiting ? { completedAt: Date.now() } : {}) };
+    };
     updateInListPages(localStore, api.tasks.listOneTimeRows, args.taskId, patch);
     updateInDetailQueries(localStore, api.tasks.getOneTime, args.taskId, patch);
   });
@@ -475,8 +514,12 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
   const [failed, setFailed] = useState(false);
   const [open, setOpen] = useState(false);
   const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const [sentForConfirmation, setSentForConfirmation] = useState(false);
   const status = statusText(task);
   const raw = rawStatus(task);
+  // Awaiting work can only be withdrawn by its assignees; Completed stays with
+  // the designated confirmer in the Awaiting confirmation view.
+  const selectableStatuses = raw === "awaiting_confirmation" ? manualStatuses.filter((option) => option.value !== "completed") : manualStatuses;
   const deadlineClock = useContext(TaskDeadlineContext);
   const awaitingClock = kind === "one" && task.dueDate != null && !deadlineClock?.synchronized;
   const locked = status === "Overdue" || raw === "overdue";
@@ -499,6 +542,7 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
     try {
       if (kind === "jd") await updateJdStatus({ companyId: activeCompanyId, taskId: task._id, status: nextStatus });
       else await updateOneStatus({ companyId: activeCompanyId, taskId: task._id, status: nextStatus });
+      setSentForConfirmation(sendForConfirmation(task, nextStatus, active?.membership._id));
     } catch {
       // The optimistic store reverts on failure; flag it so the retry affordance is clear.
       setFailed(true);
@@ -514,6 +558,7 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
     try {
       if (kind === "jd") await updateJdStatus({ companyId: activeCompanyId, taskId: task._id, status: "completed", evidence });
       else await updateOneStatus({ companyId: activeCompanyId, taskId: task._id, status: "completed", evidence });
+      setSentForConfirmation(sendForConfirmation(task, "completed", active?.membership._id));
     } catch (error) {
       setFailed(true);
       throw error;
@@ -541,7 +586,7 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
     return (
       <>
         <TaskCellPopover open={open} onOpenChange={setOpen} disabled={pending || awaitingClock} pending={pending} ariaLabel="Change status" header={pill}>
-          {manualStatuses.map((option) => (
+          {selectableStatuses.map((option) => (
             <button key={option.value} type="button" disabled={pending || awaitingClock} onClick={() => { setOpen(false); void change(option.value); }} className="task-cell-popover-item">
               <span className={cn("task-pill h-[22px] px-2", toneClasses[statusTone(option.label)])}>
                 <span className={cn("task-pill-dot", statusDotClass(option.value))} />
@@ -553,6 +598,7 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
           ))}
         </TaskCellPopover>
         {completionDialog}
+        {sentForConfirmation && <span className="sr-only" role="status" aria-live="polite">Sent for confirmation.</span>}
       </>
     );
   }
@@ -568,7 +614,7 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
         </DropdownMenu.Trigger>
         <DropdownMenu.Portal>
           <DropdownMenu.Content align="start" sideOffset={4} className="task-menu" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
-            {manualStatuses.map((option) => (
+            {selectableStatuses.map((option) => (
               <DropdownMenu.Item key={option.value} disabled={pending || awaitingClock} onSelect={() => change(option.value)} className="task-menu-item">
                 <span className={cn("task-pill-dot", statusDotClass(option.value))} />
                 <span className="flex-1">{option.label}</span>
@@ -579,6 +625,7 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
       {completionDialog}
+      {sentForConfirmation && <span className="sr-only" role="status" aria-live="polite">Sent for confirmation.</span>}
     </>
   );
 }
@@ -935,6 +982,124 @@ const TaskTableRow = memo(function TaskTableRow({
     </SortableTaskRow>
   );
 });
+
+function AwaitingConfirmationTable({
+  kind,
+  result,
+  pendingId,
+  sendBackId,
+  onOpen,
+  onConfirm,
+  onRequestSendBack,
+  onCancelSendBack,
+  onSendBack,
+}: {
+  kind: Kind;
+  result: { isTruncated: boolean; rows: AwaitingConfirmationRow[] } | undefined;
+  pendingId: string | null;
+  sendBackId: string | null;
+  onOpen: (row: AwaitingConfirmationRow) => void;
+  onConfirm: (row: AwaitingConfirmationRow) => void;
+  onRequestSendBack: (row: AwaitingConfirmationRow) => void;
+  onCancelSendBack: () => void;
+  onSendBack: (row: AwaitingConfirmationRow) => void;
+}) {
+  const rows = result?.rows ?? [];
+  const columns = kind === "jd" ? 7 : 6;
+  const openRow = (row: AwaitingConfirmationRow, event: React.MouseEvent | React.KeyboardEvent) => {
+    if ((event.target as HTMLElement).closest("[data-interactive='true']")) return;
+    onOpen(row);
+  };
+  return (
+    <>
+      <div className="task-table-wrap task-list-table-wrap">
+        <table className="task-table">
+          <thead>
+            <tr>
+              <th className="w-[92px] whitespace-nowrap"><span className="inline-flex items-center gap-1.5"><Hash className="h-3.5 w-3.5" />CODE</span></th>
+              <th className="min-w-[200px] max-w-[250px]"><span className="inline-flex items-center gap-1.5"><TaskIcon className="h-3.5 w-3.5" />TITLE</span></th>
+              <th><span className="inline-flex items-center gap-1.5"><UsersIcon className="h-3.5 w-3.5" />ASSIGNED TO</span></th>
+              <th><span className="inline-flex items-center gap-1.5"><User className="h-3.5 w-3.5" />SUBMITTED BY</span></th>
+              <th><span className="inline-flex items-center gap-1.5"><CalendarClock className="h-3.5 w-3.5" />SUBMITTED</span></th>
+              {kind === "jd" && <th><span className="inline-flex items-center gap-1.5"><CalendarDays className="h-3.5 w-3.5" />CYCLE DUE</span></th>}
+              <th><span className="inline-flex items-center gap-1.5"><StatusIcon className="h-3.5 w-3.5" />STATUS</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {result === undefined ? (
+              Array.from({ length: 3 }).map((_, index) => (
+                <tr key={`awaiting-skeleton-${index}`}>
+                  <td colSpan={columns} className="pl-4">
+                    <div className="flex items-center gap-3">
+                      <div className="h-3 w-3 shrink-0 animate-pulse rounded-full bg-[var(--surface-muted)]" />
+                      <div className="h-3 w-2/5 animate-pulse rounded bg-[var(--surface-muted)]" />
+                    </div>
+                  </td>
+                </tr>
+              ))
+            ) : rows.length === 0 ? (
+              <tr>
+                <td colSpan={columns} className="!h-auto py-2">
+                  <div className="task-empty">
+                    <span className="flex h-11 w-11 items-center justify-center rounded-full bg-[var(--surface-muted)] text-[var(--ink-faint)]"><Inbox className="h-5 w-5" /></span>
+                    <div className="mt-3 text-[14px] font-semibold text-[var(--ink)]">Nothing to confirm</div>
+                    <p className="mt-1 max-w-[280px] text-[13px] text-[var(--ink-muted)]">Submitted work waiting on you will appear here.</p>
+                  </div>
+                </td>
+              </tr>
+            ) : rows.map((row) => {
+              const submitter = row.submittedBy;
+              const submitterName = submitter ? assigneeDisplayName(submitter) : "Unknown member";
+              return (
+                <tr
+                  key={row._id}
+                  data-task-id={row.taskId}
+                  tabIndex={0}
+                  className="cursor-pointer"
+                  onClick={(event) => openRow(row, event)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter" && event.key !== " ") return;
+                    if ((event.target as HTMLElement).closest("[data-interactive='true']")) return;
+                    event.preventDefault();
+                    onOpen(row);
+                  }}
+                >
+                  <td className="w-[92px] whitespace-nowrap font-mono text-[12px] text-[var(--ink-muted)]">{row.reference}</td>
+                  <td className="col-task max-w-[250px]"><span className="block truncate">{row.title}</span></td>
+                  <td><AvatarStack assignees={row.assignees} showName /></td>
+                  <td className="whitespace-nowrap">
+                    <span className="inline-flex min-w-0 items-center gap-2">
+                      {submitter && <Avatar name={submitter.user.name} email={submitter.user.email} imageUrl={submitter.user.imageUrl} />}
+                      <span className="min-w-0 truncate">{submitterName}</span>
+                    </span>
+                  </td>
+                  <td className="whitespace-nowrap text-[var(--ink-secondary)]">{formatDate(row.submittedAt)}</td>
+                  {kind === "jd" && <td className="whitespace-nowrap text-[var(--ink-secondary)]">{row.cycleEnd != null ? formatDate(row.cycleEnd) : "—"}</td>}
+                  <td data-interactive="true" onClick={(event) => event.stopPropagation()}>
+                    {sendBackId === row._id ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Button size="sm" variant="danger" disabled={pendingId === row._id} onClick={() => onSendBack(row)}>Confirm send back</Button>
+                        <Button size="sm" variant="ghost" disabled={pendingId === row._id} onClick={onCancelSendBack}>Cancel</Button>
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-2">
+                        <Button size="sm" variant="primary" disabled={pendingId === row._id} onClick={() => onConfirm(row)}>Confirm</Button>
+                        <Button size="sm" variant="ghost" disabled={pendingId === row._id} onClick={() => onRequestSendBack(row)}>Send back</Button>
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {result?.isTruncated && (
+        <p role="status" className="mt-2 px-1 text-[12px] text-[var(--ink-muted)]">Only the most recent submissions are shown. Confirm or send back some to see the rest.</p>
+      )}
+    </>
+  );
+}
 
 function SelectPicker<T extends string>({ ariaLabel, value, options, onChange, placeholder = "Select", required = false }: { ariaLabel: string; required?: boolean; value: T; options: { value: T; label: string; helper?: string }[]; onChange: (value: T) => void; placeholder?: string }) {
   const selectedOption = options.find((option) => option.value === value);
@@ -1607,6 +1772,31 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
   const [values, setValues] = useState<TaskFormValues>(() => task ? formFromTask(kind, task) : emptyForm(kind));
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // Only the open dialog needs the confirmer list.
+  const confirmersResult = useQuery(
+    api.tasks.eligibleConfirmers,
+    activeCompanyId && open ? { companyId: activeCompanyId } : "skip",
+  ) as AssignableUsersResult | undefined;
+  const confirmerOptions = (confirmersResult?.users ?? []).map((user) => ({
+    value: user.membership._id,
+    label: assigneeDisplayName(user),
+    helper: user.membership.role,
+  }));
+  // A saved confirmer may no longer hold tasks:confirm; the backend keeps them
+  // so their pending approval still resolves. Show that person rather than a
+  // blank "Select confirmer" that hides who the task is actually waiting on.
+  const savedConfirmerId = values.confirmerMembershipId;
+  const savedConfirmerIsIneligible = Boolean(savedConfirmerId) && confirmersResult !== undefined && !confirmerOptions.some((option) => option.value === savedConfirmerId);
+  const savedConfirmer = savedConfirmerIsIneligible
+    ? [
+        task?.confirmer?.membership?._id === savedConfirmerId ? task.confirmer : null,
+        assignable.find((candidate) => candidate.membership?._id === savedConfirmerId) ?? null,
+        task?.assignees?.find((candidate: any) => candidate.membership?._id === savedConfirmerId) ?? null,
+      ].find(Boolean) ?? null
+    : null;
+  const confirmerSelectOptions = savedConfirmerIsIneligible
+    ? [{ value: savedConfirmerId!, label: `${savedConfirmer ? assigneeDisplayName(savedConfirmer) : "Saved confirmer"} (can no longer confirm)` }, ...confirmerOptions]
+    : confirmerOptions;
 
   const titleId = useId();
   const taskAssignees = task?.assignees;
@@ -1657,11 +1847,14 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
     if (!values.title.trim()) { setError("Task title is required."); return; }
     if (mode === "create" && values.assigneeMembershipIds.length === 0) { setError("Assignee is required."); return; }
     if (kind === "jd" && !values.recurrence) { setError("Frequency is required."); return; }
+    if (values.confirmationRequired && !values.confirmerMembershipId) { setError("Select a confirmer."); return; }
     setSaving(true);
     setError(null);
     try {
       let taskId = task?._id as string | undefined;
-      const common = { companyId: activeCompanyId, title: values.title.trim(), description: values.description, notes: values.notes, time: values.time, quantity: quantityFromInput(values.quantity), evidenceRequired: values.evidenceRequired, assigneeMembershipIds: values.assigneeMembershipIds as Id<"companyMemberships">[] };
+      // Turning confirmation off clears the confirmer on edit.
+      const confirmerMembershipId = values.confirmationRequired ? values.confirmerMembershipId as Id<"companyMemberships"> : null;
+      const common = { companyId: activeCompanyId, title: values.title.trim(), description: values.description, notes: values.notes, time: values.time, quantity: quantityFromInput(values.quantity), evidenceRequired: values.evidenceRequired, confirmerMembershipId, assigneeMembershipIds: values.assigneeMembershipIds as Id<"companyMemberships">[] };
       if (kind === "jd") {
         if (mode === "create") taskId = await createJd({ ...common, recurrence: values.recurrence });
         else await updateJd({ ...common, taskId: task._id, recurrence: values.recurrence });
@@ -1741,6 +1934,26 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
                     <Switch checked={values.evidenceRequired} onCheckedChange={(evidenceRequired) => patch({ evidenceRequired })} aria-label="Require evidence to complete">
                       Require evidence to complete
                     </Switch>
+                  </div>
+                </div>
+                <div className="grid grid-cols-[120px_1fr] items-start gap-3 py-2">
+                  <span className="pt-1 text-[13px] text-[var(--ink-muted)]">Confirmation</span>
+                  <div className="min-w-0">
+                    <Switch checked={values.confirmationRequired} onCheckedChange={(confirmationRequired) => patch({ confirmationRequired })} aria-label="Require confirmation to complete">
+                      Require confirmation to complete
+                    </Switch>
+                    {values.confirmationRequired && (
+                      <div className="mt-1.5">
+                        <SelectPicker
+                          ariaLabel="Confirmer"
+                          required
+                          value={values.confirmerMembershipId ?? ""}
+                          options={confirmerSelectOptions}
+                          onChange={(confirmerMembershipId) => patch({ confirmerMembershipId })}
+                          placeholder="Select confirmer"
+                        />
+                      </div>
+                    )}
                   </div>
                 </div>
                 <div className="grid grid-cols-[120px_1fr] items-start gap-3 py-2">
@@ -1887,7 +2100,7 @@ function useTaskDeadlineRows(tasks: TaskRow[] | undefined, kind: Kind) {
   const allTasks = useMemo<TaskRow[]>(() => {
     if (kind !== "one" || taskTime === null) return tasks ?? [];
     return (tasks ?? []).map((task) => {
-      if (rawStatus(task) === "completed" || rawStatus(task) === "overdue" || task.dueDate == null || task.dueDate >= taskTime) return task;
+      if (rawStatus(task) === "completed" || rawStatus(task) === "overdue" || rawStatus(task) === "awaiting_confirmation" || task.dueDate == null || task.dueDate >= taskTime) return task;
       return { ...task, state: { ...(typeof task.state === "object" ? task.state : {}), status: "Overdue", rawStatus: "overdue" as const, isOverdue: true } };
     });
   }, [kind, tasks, taskTime]);
@@ -1897,7 +2110,7 @@ function useTaskDeadlineRows(tasks: TaskRow[] | undefined, kind: Kind) {
     // an open detail whose task isn't in the list's loaded pages.
     let nextDeadline = Infinity;
     for (const task of allTasks) {
-      if (task.dueDate != null && rawStatus(task) !== "completed" && rawStatus(task) !== "overdue") {
+      if (task.dueDate != null && rawStatus(task) !== "completed" && rawStatus(task) !== "overdue" && rawStatus(task) !== "awaiting_confirmation") {
         nextDeadline = Math.min(nextDeadline, task.dueDate);
       }
     }
@@ -1926,7 +2139,7 @@ function TaskListContent({ kind, selectedId }: { kind: Kind; selectedId?: string
   const [taskView, setTaskView] = useState<TaskView>("all");
   const [frequency, setFrequency] = useState<FrequencyFilter>("all");
   const [priorityFilter, setPriorityFilter] = useState<PriorityFilter>("all");
-  const [statusFilter, setStatusFilter] = useState<StatusFilter[]>(() => kind === "one" ? manualStatuses.map((option) => option.value) : allStatusFilters);
+  const [statusFilter, setStatusFilter] = useState<StatusFilter[]>(() => kind === "one" ? oneTimeDefaultStatusFilters : allStatusFilters);
   const [customShowOverdue, setCustomShowOverdue] = useState(false);
   const [pausedFilter, setPausedFilter] = useState(false);
   const [changingPaused, setChangingPaused] = useState(false);
@@ -1948,9 +2161,18 @@ function TaskListContent({ kind, selectedId }: { kind: Kind; selectedId?: string
   const assignable = assignableResult?.users;
   const filterableAssignees = useQuery(api.tasks.filterableAssignees, activeCompanyId && canUseAllTasks ? { companyId: activeCompanyId } : "skip") as any[] | undefined;
   const taskType: TaskListTaskType = taskTypeFor(kind);
+  const canConfirm = active?.capabilities.includes("tasks:confirm") ?? false;
+  const awaitingResult = useQuery(
+    api.tasks.listAwaitingConfirmation,
+    activeCompanyId && canConfirm ? { companyId: activeCompanyId, taskType } : "skip",
+  ) as { isTruncated: boolean; rows: AwaitingConfirmationRow[] } | undefined;
+  const confirmTaskCompletion = useMutation(api.tasks.confirmTaskCompletion);
+  const sendBackTaskCompletion = useMutation(api.tasks.sendBackTaskCompletion);
+  const [awaitingPendingId, setAwaitingPendingId] = useState<string | null>(null);
+  const [pendingSendBackId, setPendingSendBackId] = useState<string | null>(null);
   const queryArgs = useMemo(
-    () => (activeCompanyId ? { companyId: activeCompanyId, ...(kind === "jd" ? { paused: taskView !== "custom" && pausedFilter } : {}) } : "skip" as const),
-    [activeCompanyId, kind, taskView, pausedFilter],
+    () => (activeCompanyId && !(taskView === "awaiting" && canConfirm) ? { companyId: activeCompanyId, ...(kind === "jd" ? { paused: taskView !== "custom" && pausedFilter } : {}) } : "skip" as const),
+    [activeCompanyId, canConfirm, kind, taskView, pausedFilter],
   );
 
   const {
@@ -2038,8 +2260,13 @@ function TaskListContent({ kind, selectedId }: { kind: Kind; selectedId?: string
   const canExport = canExportTasks(active, kind);
   const frequencyFilterActive = kind === "jd" && frequency !== "all";
   const priorityFilterActive = kind === "one" && priorityFilter !== "all";
-  const effectiveTaskView: TaskView = taskView === "custom" ? "custom" : canUseAllTasks ? taskView : "my";
+  const effectiveTaskView: TaskView = taskView === "custom"
+    ? "custom"
+    : taskView === "awaiting"
+      ? canConfirm ? "awaiting" : canUseAllTasks ? "all" : "my"
+      : canUseAllTasks ? taskView : "my";
   const isCustomView = effectiveTaskView === "custom";
+  const isAwaitingView = effectiveTaskView === "awaiting";
   const currentMembershipId = active?.membership._id as string | undefined;
   const preferenceScope = `${activeCompanyId ?? "none"}:${active?.membership._id ?? "none"}:${taskType}`;
   const activePreference = preferenceState.preference ?? subscribedPreference;
@@ -2277,20 +2504,35 @@ function TaskListContent({ kind, selectedId }: { kind: Kind; selectedId?: string
     setExportingSelection(true);
     try {
       const selectedTasks = tasks.filter((t: any) => selectedIds.has(t._id));
-      const exportTasks = selectedTasks.map((t: any) => ({
-        reference: t.reference,
-        title: t.title,
-        description: t.description ?? null,
-        notes: t.notes ?? null,
-        recurrence: kind === "jd" ? t.recurrence : undefined,
-        dueDate: kind === "one" ? (t.dueDate ?? null) : undefined,
-        priority: kind === "one" ? t.priority : undefined,
-        time: t.time ?? null,
-        quantity: t.quantity ?? null,
-        assigneeEmails: t.assignees?.map((a: any) => a.user.email).join("; ") ?? "",
-        isActive: kind === "jd" ? t.pausedAt === undefined : undefined,
-        evidenceRequired: t.evidenceRequired === true,
-      }));
+      // List rows carry the confirmer id but not their email. Resolve it from
+      // the enriched member lists the page already holds; if it cannot be
+      // resolved, both export cells stay blank so a re-import leaves the
+      // confirmer unchanged instead of clearing it with a "No".
+      const memberEmails = new Map<string, string>();
+      for (const member of [...(assignable ?? []), ...(filterableAssignees ?? [])]) {
+        const membershipId = member?.membership?._id;
+        const memberEmail = member?.user?.email;
+        if (membershipId && memberEmail && !memberEmails.has(membershipId)) memberEmails.set(membershipId, memberEmail);
+      }
+      const exportTasks = selectedTasks.map((t: any) => {
+        const confirmerEmail = t.confirmerMembershipId ? memberEmails.get(t.confirmerMembershipId) ?? null : null;
+        return {
+          reference: t.reference,
+          title: t.title,
+          description: t.description ?? null,
+          notes: t.notes ?? null,
+          recurrence: kind === "jd" ? t.recurrence : undefined,
+          dueDate: kind === "one" ? (t.dueDate ?? null) : undefined,
+          priority: kind === "one" ? t.priority : undefined,
+          time: t.time ?? null,
+          quantity: t.quantity ?? null,
+          assigneeEmails: t.assignees?.map((a: any) => a.user.email).join("; ") ?? "",
+          isActive: kind === "jd" ? t.pausedAt === undefined : undefined,
+          evidenceRequired: t.evidenceRequired === true,
+          confirmationRequired: t.confirmerMembershipId ? (confirmerEmail ? true : null) : false,
+          confirmerEmail,
+        };
+      });
       const { exportTaskWorkbook, downloadBlob } = await loadWorkbook();
       const workbook = await exportTaskWorkbook(
         kind === "jd" ? "jd" : "one_time",
@@ -2354,6 +2596,51 @@ function TaskListContent({ kind, selectedId }: { kind: Kind; selectedId?: string
     setTaskView("custom");
   }
 
+  function selectAwaitingView() {
+    setSelectedIds(new Set());
+    setTaskView("awaiting");
+  }
+
+  const openAwaitingTask = useCallback((row: AwaitingConfirmationRow) => {
+    seedDetailPreview(`task:${activeCompanyId}:${kind}:${active?.membership._id}`, row.taskId, {
+      _id: row.taskId,
+      reference: row.reference,
+      title: row.title,
+      createdAt: row.submittedAt,
+      assigneeMembershipIds: row.assignees.map((assignee) => assignee.membership._id),
+      assignees: row.assignees,
+      state: { status: "Awaiting confirmation", rawStatus: "awaiting_confirmation" },
+    } as any);
+    router.push(`${base}/${row.taskId}`);
+  }, [activeCompanyId, active?.membership._id, base, kind, router]);
+
+  async function confirmAwaitingTask(row: AwaitingConfirmationRow) {
+    if (!activeCompanyId || awaitingPendingId) return;
+    setAwaitingPendingId(row._id);
+    setInlineError(null);
+    try {
+      await confirmTaskCompletion({ companyId: activeCompanyId, requestId: row._id as Id<"taskConfirmationRequests"> });
+    } catch (err) {
+      setInlineError(err instanceof Error ? err.message : "Could not confirm the task.");
+    } finally {
+      setAwaitingPendingId(null);
+    }
+  }
+
+  async function sendBackAwaitingTask(row: AwaitingConfirmationRow) {
+    if (!activeCompanyId || awaitingPendingId) return;
+    setAwaitingPendingId(row._id);
+    setPendingSendBackId(null);
+    setInlineError(null);
+    try {
+      await sendBackTaskCompletion({ companyId: activeCompanyId, requestId: row._id as Id<"taskConfirmationRequests"> });
+    } catch (err) {
+      setInlineError(err instanceof Error ? err.message : "Could not send the task back.");
+    } finally {
+      setAwaitingPendingId(null);
+    }
+  }
+
   function selectTaskSortField(field: TaskListSortField) {
     const direction = taskSortDirectionForField(taskType, activeSort, field);
     const nextSort: TaskListSort = {
@@ -2369,9 +2656,81 @@ function TaskListContent({ kind, selectedId }: { kind: Kind; selectedId?: string
   const jdColumns = 5 + (showFrequencyColumn ? 1 : 0) + (showAssigneeColumn ? 1 : 0); // reference + title + optional frequency + optional assignee + status + time + quantity
   const oneColumns = 5 + (showPriorityColumn ? 1 : 0) + (showAssigneeColumn ? 1 : 0); // reference + title + optional priority + optional assignee + status + date assigned + due
   const filterCount = isCustomView ? Number(kind === "one" && !customShowOverdue) : [kind === "jd" && pausedFilter, !pausedFilter && statusFilter.length !== allStatusFilters.length, kind === "jd" ? frequency !== "all" : priorityFilter !== "all", assigneeFilter !== "all"].filter(Boolean).length;
-  const hasOnlyDefaultStatusFilter = kind === "one" && filterCount === 1 && search.trim() === "" && statusFilter.length === manualStatuses.length && manualStatuses.every((option) => statusFilter.includes(option.value));
+  const hasOnlyDefaultStatusFilter = kind === "one" && filterCount === 1 && search.trim() === "" && statusFilter.length === oneTimeDefaultStatusFilters.length && oneTimeDefaultStatusFilters.every((filter) => statusFilter.includes(filter));
   const hasActiveFilters = isCustomView ? filterCount > 0 && orderedTasks.length > 0 : (filterCount > 0 || search.trim() !== "") && (allTasks.length > 0 || !hasOnlyDefaultStatusFilter);
   const hasHiddenOverdueTasks = !isCustomView && hasOnlyDefaultStatusFilter && orderedTasks.some((task) => rawStatus(task) === "overdue" && (effectiveTaskView !== "my" || taskHasAssignee(task, currentMembershipId)));
+  const awaitingCount = awaitingResult?.rows?.length ?? 0;
+
+  const viewRail = (
+    <TaskRail
+      railRef={viewToggleRef}
+      onScroll={syncToggleScrollState}
+    >
+      {kind === "jd" ? (
+        <>
+          <button type="button" className="task-view-button" data-active={!isCustomView && !isAwaitingView && (!canUseAllTasks || effectiveTaskView === "all")} onClick={() => { setFrequency("all"); setTaskView(canUseAllTasks ? "all" : "my"); setAssigneeFilter("all"); }}>
+            <StarIcon className="h-4 w-4" />All Tasks
+          </button>
+          {canUseAllTasks && (
+            <button type="button" className="task-view-button" data-active={!isCustomView && !isAwaitingView && effectiveTaskView === "my"} onClick={() => { setFrequency("all"); setTaskView("my"); setAssigneeFilter("all"); }}>
+              <User className="h-4 w-4" />My Tasks
+            </button>
+          )}
+          <button type="button" className="task-view-button" data-active={isCustomView} onClick={selectCustomView}>
+            <ListOrdered className="h-4 w-4" aria-hidden="true" />Custom
+          </button>
+        </>
+      ) : (
+        <>
+          <button type="button" className="task-view-button" data-active={!isCustomView && !isAwaitingView && (!canUseAllTasks || effectiveTaskView === "all")} onClick={() => { setPriorityFilter("all"); setTaskView(canUseAllTasks ? "all" : "my"); setAssigneeFilter("all"); }}>
+            <StarIcon className="h-4 w-4" />All Tasks
+          </button>
+          {canUseAllTasks && (
+            <button type="button" className="task-view-button" data-active={!isCustomView && !isAwaitingView && effectiveTaskView === "my"} onClick={() => { setPriorityFilter("all"); setTaskView("my"); setAssigneeFilter("all"); }}>
+              <User className="h-4 w-4" />My Tasks
+            </button>
+          )}
+          <button type="button" className="task-view-button" data-active={isCustomView} onClick={selectCustomView}>
+            <ListOrdered className="h-4 w-4" aria-hidden="true" />Custom
+          </button>
+        </>
+      )}
+      {canConfirm && (
+        <>
+          <button type="button" className="task-view-button" data-active={isAwaitingView} onClick={selectAwaitingView}>
+            <Clock className="h-4 w-4" />Awaiting confirmation
+            {awaitingCount > 0 && <Badge tone="neutral">{awaitingCount}{awaitingResult?.isTruncated ? "+" : ""}</Badge>}
+          </button>
+        </>
+      )}
+    </TaskRail>
+  );
+
+  if (isAwaitingView) {
+    return (
+      <div>
+        <PageHeader title={pageTitle} description={description} />
+        <div className="mb-3 flex flex-col items-stretch gap-2 md:flex-row md:flex-nowrap md:items-center">{viewRail}</div>
+        {inlineError && (
+          <div className="alert-error mb-3 flex items-center justify-between gap-3 rounded-lg px-3 py-2 text-[13px]" role="alert">
+            <span>{inlineError}</span>
+            <button type="button" className="task-icon-btn h-6 w-6" onClick={() => setInlineError(null)} aria-label="Dismiss confirmation error"><X className="h-3.5 w-3.5" /></button>
+          </div>
+        )}
+        <AwaitingConfirmationTable
+          kind={kind}
+          result={awaitingResult}
+          pendingId={awaitingPendingId}
+          sendBackId={pendingSendBackId}
+          onOpen={openAwaitingTask}
+          onConfirm={(row) => void confirmAwaitingTask(row)}
+          onRequestSendBack={(row) => setPendingSendBackId(row._id)}
+          onCancelSendBack={() => setPendingSendBackId(null)}
+          onSendBack={(row) => void sendBackAwaitingTask(row)}
+        />
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -2396,40 +2755,7 @@ function TaskListContent({ kind, selectedId }: { kind: Kind; selectedId?: string
       )}
 
       <div className="mb-3 flex flex-col items-stretch gap-2 md:flex-row md:flex-nowrap md:items-center">
-        <TaskRail
-          railRef={viewToggleRef}
-          onScroll={syncToggleScrollState}
-        >
-          {kind === "jd" ? (
-            <>
-              <button type="button" className="task-view-button" data-active={!isCustomView && (!canUseAllTasks || effectiveTaskView === "all")} onClick={() => { setFrequency("all"); setTaskView(canUseAllTasks ? "all" : "my"); setAssigneeFilter("all"); }}>
-                <StarIcon className="h-4 w-4" />All Tasks
-              </button>
-              {canUseAllTasks && (
-                <button type="button" className="task-view-button" data-active={!isCustomView && effectiveTaskView === "my"} onClick={() => { setFrequency("all"); setTaskView("my"); setAssigneeFilter("all"); }}>
-                  <User className="h-4 w-4" />My Tasks
-                </button>
-              )}
-              <button type="button" className="task-view-button" data-active={isCustomView} onClick={selectCustomView}>
-                <ListOrdered className="h-4 w-4" aria-hidden="true" />Custom
-              </button>
-            </>
-          ) : (
-            <>
-              <button type="button" className="task-view-button" data-active={!isCustomView && (!canUseAllTasks || effectiveTaskView === "all")} onClick={() => { setPriorityFilter("all"); setTaskView(canUseAllTasks ? "all" : "my"); setAssigneeFilter("all"); }}>
-                <StarIcon className="h-4 w-4" />All Tasks
-              </button>
-              {canUseAllTasks && (
-                <button type="button" className="task-view-button" data-active={!isCustomView && effectiveTaskView === "my"} onClick={() => { setPriorityFilter("all"); setTaskView("my"); setAssigneeFilter("all"); }}>
-                  <User className="h-4 w-4" />My Tasks
-                </button>
-              )}
-              <button type="button" className="task-view-button" data-active={isCustomView} onClick={selectCustomView}>
-                <ListOrdered className="h-4 w-4" aria-hidden="true" />Custom
-              </button>
-            </>
-          )}
-        </TaskRail>
+        {viewRail}
         <div className="flex flex-wrap items-center justify-end gap-2 shrink-0 md:flex-nowrap md:ml-auto">
           {!isCustomView && <div className="task-search-control" data-open={searchOpen || search.trim() !== ""}>
             <Input ref={searchInputRef} value={search} onChange={(event) => setSearch(event.target.value)} className="task-search-input border-none focus:border-none bg-transparent" placeholder="Search title or code" aria-label="Search tasks by title or code" tabIndex={searchOpen || search.trim() !== "" ? 0 : -1} />
@@ -3109,6 +3435,10 @@ function TaskDetailContent({ kind, id }: { kind: Kind; id: string }) {
   const { allTasks, deadlineError } = useTaskDeadlineRows(detailRows, kind);
   if (!data && !preview) return <TaskDetailSkeleton />;
   const task = allTasks[0] as any;
+  // The seeded preview has no enriched confirmer: render nothing until the
+  // authoritative detail query arrives rather than guessing a name.
+  const confirmer = data?.task?.confirmer as TaskRowAssignee | null | undefined;
+  const confirmerIsMe = Boolean(data) && task.confirmerMembershipId === active?.membership._id;
 
   async function saveTaskText(patch: { title?: string; description?: string; notes?: string }) {
     if (!activeCompanyId) return false;
@@ -3276,6 +3606,18 @@ function TaskDetailContent({ kind, id }: { kind: Kind; id: string }) {
               </span>
             ) : "Unassigned"}
           </PropertyRow>
+          {task.confirmerMembershipId && (
+            <PropertyRow icon={<Check className="h-3.5 w-3.5" />} label="Confirmer">
+              {confirmerIsMe ? (
+                <span>You</span>
+              ) : confirmer ? (
+                <span className="inline-flex items-center gap-2">
+                  <Avatar name={confirmer.user.name} email={confirmer.user.email} imageUrl={confirmer.user.imageUrl} />
+                  <span className="truncate">{assigneeDisplayName(confirmer)}</span>
+                </span>
+              ) : null}
+            </PropertyRow>
+          )}
           <PropertyRow icon={<StatusIcon className="h-3.5 w-3.5" />} label="Status">
             <StatusBadge kind={kind} task={task} size="md" canUpdateOverride={canEdit} cellTrigger={canEdit} />
           </PropertyRow>

@@ -5,7 +5,7 @@ import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { currentJdCycle, defaultTimeZone, nextJdCycleStart, type JdRecurrence } from "./taskCycles";
 import { effectiveCurrentJdCycle, elapsedJdOccurrences, loadWorkCalendar, occurrenceDeadline, type WorkCalendar } from "./workCalendar";
-import { activeCompanyMembershipIds, assertCanAssign, assertCanDeleteTask, assertCanUpdateTask, canViewTask, getManagedMembershipIds, hasAllManagedMemberships, hasAnyManagedMembership, memberFirstName, memberFullName, membershipCapabilities, requireCapability, requireMembership, scanManagedMembershipIds, scopedMembershipIds } from "./permissions";
+import { activeCompanyMembershipIds, assertCanAssign, assertCanChangeTaskConfirmer, assertCanDeleteTask, assertCanUpdateTask, canViewTask, getManagedMembershipIds, hasAllManagedMemberships, hasAnyManagedMembership, memberFirstName, memberFullName, membershipCapabilities, requireCapability, requireMembership, roleNameCapabilities, scanManagedMembershipIds, scopedMembershipIds } from "./permissions";
 import type { Capability } from "../src/lib/permissions";
 import { nonEmpty } from "./validation";
 import { DEFAULT_QUERY_LIMIT, takeWithOverflow } from "./queryLimits";
@@ -33,6 +33,7 @@ import {
 } from "./taskListPreferences";
 
 type ManualStatus = "due" | "in_progress" | "completed";
+type TaskStatus = ManualStatus | "awaiting_confirmation";
 type TaskKind = "jd" | "one_time";
 type Ctx = QueryCtx | MutationCtx;
 export type TaskVisibilityAuth = {
@@ -58,7 +59,7 @@ const ASSIGNABLE_USER_SEARCH_SCAN_LIMIT = 1_000;
 const ASSIGNABLE_USER_SEARCH_RESULT_LIMIT = 50;
 const ASSIGNABLE_USER_SEARCH_USER_BATCH_SIZE = 50;
 const taskListOrderKeyPattern = /^(?:0|-[1-9]\d*|[1-9]\d*)\/[1-9]\d*$/;
-function statusLabel(status: ManualStatus | "overdue") { return status === "due" ? "Pending" : status === "in_progress" ? "In Progress" : status === "completed" ? "Completed" : "Overdue"; }
+function statusLabel(status: TaskStatus | "overdue") { return status === "due" ? "Pending" : status === "in_progress" ? "In Progress" : status === "completed" ? "Completed" : status === "awaiting_confirmation" ? "Awaiting confirmation" : "Overdue"; }
 function cleanOptionalText(value?: string) { const text = value?.trim(); return text ? text : undefined; }
 function cleanOptionalQuantity(value?: number) { return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined; }
 async function enrich(ctx: Ctx, ids: Id<"companyMemberships">[]) {
@@ -91,7 +92,13 @@ async function taskVisibilityAuth(ctx: Ctx, companyId: Id<"companies">, membersh
   };
 }
 
-async function visible(ctx: Ctx, companyId: Id<"companies">, membership: Doc<"companyMemberships">, task: Pick<Doc<"jdTasks"> | Doc<"oneTimeTasks">, "assigneeMembershipIds" | "createdByMembershipId">, kind: TaskKind, auth?: TaskVisibilityAuth) {
+async function visible(ctx: Ctx, companyId: Id<"companies">, membership: Doc<"companyMemberships">, task: Pick<Doc<"jdTasks"> | Doc<"oneTimeTasks">, "assigneeMembershipIds" | "createdByMembershipId" | "confirmerMembershipId">, kind: TaskKind, auth?: TaskVisibilityAuth) {
+  // The designated confirmer may see the task they must act on even when it
+  // sits outside their normal view scope.
+  if (task.confirmerMembershipId === membership._id) {
+    const caps = auth?.caps ?? (await membershipCapabilities(ctx, membership));
+    if (caps.has("tasks:confirm")) return true;
+  }
   if (!auth) {
     return await canViewTask(ctx, companyId, membership, { companyId, assigneeMembershipIds: task.assigneeMembershipIds, createdByMembershipId: task.createdByMembershipId }, kind);
   }
@@ -129,8 +136,157 @@ function requireTaskAssignee(assignees: Id<"companyMemberships">[]) {
   if (new Set(assignees).size !== assignees.length) throw new ConvexError("Duplicate assignees are not allowed.");
 }
 
+// A confirmation request is per task (one-time) or per cycle (JD); pending
+// lists and per-task resolution stay bounded so a long history cannot make an
+// edit or a status change unbounded.
+const CONFIRMATION_REQUEST_LIMIT = 100;
+
+/**
+ * The pending request for a JD cycle on the given grid. A request stamped with
+ * another recurrence belongs to a superseded grid and is never "pending" for
+ * the current one.
+ */
+async function pendingConfirmationRequest(ctx: Ctx, taskType: TaskKind, taskId: string, cycleStart?: number, recurrence?: JdRecurrence) {
+  if (taskType === "jd") {
+    const request = ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", taskType).eq("taskId", taskId).eq("cycleStart", cycleStart!));
+    return recurrence === undefined
+      ? await request.first()
+      : await request.filter((q) => q.eq(q.field("recurrence"), recurrence)).first();
+  }
+  return await ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", taskType).eq("taskId", taskId)).filter((q) => q.eq(q.field("cycleStart"), undefined)).first();
+}
+
+export async function assertConfirmerInCompany(ctx: Ctx, companyId: Id<"companies">, confirmerMembershipId: Id<"companyMemberships">) {
+  const confirmer = await ctx.db.get(confirmerMembershipId);
+  if (!confirmer || confirmer.companyId !== companyId || !confirmer.active) throw new ConvexError("Confirmer not found in this company.");
+  if (!(await membershipCapabilities(ctx, confirmer)).has("tasks:confirm")) throw new ConvexError("The selected confirmer cannot confirm task completion.");
+}
+
+/**
+ * Applies the Confirm effect a request represents, in the caller's
+ * transaction. Authorization is the caller's job: the confirm mutation checks
+ * designation, and the confirmer's own completion path checks capability.
+ */
+async function resolveConfirmationRequest(ctx: MutationCtx, request: Doc<"taskConfirmationRequests">, actorMembershipId: Id<"companyMemberships">, now: number) {
+  if (request.taskType === "jd") {
+    const taskId = ctx.db.normalizeId("jdTasks", request.taskId);
+    const task = taskId ? await ctx.db.get(taskId) : null;
+    if (!taskId || !task || task.companyId !== request.companyId || request.cycleStart === undefined) {
+      await ctx.db.delete(request._id);
+      return;
+    }
+    const cycleStart = request.cycleStart;
+    // A request submitted on an earlier grid shares no cycle identity with the
+    // current one even when their starts coincide. Its confirmation is history:
+    // record the work retired and never touch the current grid's status.
+    const retired = request.recurrence !== task.recurrence;
+    if (!(await currentJdCompletion(ctx, taskId, cycleStart))) {
+      await ctx.db.insert("jdTaskCompletions", {
+        companyId: request.companyId,
+        jdTaskId: taskId,
+        cycleStart,
+        cycleEnd: request.cycleEnd,
+        completedByMembershipId: request.submittedByMembershipId,
+        completedAt: request.submittedAt,
+        ...(retired ? { retiredAt: now } : {}),
+      });
+    }
+    if (retired) {
+      await ctx.db.delete(request._id);
+      return;
+    }
+    const missed = await currentJdCycleRecord(ctx, taskId, cycleStart);
+    if (missed) await ctx.db.delete(missed._id);
+    if (task.statusCycleStart === cycleStart && task.status !== "completed") await ctx.db.patch(taskId, { status: "completed", updatedAt: now });
+  } else {
+    const taskId = ctx.db.normalizeId("oneTimeTasks", request.taskId);
+    const task = taskId ? await ctx.db.get(taskId) : null;
+    if (!taskId || !task || task.companyId !== request.companyId) {
+      await ctx.db.delete(request._id);
+      return;
+    }
+    if (task.status !== "completed") {
+      await ctx.db.replace(taskId, { ...task, status: "completed", completedAt: request.submittedAt, completedByMembershipId: request.submittedByMembershipId, updatedAt: now });
+    }
+  }
+  await logTaskActivity(ctx, { companyId: request.companyId, taskType: request.taskType, taskId: request.taskId, actorMembershipId, event: "status_changed", fromStatus: "awaiting_confirmation", toStatus: "completed", createdAt: now });
+  await ctx.db.delete(request._id);
+}
+
+/**
+ * Applies an edit that changes the task's confirmer: pending requests follow
+ * the new confirmer. Turning confirmation off is refused while anything is
+ * still pending, so no submission is silently approved by the edit.
+ */
+export async function applyConfirmerChange(
+  ctx: MutationCtx,
+  args: {
+    taskType: TaskKind;
+    taskId: string;
+    previousConfirmer?: Id<"companyMemberships">;
+    nextConfirmer?: Id<"companyMemberships">;
+  },
+) {
+  if (args.previousConfirmer === args.nextConfirmer) return;
+  const requests = ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", args.taskType).eq("taskId", args.taskId));
+  if (args.nextConfirmer === undefined) {
+    if (await requests.first()) throw new ConvexError("Confirm or send back the pending submissions before turning off confirmation.");
+    return;
+  }
+  const batch = await requests.take(CONFIRMATION_REQUEST_LIMIT);
+  for (const request of batch) {
+    if (request.confirmerMembershipId !== args.nextConfirmer) await ctx.db.patch(request._id, { confirmerMembershipId: args.nextConfirmer });
+  }
+  // A long-running JD task can hold more pending cycles than one transaction
+  // should write; the continuation finishes the re-point from the task's
+  // current confirmer, so a later edit still wins.
+  if (batch.length === CONFIRMATION_REQUEST_LIMIT) {
+    await ctx.scheduler.runAfter(0, internal.tasks.repointConfirmationRequests, { taskType: args.taskType, taskId: args.taskId });
+  }
+}
+
+/** Idempotent continuation of a confirmer re-point across every pending request batch. */
+export const repointConfirmationRequests = internalMutation({
+  args: {
+    taskType: v.union(v.literal("jd"), v.literal("one_time")),
+    taskId: v.string(),
+    cursor: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const normalized = args.taskType === "jd" ? ctx.db.normalizeId("jdTasks", args.taskId) : ctx.db.normalizeId("oneTimeTasks", args.taskId);
+    const task = normalized ? await ctx.db.get(normalized) : null;
+    const confirmer = task?.confirmerMembershipId;
+    // The task may have been deleted or confirmation turned off since the edit.
+    if (confirmer === undefined) return null;
+    const page = await ctx.db.query("taskConfirmationRequests")
+      .withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", args.taskType).eq("taskId", args.taskId))
+      .paginate({ numItems: CONFIRMATION_REQUEST_LIMIT, cursor: args.cursor ?? null });
+    for (const request of page.page) {
+      if (request.confirmerMembershipId !== confirmer) await ctx.db.patch(request._id, { confirmerMembershipId: confirmer });
+    }
+    if (!page.isDone) {
+      await ctx.scheduler.runAfter(0, internal.tasks.repointConfirmationRequests, { taskType: args.taskType, taskId: args.taskId, cursor: page.continueCursor });
+    }
+    return null;
+  },
+});
+
 function updateAuthTargets(task: Pick<Doc<"jdTasks"> | Doc<"oneTimeTasks">, "assigneeMembershipIds" | "createdByMembershipId">) {
   return task.assigneeMembershipIds.length === 0 ? [task.createdByMembershipId] : task.assigneeMembershipIds;
+}
+
+/** A confirmer change needs update authority beyond the self scope. */
+async function assertConfirmerChangeAllowed(
+  ctx: Ctx,
+  companyId: Id<"companies">,
+  membership: Doc<"companyMemberships">,
+  task: Pick<Doc<"jdTasks"> | Doc<"oneTimeTasks">, "assigneeMembershipIds" | "createdByMembershipId" | "confirmerMembershipId">,
+  kind: TaskKind,
+  capabilities: Set<Capability>,
+  nextConfirmer?: Id<"companyMemberships">,
+) {
+  if (nextConfirmer === task.confirmerMembershipId) return;
+  await assertCanChangeTaskConfirmer(ctx, companyId, membership, updateAuthTargets(task), kind, capabilities);
 }
 
 async function canUpdateTask(
@@ -230,9 +386,10 @@ export async function recordMissedJdCycles(ctx: MutationCtx, task: Doc<"jdTasks"
   // lookups per elapsed cycle. Keeping each lookup bounded to its own cycle
   // start means retired rows left at other starts by older, denser grids are
   // never scanned.
-  const [doneDocs, recordDocs] = await Promise.all([
+  const [doneDocs, recordDocs, pendingDocs] = await Promise.all([
     Promise.all(occurrences.map((cycle) => currentJdCompletion(ctx, task._id, cycle.start))),
     Promise.all(occurrences.map((cycle) => currentJdCycleRecord(ctx, task._id, cycle.start))),
+    Promise.all(occurrences.map((cycle) => pendingConfirmationRequest(ctx, "jd", task._id, cycle.start, task.recurrence))),
   ]);
   for (let i = 0; i < occurrences.length; i++) {
     const cycle = occurrences[i];
@@ -242,6 +399,8 @@ export async function recordMissedJdCycles(ctx: MutationCtx, task: Doc<"jdTasks"
     const markedDone = task.status === "completed" && task.statusCycleStart === cycle.start;
     const recorded = recordDocs[i];
     if (done) continue;
+    // A submitted cycle waiting on its confirmer is neither done nor missed.
+    if (pendingDocs[i]) continue;
     if (markedDone) {
       // Persist the stamped completion before cycleStartedAt advances past the
       // cycle, or the dashboard loses it once the stamp moves on. A missed
@@ -312,14 +471,14 @@ async function jdState(ctx: Ctx, task: Doc<"jdTasks">, now = Date.now(), timeZon
   const cal = calendar ?? await loadWorkCalendar(ctx, task.companyId);
   const c = effectiveCurrentJdCycle(cal, task.recurrence, now, zone);
   const currentDone = await currentJdCompletion(ctx, task._id, c.start);
-  const status: ManualStatus = currentDone || (task.statusCycleStart === c.start && task.status === "completed") ? "completed" : task.statusCycleStart === c.start ? task.status : "due";
+  const status: TaskStatus = currentDone || (task.statusCycleStart === c.start && task.status === "completed") ? "completed" : task.statusCycleStart === c.start ? task.status : "due";
   const dueAt = occurrenceDeadline(cal, task.recurrence, c.end, zone) ?? c.end;
   return { status: statusLabel(status), rawStatus: status, isOverdue: false, currentCycleStart: c.start, currentCycleEnd: c.end, dueAt };
 }
 
 // Overdue is an overlay; keep the stored manual status when a deadline changes.
 export function reconcileOneTimeOverdue(task: Doc<"oneTimeTasks">, now = Date.now()) {
-  if (task.status !== "completed" && task.dueDate !== undefined && task.dueDate < now) {
+  if (task.status !== "completed" && task.status !== "awaiting_confirmation" && task.dueDate !== undefined && task.dueDate < now) {
     task.overdueAt ??= now;
   } else {
     delete task.overdueAt;
@@ -327,8 +486,10 @@ export function reconcileOneTimeOverdue(task: Doc<"oneTimeTasks">, now = Date.no
 }
 
 function oneState(task: Doc<"oneTimeTasks">) {
-  const isOverdue = Boolean(task.overdueAt) || Boolean(task.dueDate && task.status !== "completed" && task.dueDate < Date.now());
-  const status: ManualStatus | "overdue" = isOverdue ? "overdue" : task.status;
+  // Submitted work waiting on its confirmer is not overdue; a sticky overdueAt
+  // still wins, exactly as it does for completed tasks.
+  const isOverdue = Boolean(task.overdueAt) || Boolean(task.dueDate && task.status !== "completed" && task.status !== "awaiting_confirmation" && task.dueDate < Date.now());
+  const status: TaskStatus | "overdue" = isOverdue ? "overdue" : task.status;
   return { status: statusLabel(status), rawStatus: status, isOverdue, dueAt: task.dueDate ?? null };
 }
 
@@ -340,7 +501,7 @@ async function getVisibleTask(ctx: Ctx, companyId: Id<"companies">, membership: 
   return { normalized, task };
 }
 
-async function logTaskActivity(ctx: MutationCtx, args: { companyId: Id<"companies">; taskType: TaskKind; taskId: string; actorMembershipId: Id<"companyMemberships">; event: "created" | "status_changed" | "paused" | "resumed"; fromStatus?: ManualStatus; toStatus?: ManualStatus; createdAt?: number }) {
+async function logTaskActivity(ctx: MutationCtx, args: { companyId: Id<"companies">; taskType: TaskKind; taskId: string; actorMembershipId: Id<"companyMemberships">; event: "created" | "status_changed" | "paused" | "resumed"; fromStatus?: TaskStatus; toStatus?: TaskStatus; createdAt?: number }) {
   await ctx.db.insert("taskActivityLogs", { companyId: args.companyId, taskType: args.taskType, taskId: args.taskId, actorMembershipId: args.actorMembershipId, event: args.event, ...(args.fromStatus ? { fromStatus: args.fromStatus } : {}), ...(args.toStatus ? { toStatus: args.toStatus } : {}), createdAt: args.createdAt ?? Date.now() });
 }
 
@@ -365,6 +526,12 @@ async function enrichedOneTime(ctx: Ctx, task: Doc<"oneTimeTasks">, canUpdate?: 
     ...(canDelete !== undefined ? { canDelete } : {}),
     ...(customOrderKey ? { customOrderKey } : {}),
   };
+}
+
+/** Detail payloads carry the confirmer as an enriched member so the client never resolves it itself. */
+async function withConfirmer<T extends { confirmerMembershipId?: Id<"companyMemberships"> }>(ctx: Ctx, task: T) {
+  const confirmer = task.confirmerMembershipId === undefined ? null : (await enrich(ctx, [task.confirmerMembershipId]))[0] ?? null;
+  return { ...task, confirmer };
 }
 function matchesSearch(task: { title: string; reference: string }, search?: string) {
   const needle = search?.trim().toLowerCase();
@@ -678,7 +845,9 @@ export const exportRows = query({
       const visibleTasks = page.page.filter((_, index) => visibleFlags[index]);
       const assigneeRows = await enrich(ctx, visibleTasks.flatMap((task) => task.assigneeMembershipIds.filter((id) => scoped.has(id))));
       const assigneeById = new Map(assigneeRows.map((row) => [row.membership._id, row]));
-      const rows = visibleTasks.map((task) => ({ reference: task.reference, title: task.title, description: task.description ?? null, notes: task.notes ?? null, recurrence: task.recurrence, time: task.time ?? null, quantity: task.quantity ?? null, assigneeEmails: task.assigneeMembershipIds.filter((id) => scoped.has(id)).map((id) => assigneeById.get(id)?.user.email).filter(Boolean).join("; "), isActive: task.pausedAt === undefined, evidenceRequired: task.evidenceRequired === true }));
+      const confirmerRows = await enrich(ctx, visibleTasks.flatMap((task) => task.confirmerMembershipId === undefined ? [] : [task.confirmerMembershipId]));
+      const confirmerEmailById = new Map(confirmerRows.map((row) => [row.membership._id, row.user.email]));
+      const rows = visibleTasks.map((task) => ({ reference: task.reference, title: task.title, description: task.description ?? null, notes: task.notes ?? null, recurrence: task.recurrence, time: task.time ?? null, quantity: task.quantity ?? null, assigneeEmails: task.assigneeMembershipIds.filter((id) => scoped.has(id)).map((id) => assigneeById.get(id)?.user.email).filter(Boolean).join("; "), isActive: task.pausedAt === undefined, evidenceRequired: task.evidenceRequired === true, confirmationRequired: task.confirmerMembershipId !== undefined, confirmerEmail: task.confirmerMembershipId === undefined ? null : confirmerEmailById.get(task.confirmerMembershipId) ?? null }));
       return { ...page, page: rows };
     }
     const page = await ctx.db.query("oneTimeTasks").withIndex("by_company", (q) => q.eq("companyId", args.companyId)).order("asc").paginate(args.paginationOpts);
@@ -686,7 +855,9 @@ export const exportRows = query({
     const visibleTasks = page.page.filter((_, index) => visibleFlags[index]);
     const assigneeRows = await enrich(ctx, visibleTasks.flatMap((task) => task.assigneeMembershipIds.filter((id) => scoped.has(id))));
     const assigneeById = new Map(assigneeRows.map((row) => [row.membership._id, row]));
-    const rows = visibleTasks.map((task) => ({ reference: task.reference, title: task.title, description: task.description ?? null, notes: task.notes ?? null, dueDate: task.dueDate ?? null, priority: task.priority, time: task.time ?? null, quantity: task.quantity ?? null, assigneeEmails: task.assigneeMembershipIds.filter((id) => scoped.has(id)).map((id) => assigneeById.get(id)?.user.email).filter(Boolean).join("; "), evidenceRequired: task.evidenceRequired === true }));
+    const confirmerRows = await enrich(ctx, visibleTasks.flatMap((task) => task.confirmerMembershipId === undefined ? [] : [task.confirmerMembershipId]));
+    const confirmerEmailById = new Map(confirmerRows.map((row) => [row.membership._id, row.user.email]));
+    const rows = visibleTasks.map((task) => ({ reference: task.reference, title: task.title, description: task.description ?? null, notes: task.notes ?? null, dueDate: task.dueDate ?? null, priority: task.priority, time: task.time ?? null, quantity: task.quantity ?? null, assigneeEmails: task.assigneeMembershipIds.filter((id) => scoped.has(id)).map((id) => assigneeById.get(id)?.user.email).filter(Boolean).join("; "), evidenceRequired: task.evidenceRequired === true, confirmationRequired: task.confirmerMembershipId !== undefined, confirmerEmail: task.confirmerMembershipId === undefined ? null : confirmerEmailById.get(task.confirmerMembershipId) ?? null }));
     return { ...page, page: rows };
   },
 });
@@ -1100,22 +1271,23 @@ export const getJd = query({
       canDeleteTask(ctx, args.companyId, membership, task, "jd", auth),
       displayScopedMembershipIds(ctx, args.companyId, auth, "tasks:jd:view:any"),
     ]);
-    return { task: await enrichedJd(ctx, task, company.timeZone ?? defaultTimeZone, canUpdate, canDelete, scoped), canUpdate, canDelete };
+    return { task: await withConfirmer(ctx, await enrichedJd(ctx, task, company.timeZone ?? defaultTimeZone, canUpdate, canDelete, scoped)), canUpdate, canDelete };
   },
 });
 
 export const createJd = mutation({
-  args: { companyId: v.id("companies"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), time: v.optional(v.string()), quantity: v.optional(v.number()), recurrence: recurrenceValidator, evidenceRequired: v.optional(v.boolean()), assigneeMembershipIds: v.array(v.id("companyMemberships")) },
+  args: { companyId: v.id("companies"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), time: v.optional(v.string()), quantity: v.optional(v.number()), recurrence: recurrenceValidator, evidenceRequired: v.optional(v.boolean()), confirmerMembershipId: v.optional(v.union(v.id("companyMemberships"), v.null())), assigneeMembershipIds: v.array(v.id("companyMemberships")) },
   handler: async (ctx, args) => {
     const { membership, user, company, capabilities } = await requireCapability(ctx, args.companyId, "tasks:jd:create");
     const title = nonEmpty(args.title, "Task title");
     requireTaskAssignee(args.assigneeMembershipIds);
     await assertAssigneesInCompany(ctx, args.companyId, args.assigneeMembershipIds);
     await assertCanAssign(ctx, args.companyId, membership, args.assigneeMembershipIds, "jd", capabilities);
+    if (args.confirmerMembershipId) await assertConfirmerInCompany(ctx, args.companyId, args.confirmerMembershipId);
     const now = Date.now();
     const reference = await nextReference(ctx, args.companyId, "jd");
     const calendar = await loadWorkCalendar(ctx, args.companyId);
-    const id = await ctx.db.insert("jdTasks", { companyId: args.companyId, reference, title, description: cleanOptionalText(args.description), notes: cleanOptionalText(args.notes), time: cleanOptionalText(args.time), quantity: cleanOptionalQuantity(args.quantity), recurrence: args.recurrence, cycleStartedAt: now, status: "due", statusCycleStart: effectiveCurrentJdCycle(calendar, args.recurrence, now, company.timeZone).start, evidenceRequired: args.evidenceRequired === true ? true : undefined, assigneeMembershipIds: args.assigneeMembershipIds, createdByMembershipId: membership._id, createdAt: now, updatedAt: now });
+    const id = await ctx.db.insert("jdTasks", { companyId: args.companyId, reference, title, description: cleanOptionalText(args.description), notes: cleanOptionalText(args.notes), time: cleanOptionalText(args.time), quantity: cleanOptionalQuantity(args.quantity), recurrence: args.recurrence, cycleStartedAt: now, status: "due", statusCycleStart: effectiveCurrentJdCycle(calendar, args.recurrence, now, company.timeZone).start, evidenceRequired: args.evidenceRequired === true ? true : undefined, confirmerMembershipId: args.confirmerMembershipId ?? undefined, assigneeMembershipIds: args.assigneeMembershipIds, createdByMembershipId: membership._id, createdAt: now, updatedAt: now });
     await logTaskActivity(ctx, { companyId: args.companyId, taskType: "jd", taskId: id, actorMembershipId: membership._id, event: "created", createdAt: now });
     await ctx.db.insert("auditEvents", { companyId: args.companyId, actorUserId: user._id, action: "jd_task.create", targetType: "jdTask", targetId: id, createdAt: now });
     return id;
@@ -1123,7 +1295,7 @@ export const createJd = mutation({
 });
 
 export const updateJd = mutation({
-  args: { companyId: v.id("companies"), taskId: v.id("jdTasks"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), time: v.optional(v.string()), quantity: v.optional(v.number()), recurrence: recurrenceValidator, evidenceRequired: v.optional(v.boolean()), assigneeMembershipIds: v.array(v.id("companyMemberships")) },
+  args: { companyId: v.id("companies"), taskId: v.id("jdTasks"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), time: v.optional(v.string()), quantity: v.optional(v.number()), recurrence: recurrenceValidator, evidenceRequired: v.optional(v.boolean()), confirmerMembershipId: v.optional(v.union(v.id("companyMemberships"), v.null())), assigneeMembershipIds: v.array(v.id("companyMemberships")) },
   handler: async (ctx, args) => {
     const { membership, capabilities } = await requireMembership(ctx, args.companyId);
     const task = await ctx.db.get(args.taskId);
@@ -1131,6 +1303,13 @@ export const updateJd = mutation({
     await assertCanUpdateTask(ctx, args.companyId, membership, updateAuthTargets(task), "jd", capabilities);
     requireTaskAssignee(args.assigneeMembershipIds);
     await assertAssigneesInCompany(ctx, args.companyId, args.assigneeMembershipIds);
+    const confirmer = args.confirmerMembershipId === undefined ? task.confirmerMembershipId : args.confirmerMembershipId ?? undefined;
+    if (confirmer !== task.confirmerMembershipId) {
+      await assertConfirmerChangeAllowed(ctx, args.companyId, membership, task, "jd", capabilities, confirmer);
+      // Only a newly chosen confirmer is validated, so a confirmer who later
+      // lost the capability never blocks unrelated edits to the task.
+      if (confirmer !== undefined) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    }
     const assigneesChanged = task.assigneeMembershipIds.length !== args.assigneeMembershipIds.length || args.assigneeMembershipIds.some((id) => !task.assigneeMembershipIds.includes(id));
     if (assigneesChanged && args.assigneeMembershipIds.length) await assertCanAssign(ctx, args.companyId, membership, args.assigneeMembershipIds, "jd", capabilities);
     const now = Date.now();
@@ -1161,6 +1340,10 @@ export const updateJd = mutation({
       if (args.evidenceRequired) nextTask.evidenceRequired = true;
       else delete nextTask.evidenceRequired;
     }
+    if (args.confirmerMembershipId !== undefined) {
+      if (confirmer === undefined) delete nextTask.confirmerMembershipId;
+      else nextTask.confirmerMembershipId = confirmer;
+    }
     nextTask.assigneeMembershipIds = args.assigneeMembershipIds;
     if (args.recurrence !== task.recurrence) {
       await retireJdHistoryAtCycle(ctx, task._id, nextCycleStart, now);
@@ -1170,6 +1353,7 @@ export const updateJd = mutation({
     }
     nextTask.updatedAt = now;
     await ctx.db.replace(args.taskId, nextTask);
+    await applyConfirmerChange(ctx, { taskType: "jd", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer });
     return null;
   },
 });
@@ -1211,15 +1395,23 @@ export const updateJdFields = mutation({
     quantity: v.optional(v.union(v.number(), v.null())),
     recurrence: v.optional(recurrenceValidator),
     evidenceRequired: v.optional(v.boolean()),
+    confirmerMembershipId: v.optional(v.union(v.id("companyMemberships"), v.null())),
     assigneeMembershipIds: v.optional(v.array(v.id("companyMemberships"))),
   },
   handler: async (ctx, args) => {
-    const hasUpdate = args.title !== undefined || args.description !== undefined || args.notes !== undefined || args.time !== undefined || args.quantity !== undefined || args.recurrence !== undefined || args.evidenceRequired !== undefined || args.assigneeMembershipIds !== undefined;
+    const hasUpdate = args.title !== undefined || args.description !== undefined || args.notes !== undefined || args.time !== undefined || args.quantity !== undefined || args.recurrence !== undefined || args.evidenceRequired !== undefined || args.confirmerMembershipId !== undefined || args.assigneeMembershipIds !== undefined;
     if (!hasUpdate) return null;
     const { membership, capabilities } = await requireMembership(ctx, args.companyId);
     const task = await ctx.db.get(args.taskId);
     if (!task || task.companyId !== args.companyId) throw new ConvexError("Task not found.");
     await assertCanUpdateTask(ctx, args.companyId, membership, updateAuthTargets(task), "jd", capabilities);
+    const confirmer = args.confirmerMembershipId === undefined ? task.confirmerMembershipId : args.confirmerMembershipId ?? undefined;
+    if (confirmer !== task.confirmerMembershipId) {
+      await assertConfirmerChangeAllowed(ctx, args.companyId, membership, task, "jd", capabilities, confirmer);
+      // Only a newly chosen confirmer is validated, so a confirmer who later
+      // lost the capability never blocks unrelated edits to the task.
+      if (confirmer !== undefined) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    }
     if (args.assigneeMembershipIds !== undefined) {
       requireTaskAssignee(args.assigneeMembershipIds);
       await assertAssigneesInCompany(ctx, args.companyId, args.assigneeMembershipIds);
@@ -1269,8 +1461,13 @@ export const updateJdFields = mutation({
       if (args.evidenceRequired) nextTask.evidenceRequired = true;
       else delete nextTask.evidenceRequired;
     }
+    if (args.confirmerMembershipId !== undefined) {
+      if (confirmer === undefined) delete nextTask.confirmerMembershipId;
+      else nextTask.confirmerMembershipId = confirmer;
+    }
     nextTask.updatedAt = now;
     await ctx.db.replace(args.taskId, nextTask);
+    await applyConfirmerChange(ctx, { taskType: "jd", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer });
     return null;
   },
 });
@@ -1293,7 +1490,7 @@ async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId:
   await scheduleMissedJdCycleCatchUp(ctx, task, cycle.start);
   const existing = await currentJdCompletion(ctx, taskId, cycle.start);
   const alreadyCompleted = Boolean(existing) || (task.statusCycleStart === cycle.start && task.status === "completed");
-  const previousStatus: ManualStatus = alreadyCompleted ? "completed" : task.statusCycleStart === cycle.start ? task.status : "due";
+  const previousStatus: TaskStatus = alreadyCompleted ? "completed" : task.statusCycleStart === cycle.start ? task.status : "due";
   if (status === "completed") {
     const activeEvidence = await activeTaskEvidence(ctx, "jd", taskId, cycle.start);
     if (activeEvidence) {
@@ -1312,8 +1509,51 @@ async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId:
       // after the fact must not strand the task in an unchangeable state.
       throw new ConvexError("Evidence is required to complete this task.");
     }
+    const confirmer = task.confirmerMembershipId;
+    const isConfirmer = confirmer !== undefined && confirmer === membership._id;
+    // Losing tasks:confirm also loses the direct-completion bypass; submitting
+    // a request addressed to yourself would leave the task stuck forever.
+    if (isConfirmer && !alreadyCompleted && !capabilities.has("tasks:confirm")) {
+      throw new ConvexError("You can no longer confirm this task. Ask an admin to choose a new confirmer.");
+    }
+    if (confirmer !== undefined && !isConfirmer && !alreadyCompleted) {
+      // Someone other than the designated confirmer submitted: hold the
+      // cycle. A retry for the same cycle keeps the original submission time.
+      if (!(await pendingConfirmationRequest(ctx, "jd", taskId, cycle.start, task.recurrence))) {
+        await ctx.db.insert("taskConfirmationRequests", {
+          companyId,
+          taskType: "jd",
+          taskId,
+          cycleStart: cycle.start,
+          cycleEnd: occurrenceDeadline(calendar, task.recurrence, cycle.end, timeZone) ?? cycle.end,
+          recurrence: task.recurrence,
+          confirmerMembershipId: confirmer,
+          submittedByMembershipId: membership._id,
+          submittedAt: now,
+        });
+      }
+      if (task.status !== "awaiting_confirmation" || task.statusCycleStart !== cycle.start) {
+        await ctx.db.patch(taskId, { status: "awaiting_confirmation", statusCycleStart: cycle.start, updatedAt: now });
+      }
+      if (previousStatus !== "awaiting_confirmation") await logTaskActivity(ctx, { companyId, taskType: "jd", taskId, actorMembershipId: membership._id, event: "status_changed", fromStatus: previousStatus, toStatus: "awaiting_confirmation", createdAt: now });
+      return;
+    }
+    const pending = await pendingConfirmationRequest(ctx, "jd", taskId, cycle.start, task.recurrence);
+    if (pending) {
+      if (isConfirmer) {
+        // The confirmer completing the task in the ordinary flow approves the
+        // submission, keeping its original time and author.
+        await resolveConfirmationRequest(ctx, pending, membership._id, now);
+        return;
+      }
+      // A task without a confirmer has no live submission to resolve.
+      await ctx.db.delete(pending._id);
+    }
     if (!existing) await ctx.db.insert("jdTaskCompletions", { companyId, jdTaskId: taskId, cycleStart: cycle.start, cycleEnd: occurrenceDeadline(calendar, task.recurrence, cycle.end, timeZone) ?? cycle.end, completedByMembershipId: membership._id, completedAt: now, note: cleanOptionalText(note) });
   } else {
+    // Withdrawing a submission deletes its request along with its evidence.
+    const pending = await pendingConfirmationRequest(ctx, "jd", taskId, cycle.start, task.recurrence);
+    if (pending) await ctx.db.delete(pending._id);
     await deleteActiveTaskEvidence(ctx, "jd", taskId, cycle.start);
     if (existing) await ctx.db.delete(existing._id);
   }
@@ -1452,13 +1692,14 @@ export const catchUpMissedJdCycles = internalMutation({
               .withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).eq("cycleStart", cycle.start))
               .filter((q) => q.eq(q.field("cycleEnd"), cycle.deadline))
               .first(),
+            pendingConfirmationRequest(ctx, "jd", task._id, cycle.start, args.schedule!.recurrence),
           ] as const),
         ),
       );
       for (let i = 0; i < occurrences.length; i++) {
         const cycle = occurrences[i];
-        const [done, recorded] = perCycle[i];
-        if (!done && !recorded) {
+        const [done, recorded, pending] = perCycle[i];
+        if (!done && !recorded && !pending) {
           await ctx.db.insert("jdTaskCycleRecords", { companyId: task.companyId, jdTaskId: task._id, cycleStart: cycle.start, cycleEnd: cycle.deadline, status: "missed", recordedAt: now });
         }
       }
@@ -1629,21 +1870,22 @@ export const getOneTime = query({
       canDeleteTask(ctx, args.companyId, membership, task, "one_time", auth),
       displayScopedMembershipIds(ctx, args.companyId, auth, "tasks:one_time:view:any"),
     ]);
-    return { task: await enrichedOneTime(ctx, task, canUpdate, canDelete, scoped), canUpdate, canDelete };
+    return { task: await withConfirmer(ctx, await enrichedOneTime(ctx, task, canUpdate, canDelete, scoped)), canUpdate, canDelete };
   },
 });
 
 export const createOneTime = mutation({
-  args: { companyId: v.id("companies"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), dueDate: v.optional(v.number()), time: v.optional(v.string()), quantity: v.optional(v.number()), assigneeMembershipIds: v.array(v.id("companyMemberships")), priority: priorityValidator, evidenceRequired: v.optional(v.boolean()) },
+  args: { companyId: v.id("companies"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), dueDate: v.optional(v.number()), time: v.optional(v.string()), quantity: v.optional(v.number()), assigneeMembershipIds: v.array(v.id("companyMemberships")), priority: priorityValidator, evidenceRequired: v.optional(v.boolean()), confirmerMembershipId: v.optional(v.union(v.id("companyMemberships"), v.null())) },
   handler: async (ctx, args) => {
     const { membership, user, capabilities } = await requireCapability(ctx, args.companyId, "tasks:one_time:create");
     const title = nonEmpty(args.title, "Task title");
     requireTaskAssignee(args.assigneeMembershipIds);
     await assertAssigneesInCompany(ctx, args.companyId, args.assigneeMembershipIds);
     await assertCanAssign(ctx, args.companyId, membership, args.assigneeMembershipIds, "one_time", capabilities);
+    if (args.confirmerMembershipId) await assertConfirmerInCompany(ctx, args.companyId, args.confirmerMembershipId);
     const now = Date.now();
     const reference = await nextReference(ctx, args.companyId, "one_time");
-    const id = await ctx.db.insert("oneTimeTasks", { companyId: args.companyId, reference, title, description: cleanOptionalText(args.description), notes: cleanOptionalText(args.notes), dueDate: args.dueDate, time: cleanOptionalText(args.time), quantity: cleanOptionalQuantity(args.quantity), assigneeMembershipIds: args.assigneeMembershipIds, createdByMembershipId: membership._id, priority: args.priority, status: "due", evidenceRequired: args.evidenceRequired === true ? true : undefined, createdAt: now, updatedAt: now });
+    const id = await ctx.db.insert("oneTimeTasks", { companyId: args.companyId, reference, title, description: cleanOptionalText(args.description), notes: cleanOptionalText(args.notes), dueDate: args.dueDate, time: cleanOptionalText(args.time), quantity: cleanOptionalQuantity(args.quantity), assigneeMembershipIds: args.assigneeMembershipIds, createdByMembershipId: membership._id, priority: args.priority, status: "due", evidenceRequired: args.evidenceRequired === true ? true : undefined, confirmerMembershipId: args.confirmerMembershipId ?? undefined, createdAt: now, updatedAt: now });
     await logTaskActivity(ctx, { companyId: args.companyId, taskType: "one_time", taskId: id, actorMembershipId: membership._id, event: "created", createdAt: now });
     await ctx.db.insert("auditEvents", { companyId: args.companyId, actorUserId: user._id, action: "one_time_task.create", targetType: "oneTimeTask", targetId: id, createdAt: now });
     return id;
@@ -1651,7 +1893,7 @@ export const createOneTime = mutation({
 });
 
 export const updateOneTime = mutation({
-  args: { companyId: v.id("companies"), taskId: v.id("oneTimeTasks"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), dueDate: v.optional(v.number()), time: v.optional(v.string()), quantity: v.optional(v.number()), assigneeMembershipIds: v.array(v.id("companyMemberships")), priority: priorityValidator, evidenceRequired: v.optional(v.boolean()) },
+  args: { companyId: v.id("companies"), taskId: v.id("oneTimeTasks"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), dueDate: v.optional(v.number()), time: v.optional(v.string()), quantity: v.optional(v.number()), assigneeMembershipIds: v.array(v.id("companyMemberships")), priority: priorityValidator, evidenceRequired: v.optional(v.boolean()), confirmerMembershipId: v.optional(v.union(v.id("companyMemberships"), v.null())) },
   handler: async (ctx, args) => {
     const { membership, capabilities } = await requireMembership(ctx, args.companyId);
     const task = await ctx.db.get(args.taskId);
@@ -1659,6 +1901,13 @@ export const updateOneTime = mutation({
     await assertCanUpdateTask(ctx, args.companyId, membership, updateAuthTargets(task), "one_time", capabilities);
     requireTaskAssignee(args.assigneeMembershipIds);
     await assertAssigneesInCompany(ctx, args.companyId, args.assigneeMembershipIds);
+    const confirmer = args.confirmerMembershipId === undefined ? task.confirmerMembershipId : args.confirmerMembershipId ?? undefined;
+    if (confirmer !== task.confirmerMembershipId) {
+      await assertConfirmerChangeAllowed(ctx, args.companyId, membership, task, "one_time", capabilities, confirmer);
+      // Only a newly chosen confirmer is validated, so a confirmer who later
+      // lost the capability never blocks unrelated edits to the task.
+      if (confirmer !== undefined) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    }
     const assigneesChanged = task.assigneeMembershipIds.length !== args.assigneeMembershipIds.length || args.assigneeMembershipIds.some((id) => !task.assigneeMembershipIds.includes(id));
     if (assigneesChanged && args.assigneeMembershipIds.length) await assertCanAssign(ctx, args.companyId, membership, args.assigneeMembershipIds, "one_time", capabilities);
     const nextTask = { ...task };
@@ -1683,9 +1932,14 @@ export const updateOneTime = mutation({
       if (args.evidenceRequired) nextTask.evidenceRequired = true;
       else delete nextTask.evidenceRequired;
     }
+    if (args.confirmerMembershipId !== undefined) {
+      if (confirmer === undefined) delete nextTask.confirmerMembershipId;
+      else nextTask.confirmerMembershipId = confirmer;
+    }
     reconcileOneTimeOverdue(nextTask);
     nextTask.updatedAt = Date.now();
     await ctx.db.replace(args.taskId, nextTask);
+    await applyConfirmerChange(ctx, { taskType: "one_time", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer });
     return null;
   },
 });
@@ -1729,14 +1983,22 @@ export const updateOneTimeFields = mutation({
     assigneeMembershipIds: v.optional(v.array(v.id("companyMemberships"))),
     priority: v.optional(priorityValidator),
     evidenceRequired: v.optional(v.boolean()),
+    confirmerMembershipId: v.optional(v.union(v.id("companyMemberships"), v.null())),
   },
   handler: async (ctx, args) => {
-    const hasUpdate = args.title !== undefined || args.description !== undefined || args.notes !== undefined || args.dueDate !== undefined || args.time !== undefined || args.quantity !== undefined || args.assigneeMembershipIds !== undefined || args.priority !== undefined || args.evidenceRequired !== undefined;
+    const hasUpdate = args.title !== undefined || args.description !== undefined || args.notes !== undefined || args.dueDate !== undefined || args.time !== undefined || args.quantity !== undefined || args.assigneeMembershipIds !== undefined || args.priority !== undefined || args.evidenceRequired !== undefined || args.confirmerMembershipId !== undefined;
     if (!hasUpdate) return null;
     const { membership, capabilities } = await requireMembership(ctx, args.companyId);
     const task = await ctx.db.get(args.taskId);
     if (!task || task.companyId !== args.companyId) throw new ConvexError("Task not found.");
     await assertCanUpdateTask(ctx, args.companyId, membership, updateAuthTargets(task), "one_time", capabilities);
+    const confirmer = args.confirmerMembershipId === undefined ? task.confirmerMembershipId : args.confirmerMembershipId ?? undefined;
+    if (confirmer !== task.confirmerMembershipId) {
+      await assertConfirmerChangeAllowed(ctx, args.companyId, membership, task, "one_time", capabilities, confirmer);
+      // Only a newly chosen confirmer is validated, so a confirmer who later
+      // lost the capability never blocks unrelated edits to the task.
+      if (confirmer !== undefined) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    }
     if (args.assigneeMembershipIds !== undefined) {
       requireTaskAssignee(args.assigneeMembershipIds);
       await assertAssigneesInCompany(ctx, args.companyId, args.assigneeMembershipIds);
@@ -1775,9 +2037,14 @@ export const updateOneTimeFields = mutation({
       if (args.evidenceRequired) nextTask.evidenceRequired = true;
       else delete nextTask.evidenceRequired;
     }
+    if (args.confirmerMembershipId !== undefined) {
+      if (confirmer === undefined) delete nextTask.confirmerMembershipId;
+      else nextTask.confirmerMembershipId = confirmer;
+    }
     reconcileOneTimeOverdue(nextTask);
     nextTask.updatedAt = Date.now();
     await ctx.db.replace(args.taskId, nextTask);
+    await applyConfirmerChange(ctx, { taskType: "one_time", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer });
     return null;
   },
 });
@@ -1793,7 +2060,7 @@ async function setOneTimeStatus(ctx: MutationCtx, companyId: Id<"companies">, ta
     throw new ConvexError("Overdue tasks are locked and cannot be changed back.");
   }
   const now = Date.now();
-  const previousStatus = state.rawStatus as ManualStatus;
+  const previousStatus = state.rawStatus as TaskStatus;
   if (status === "completed") {
     const activeEvidence = await activeTaskEvidence(ctx, "one_time", taskId);
     if (activeEvidence) {
@@ -1813,7 +2080,51 @@ async function setOneTimeStatus(ctx: MutationCtx, companyId: Id<"companies">, ta
       // after the fact must not strand the task in an unchangeable state.
       throw new ConvexError("Evidence is required to complete this task.");
     }
+    const confirmer = task.confirmerMembershipId;
+    const isConfirmer = confirmer !== undefined && confirmer === membership._id;
+    // Losing tasks:confirm also loses the direct-completion bypass; submitting
+    // a request addressed to yourself would leave the task stuck forever.
+    if (isConfirmer && task.status !== "completed" && !capabilities.has("tasks:confirm")) {
+      throw new ConvexError("You can no longer confirm this task. Ask an admin to choose a new confirmer.");
+    }
+    if (confirmer !== undefined && !isConfirmer && task.status !== "completed") {
+      // Someone other than the designated confirmer submitted. A retry keeps
+      // the original submission time instead of moving the stamp.
+      if (!(await pendingConfirmationRequest(ctx, "one_time", taskId))) {
+        await ctx.db.insert("taskConfirmationRequests", {
+          companyId,
+          taskType: "one_time",
+          taskId,
+          recurrence: null,
+          confirmerMembershipId: confirmer,
+          submittedByMembershipId: membership._id,
+          submittedAt: now,
+        });
+      }
+      if (task.status !== "awaiting_confirmation" || task.completedAt !== undefined) {
+        const awaiting = { ...task, status: "awaiting_confirmation" as const, updatedAt: now };
+        delete awaiting.completedAt;
+        delete awaiting.completedByMembershipId;
+        await ctx.db.replace(taskId, awaiting);
+      }
+      if (previousStatus !== "awaiting_confirmation") await logTaskActivity(ctx, { companyId, taskType: "one_time", taskId, actorMembershipId: membership._id, event: "status_changed", fromStatus: previousStatus, toStatus: "awaiting_confirmation", createdAt: now });
+      return null;
+    }
+    const pending = await pendingConfirmationRequest(ctx, "one_time", taskId);
+    if (pending) {
+      if (isConfirmer) {
+        // The confirmer completing the task in the ordinary flow approves the
+        // submission, keeping its original time and author.
+        await resolveConfirmationRequest(ctx, pending, membership._id, now);
+        return null;
+      }
+      // A task without a confirmer has no live submission to resolve.
+      await ctx.db.delete(pending._id);
+    }
   } else {
+    // Withdrawing a submission deletes its request along with its evidence.
+    const pending = await pendingConfirmationRequest(ctx, "one_time", taskId);
+    if (pending) await ctx.db.delete(pending._id);
     await deleteActiveTaskEvidence(ctx, "one_time", taskId);
   }
   const nextTask = { ...task, status, updatedAt: now };
@@ -1838,6 +2149,65 @@ export const completeOneTime = mutation({
   handler: async (ctx, args) => { await setOneTimeStatus(ctx, args.companyId, args.taskId, "completed", args.evidence); return null; },
 });
 
+export const confirmTaskCompletion = mutation({
+  args: { companyId: v.id("companies"), requestId: v.id("taskConfirmationRequests") },
+  handler: async (ctx, args) => {
+    const { membership } = await requireCapability(ctx, args.companyId, "tasks:confirm");
+    const request = await ctx.db.get(args.requestId);
+    // A retry after the request was resolved has nothing left to confirm.
+    if (!request) return null;
+    if (request.companyId !== args.companyId || request.confirmerMembershipId !== membership._id) throw new ConvexError("Confirmation request not found.");
+    await resolveConfirmationRequest(ctx, request, membership._id, Date.now());
+    return null;
+  },
+});
+
+export const sendBackTaskCompletion = mutation({
+  args: { companyId: v.id("companies"), requestId: v.id("taskConfirmationRequests") },
+  handler: async (ctx, args) => {
+    const { membership } = await requireCapability(ctx, args.companyId, "tasks:confirm");
+    const request = await ctx.db.get(args.requestId);
+    if (!request) return null;
+    if (request.companyId !== args.companyId || request.confirmerMembershipId !== membership._id) throw new ConvexError("Confirmation request not found.");
+    const now = Date.now();
+    await deleteActiveTaskEvidence(ctx, request.taskType, request.taskId, request.cycleStart);
+    if (request.taskType === "jd") {
+      const taskId = ctx.db.normalizeId("jdTasks", request.taskId);
+      const task = taskId ? await ctx.db.get(taskId) : null;
+      if (taskId && task && task.companyId === args.companyId && request.cycleStart !== undefined) {
+        if (request.recurrence !== task.recurrence) {
+          // A submission from a superseded grid becomes retired missed
+          // history; the current grid's status and records stay untouched.
+          if (request.cycleEnd !== undefined) {
+            await ctx.db.insert("jdTaskCycleRecords", { companyId: args.companyId, jdTaskId: taskId, cycleStart: request.cycleStart, cycleEnd: request.cycleEnd, status: "missed", recordedAt: now, retiredAt: now });
+          }
+        } else {
+          const timeZone = await companyTimeZone(ctx, args.companyId);
+          const calendar = await loadWorkCalendar(ctx, args.companyId);
+          const currentCycleStart = effectiveCurrentJdCycle(calendar, task.recurrence, now, timeZone).start;
+          if (request.cycleStart === currentCycleStart) {
+            await ctx.db.patch(taskId, { status: "in_progress", statusCycleStart: request.cycleStart, updatedAt: now });
+            await logTaskActivity(ctx, { companyId: args.companyId, taskType: "jd", taskId, actorMembershipId: membership._id, event: "status_changed", fromStatus: "awaiting_confirmation", toStatus: "in_progress", createdAt: now });
+          } else if (request.cycleEnd !== undefined && !(await currentJdCycleRecord(ctx, taskId, request.cycleStart))) {
+            // Catch-up deferred this elapsed cycle while it was pending; it is
+            // missed now that the submission is rejected.
+            await ctx.db.insert("jdTaskCycleRecords", { companyId: args.companyId, jdTaskId: taskId, cycleStart: request.cycleStart, cycleEnd: request.cycleEnd, status: "missed", recordedAt: now });
+          }
+        }
+      }
+    } else {
+      const taskId = ctx.db.normalizeId("oneTimeTasks", request.taskId);
+      const task = taskId ? await ctx.db.get(taskId) : null;
+      if (taskId && task && task.companyId === args.companyId && task.status === "awaiting_confirmation") {
+        await ctx.db.patch(taskId, { status: "in_progress", completedAt: undefined, completedByMembershipId: undefined, updatedAt: now });
+        await logTaskActivity(ctx, { companyId: args.companyId, taskType: "one_time", taskId, actorMembershipId: membership._id, event: "status_changed", fromStatus: "awaiting_confirmation", toStatus: "in_progress", createdAt: now });
+      }
+    }
+    await ctx.db.delete(request._id);
+    return null;
+  },
+});
+
 const DELETE_RELATED_BATCH = 500;
 const DELETE_BULK_TASK_LIMIT = 100;
 
@@ -1850,7 +2220,7 @@ const DELETE_BULK_TASK_LIMIT = 100;
  */
 async function deleteTaskRelatedBatch(ctx: MutationCtx, taskType: TaskKind, taskId: string): Promise<boolean> {
   if (await deleteTaskEvidenceBatch(ctx, taskType, taskId)) return true;
-  const loaders: (() => Promise<{ _id: Id<"jdTaskCompletions" | "jdTaskCycleRecords" | "taskComments" | "taskActivityLogs" | "taskAttachments">; storageId?: Id<"_storage"> }[]>)[] = [];
+  const loaders: (() => Promise<{ _id: Id<"jdTaskCompletions" | "jdTaskCycleRecords" | "taskConfirmationRequests" | "taskComments" | "taskActivityLogs" | "taskAttachments">; storageId?: Id<"_storage"> }[]>)[] = [];
   if (taskType === "jd") {
     const jdTaskId = taskId as Id<"jdTasks">;
     loaders.push(
@@ -1859,6 +2229,7 @@ async function deleteTaskRelatedBatch(ctx: MutationCtx, taskType: TaskKind, task
     );
   }
   loaders.push(
+    () => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", taskType).eq("taskId", taskId)).take(DELETE_RELATED_BATCH),
     () => ctx.db.query("taskComments").withIndex("by_task", (q) => q.eq("taskType", taskType).eq("taskId", taskId)).take(DELETE_RELATED_BATCH),
     () => ctx.db.query("taskActivityLogs").withIndex("by_task", (q) => q.eq("taskType", taskType).eq("taskId", taskId)).take(DELETE_RELATED_BATCH),
     () => ctx.db.query("taskAttachments").withIndex("by_task", (q) => q.eq("taskType", taskType).eq("taskId", taskId)).take(DELETE_RELATED_BATCH),
@@ -2294,6 +2665,64 @@ export const filterableAssignees = query({
   },
 });
 
+export const eligibleConfirmers = query({
+  args: { companyId: v.id("companies") },
+  handler: async (ctx, args) => {
+    const { capabilities } = await requireMembership(ctx, args.companyId);
+    const canConfigureTask = ["tasks:jd:create", "tasks:one_time:create", "tasks:jd:update:any", "tasks:jd:update:managed", "tasks:jd:update:self", "tasks:one_time:update:any", "tasks:one_time:update:managed", "tasks:one_time:update:self"].some((capability) => capabilities.has(capability as Capability));
+    if (!canConfigureTask) throw new ConvexError("You do not have access to do that.");
+    const result = await takeWithOverflow(
+      (limit) => ctx.db.query("companyMemberships").withIndex("by_company", (q) => q.eq("companyId", args.companyId)).take(limit),
+    );
+    const roleCache = new Map<string, Promise<Set<Capability>>>();
+    const ids: Id<"companyMemberships">[] = [];
+    for (const candidate of result.rows) {
+      if (candidate.active && (await roleNameCapabilities(ctx, args.companyId, candidate.role, roleCache)).has("tasks:confirm")) ids.push(candidate._id);
+    }
+    return { users: await enrich(ctx, ids), isTruncated: result.isTruncated };
+  },
+});
+
+export const listAwaitingConfirmation = query({
+  args: { companyId: v.id("companies"), taskType: v.union(v.literal("jd"), v.literal("one_time")) },
+  handler: async (ctx, args) => {
+    const { membership } = await requireCapability(ctx, args.companyId, "tasks:confirm");
+    const result = await takeWithOverflow(
+      (limit) => ctx.db
+        .query("taskConfirmationRequests")
+        .withIndex("by_confirmerMembershipId_and_taskType_and_submittedAt", (q) => q.eq("confirmerMembershipId", membership._id).eq("taskType", args.taskType))
+        .order("desc")
+        .take(limit),
+      CONFIRMATION_REQUEST_LIMIT,
+    );
+    const joined: { request: Doc<"taskConfirmationRequests">; task: Doc<"jdTasks"> | Doc<"oneTimeTasks"> }[] = [];
+    for (const request of result.rows) {
+      const taskId = request.taskType === "jd" ? ctx.db.normalizeId("jdTasks", request.taskId) : ctx.db.normalizeId("oneTimeTasks", request.taskId);
+      const task = taskId ? await ctx.db.get(taskId) : null;
+      if (task && task.companyId === args.companyId) joined.push({ request, task });
+    }
+    const assignees = await enrich(ctx, joined.flatMap(({ task }) => task.assigneeMembershipIds));
+    const assigneeById = new Map(assignees.map((row) => [row.membership._id, row]));
+    const submitters = await enrich(ctx, joined.map(({ request }) => request.submittedByMembershipId));
+    const submitterById = new Map(submitters.map((row) => [row.membership._id, row]));
+    return {
+      isTruncated: result.isTruncated,
+      rows: joined.map(({ request, task }) => ({
+        _id: request._id,
+        taskId: request.taskId,
+        taskType: request.taskType,
+        reference: task.reference,
+        title: task.title,
+        assignees: task.assigneeMembershipIds.flatMap((id) => assigneeById.get(id) ?? []),
+        submittedBy: submitterById.get(request.submittedByMembershipId) ?? null,
+        submittedAt: request.submittedAt,
+        cycleStart: request.cycleStart ?? null,
+        cycleEnd: request.cycleEnd ?? null,
+      })),
+    };
+  },
+});
+
 
 type AiAssignee = { name: string; role: string };
 
@@ -2302,11 +2731,11 @@ function visibleAssigneeIds(task: Doc<"jdTasks"> | Doc<"oneTimeTasks">, scopedMe
 }
 
 function aiJdRow(task: Doc<"jdTasks">, state: { status: string; dueAt: number | null }, scopedMembershipIds: Set<Id<"companyMemberships">> | undefined, assignees: Map<Id<"companyMemberships">, AiAssignee>) {
-  return { kind: "jd" as const, id: task._id, reference: task.reference, title: task.title, description: task.description, notes: task.notes, status: state.status, dueAt: state.dueAt, recurrence: task.recurrence, quantity: task.quantity, time: task.time, evidenceRequired: task.evidenceRequired === true, assignees: visibleAssigneeIds(task, scopedMembershipIds).map((id) => assignees.get(id)).filter(Boolean) };
+  return { kind: "jd" as const, id: task._id, reference: task.reference, title: task.title, description: task.description, notes: task.notes, status: state.status, dueAt: state.dueAt, recurrence: task.recurrence, quantity: task.quantity, time: task.time, evidenceRequired: task.evidenceRequired === true, confirmationRequired: task.confirmerMembershipId !== undefined, assignees: visibleAssigneeIds(task, scopedMembershipIds).map((id) => assignees.get(id)).filter(Boolean) };
 }
 
 function aiOneTimeRow(task: Doc<"oneTimeTasks">, state: { status: string; dueAt: number | null }, scopedMembershipIds: Set<Id<"companyMemberships">> | undefined, assignees: Map<Id<"companyMemberships">, AiAssignee>) {
-  return { kind: "one_time" as const, id: task._id, reference: task.reference, title: task.title, description: task.description, notes: task.notes, status: state.status, dueAt: task.dueDate, priority: task.priority, quantity: task.quantity, time: task.time, evidenceRequired: task.evidenceRequired === true, assignees: visibleAssigneeIds(task, scopedMembershipIds).map((id) => assignees.get(id)).filter(Boolean) };
+  return { kind: "one_time" as const, id: task._id, reference: task.reference, title: task.title, description: task.description, notes: task.notes, status: state.status, dueAt: task.dueDate, priority: task.priority, quantity: task.quantity, time: task.time, evidenceRequired: task.evidenceRequired === true, confirmationRequired: task.confirmerMembershipId !== undefined, assignees: visibleAssigneeIds(task, scopedMembershipIds).map((id) => assignees.get(id)).filter(Boolean) };
 }
 
 // Single-task wrapper for the mutation/detail paths — the list path batches

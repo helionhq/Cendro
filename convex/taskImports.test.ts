@@ -22,10 +22,12 @@ async function seed() {
     const now = Date.now();
     const companyId = await ctx.db.insert("companies", { name: "Acme", createdAt: now });
     const adminUserId = await ctx.db.insert("appUsers", { clerkSubject: "clerk|admin", email: "admin@example.com", firstName: "Admin", createdAt: now, updatedAt: now });
+    const managerUserId = await ctx.db.insert("appUsers", { clerkSubject: "clerk|manager", email: "manager@example.com", firstName: "Manager", createdAt: now, updatedAt: now });
     const employeeUserId = await ctx.db.insert("appUsers", { clerkSubject: "clerk|employee", email: "employee@example.com", firstName: "Employee", createdAt: now, updatedAt: now });
     const adminMembershipId = await ctx.db.insert("companyMemberships", { companyId, userId: adminUserId, role: "Admin", active: true, createdAt: now, updatedAt: now });
+    const managerMembershipId = await ctx.db.insert("companyMemberships", { companyId, userId: managerUserId, role: "Manager", active: true, createdAt: now, updatedAt: now });
     const employeeMembershipId = await ctx.db.insert("companyMemberships", { companyId, userId: employeeUserId, role: "Employee", active: true, createdAt: now, updatedAt: now });
-    return { companyId, adminMembershipId, employeeMembershipId };
+    return { companyId, adminMembershipId, managerMembershipId, employeeMembershipId };
   });
   return { t, ...ids };
 }
@@ -39,7 +41,7 @@ function draft(overrides: Record<string, unknown> = {}) {
   return {
     rowKey: "JD Tasks:2", sourceSheet: "JD Tasks", sourceRow: 2, source: "cendro" as const, kind: "jd" as const,
     reference: "JD-001", title: "Opening checklist", description: null, notes: null, recurrence: "daily" as const, dueDate: null, priority: null,
-    time: null, quantity: null, rawAssigneeText: "admin@example.com", assigneeEmails: ["admin@example.com"], status: null, isActive: null, presentFields: ["reference", "title", "recurrence", "assignees"] as ("reference" | "title" | "recurrence" | "assignees" | "status" | "notes" | "isActive")[],
+    time: null, quantity: null, rawAssigneeText: "admin@example.com", assigneeEmails: ["admin@example.com"], status: null, isActive: null, presentFields: ["reference", "title", "recurrence", "assignees"] as ("reference" | "title" | "recurrence" | "assignees" | "status" | "notes" | "isActive" | "evidenceRequired" | "confirmationRequired" | "confirmerEmail")[],
     warnings: [], ...overrides,
   };
 }
@@ -517,6 +519,142 @@ describe("task import backend", () => {
     });
     expect(blocked.rows[0].operation).toBe("blocked");
     expect(blocked.rows[0].errors).toContain("Evidence required must be Yes or No.");
+  });
+
+  test("confirmation imports create, preserve, re-point, and clear the confirmer", async () => {
+    const { t, companyId, adminMembershipId, managerMembershipId, employeeMembershipId } = await seed();
+    const admin = t.withIdentity(identity("admin"));
+    const employee = t.withIdentity(identity("employee"));
+
+    // Yes plus a valid email creates a task with that confirmer.
+    await commitImport(admin, {
+      companyId, kind: "jd", importKey: "confirm-create", batchKey: "batch-1",
+      rows: [{
+        include: true,
+        selectedAssigneeMembershipIds: [employeeMembershipId],
+        draft: draft({ reference: "JD-010", title: "Signed off", confirmationRequired: true, confirmerEmail: "Manager@Example.com", presentFields: ["reference", "title", "recurrence", "assignees", "confirmationRequired", "confirmerEmail"] }),
+      }],
+    });
+    const created = (await admin.query(api.tasks.listJdRows, { companyId, search: "Signed off", paginationOpts: { numItems: 10, cursor: null } })).page[0];
+    expect(created.confirmerMembershipId).toBe(managerMembershipId);
+
+    // The submission waits on the imported confirmer.
+    await employee.mutation(api.tasks.completeJd, { companyId, taskId: created._id });
+    const pending = async () => await t.run(async (ctx) => await ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", created._id)).first());
+    expect((await pending())?.confirmerMembershipId).toBe(managerMembershipId);
+
+    // A blank column preserves the confirmer on update.
+    const submitted = await admin.query(api.tasks.getJd, { companyId, taskId: created._id });
+    await commitImport(admin, {
+      companyId, kind: "jd", importKey: "confirm-blank", batchKey: "batch-1",
+      rows: [{ include: true, expectedUpdatedAt: submitted.task.updatedAt, selectedAssigneeMembershipIds: null, draft: draft({ reference: "JD-010", title: "Renamed", presentFields: ["reference", "title"], rawAssigneeText: "", assigneeEmails: [] }) }],
+    });
+    expect((await pending())?.confirmerMembershipId).toBe(managerMembershipId);
+
+    // Re-pointing follows the same path as a task edit.
+    const renamed = await admin.query(api.tasks.getJd, { companyId, taskId: created._id });
+    await commitImport(admin, {
+      companyId, kind: "jd", importKey: "confirm-repoint", batchKey: "batch-1",
+      rows: [{ include: true, expectedUpdatedAt: renamed.task.updatedAt, selectedAssigneeMembershipIds: null, draft: draft({ reference: "JD-010", confirmationRequired: true, confirmerEmail: "admin@example.com", presentFields: ["reference", "confirmationRequired", "confirmerEmail"], rawAssigneeText: "", assigneeEmails: [] }) }],
+    });
+    expect((await pending())?.confirmerMembershipId).toBe(adminMembershipId);
+
+    // Clearing while a submission is pending is refused; it must be resolved first.
+    const repointed = await admin.query(api.tasks.getJd, { companyId, taskId: created._id });
+    await expect(commitImport(admin, {
+      companyId, kind: "jd", importKey: "confirm-clear", batchKey: "batch-1",
+      rows: [{ include: true, expectedUpdatedAt: repointed.task.updatedAt, selectedAssigneeMembershipIds: null, draft: draft({ reference: "JD-010", confirmationRequired: false, presentFields: ["reference", "confirmationRequired"], rawAssigneeText: "", assigneeEmails: [] }) }],
+    })).rejects.toThrow("Confirm or send back the pending submissions before turning off confirmation.");
+
+    // The re-pointed confirmer resolves it, then the clear is a plain edit.
+    const request = (await admin.query(api.tasks.listAwaitingConfirmation, { companyId, taskType: "jd" })).rows[0];
+    await admin.mutation(api.tasks.sendBackTaskCompletion, { companyId, requestId: request._id });
+    expect(await pending()).toBeNull();
+    const returned = await admin.query(api.tasks.getJd, { companyId, taskId: created._id });
+    await commitImport(admin, {
+      companyId, kind: "jd", importKey: "confirm-clear-resolved", batchKey: "batch-1",
+      rows: [{ include: true, expectedUpdatedAt: returned.task.updatedAt, selectedAssigneeMembershipIds: null, draft: draft({ reference: "JD-010", confirmationRequired: false, presentFields: ["reference", "confirmationRequired"], rawAssigneeText: "", assigneeEmails: [] }) }],
+    });
+    const cleared = await admin.query(api.tasks.getJd, { companyId, taskId: created._id });
+    expect(cleared.task.confirmerMembershipId).toBeUndefined();
+    expect(cleared.task.state.rawStatus).toBe("in_progress");
+  });
+
+  test("confirmation imports reject inconsistent or ineligible confirmers", async () => {
+    const { t, companyId } = await seed();
+    const admin = t.withIdentity(identity("admin"));
+    const preview = async (overrides: Record<string, unknown>) => await admin.mutation(api.taskImports.previewTaskImport, {
+      companyId,
+      kind: "jd",
+      drafts: [draft({ reference: "JD-020", title: "Needs a decision", ...overrides })],
+    });
+
+    const missingEmail = await preview({ confirmationRequired: true, presentFields: ["reference", "title", "recurrence", "assignees", "confirmationRequired"] });
+    expect(missingEmail.rows[0].operation).toBe("blocked");
+    expect(missingEmail.rows[0].errors).toContain("Confirmation required needs a confirmer email.");
+
+    const emailWithoutConfirmation = await preview({ confirmationRequired: false, confirmerEmail: "admin@example.com", presentFields: ["reference", "title", "recurrence", "assignees", "confirmationRequired", "confirmerEmail"] });
+    expect(emailWithoutConfirmation.rows[0].operation).toBe("blocked");
+    expect(emailWithoutConfirmation.rows[0].errors).toContain("Confirmer email is only allowed when confirmation is required.");
+
+    const ineligible = await preview({ confirmationRequired: true, confirmerEmail: "employee@example.com", presentFields: ["reference", "title", "recurrence", "assignees", "confirmationRequired", "confirmerEmail"] });
+    expect(ineligible.rows[0].operation).toBe("blocked");
+    expect(ineligible.rows[0].errors).toContain("The selected confirmer cannot confirm task completion.");
+  });
+
+  test("an import cannot change the confirmer with self-only update authority", async () => {
+    const { t, companyId, managerMembershipId, employeeMembershipId } = await seed();
+    const admin = t.withIdentity(identity("admin"));
+    const employee = t.withIdentity(identity("employee"));
+    await t.run(async (ctx) => {
+      await ctx.db.insert("roles", { companyId, name: "Employee", capabilities: [...defaultRoleCapabilities.Employee, "tasks:jd:import"], createdAt: Date.now(), updatedAt: Date.now() });
+    });
+    const taskId = await admin.mutation(api.tasks.createJd, { companyId, title: "Self-appointed import", recurrence: "daily", assigneeMembershipIds: [employeeMembershipId], confirmerMembershipId: managerMembershipId });
+    const task = await admin.query(api.tasks.getJd, { companyId, taskId });
+
+    await expect(commitImport(employee, {
+      companyId, kind: "jd", importKey: "confirm-self-only", batchKey: "batch-1",
+      rows: [{ include: true, expectedUpdatedAt: task.task.updatedAt, selectedAssigneeMembershipIds: null, draft: draft({ reference: task.task.reference, title: "Self-appointed import", confirmationRequired: true, confirmerEmail: "admin@example.com", presentFields: ["reference", "title", "confirmationRequired", "confirmerEmail"], rawAssigneeText: "", assigneeEmails: [] }) }],
+    })).rejects.toThrow("You cannot change who confirms this task.");
+    expect((await admin.query(api.tasks.getJd, { companyId, taskId })).task.confirmerMembershipId).toBe(managerMembershipId);
+  });
+
+  test("an import may keep an existing confirmer who no longer holds the capability", async () => {
+    const { t, companyId, adminMembershipId, managerMembershipId } = await seed();
+    const admin = t.withIdentity(identity("admin"));
+    const taskId = await admin.mutation(api.tasks.createJd, { companyId, title: "Keep the confirmer", recurrence: "daily", assigneeMembershipIds: [adminMembershipId], confirmerMembershipId: managerMembershipId });
+    // The confirmer role loses the capability after the task was configured.
+    await t.run(async (ctx) => {
+      await ctx.db.insert("roles", { companyId, name: "Manager", capabilities: defaultRoleCapabilities.Manager.filter((capability) => capability !== "tasks:confirm"), createdAt: Date.now(), updatedAt: Date.now() });
+    });
+    const task = await admin.query(api.tasks.getJd, { companyId, taskId });
+
+    await commitImport(admin, {
+      companyId, kind: "jd", importKey: "confirm-keep", batchKey: "batch-1",
+      rows: [{ include: true, expectedUpdatedAt: task.task.updatedAt, selectedAssigneeMembershipIds: null, draft: draft({ reference: task.task.reference, title: "Keep the confirmer renamed", confirmationRequired: true, confirmerEmail: "manager@example.com", presentFields: ["reference", "title", "confirmationRequired", "confirmerEmail"], rawAssigneeText: "", assigneeEmails: [] }) }],
+    });
+    const updated = await admin.query(api.tasks.getJd, { companyId, taskId });
+    expect(updated.task.title).toBe("Keep the confirmer renamed");
+    expect(updated.task.confirmerMembershipId).toBe(managerMembershipId);
+  });
+
+  test("exportRows writes confirmation columns and the exported confirmer re-imports unchanged", async () => {
+    const { t, companyId, adminMembershipId, managerMembershipId } = await seed();
+    const admin = t.withIdentity(identity("admin"));
+    const jdId = await admin.mutation(api.tasks.createJd, { companyId, title: "Export JD", recurrence: "daily", assigneeMembershipIds: [adminMembershipId], confirmerMembershipId: managerMembershipId });
+    await admin.mutation(api.tasks.createOneTime, { companyId, title: "Export OT", dueDate: Date.now() + 86_400_000, priority: "medium", assigneeMembershipIds: [adminMembershipId], confirmerMembershipId: managerMembershipId });
+
+    const jdExport = await admin.query(api.tasks.exportRows, { companyId, kind: "jd", paginationOpts: { numItems: 50, cursor: null } });
+    expect(jdExport.page[0]).toMatchObject({ confirmationRequired: true, confirmerEmail: "manager@example.com" });
+    const otExport = await admin.query(api.tasks.exportRows, { companyId, kind: "one_time", paginationOpts: { numItems: 50, cursor: null } });
+    expect(otExport.page[0]).toMatchObject({ confirmationRequired: true, confirmerEmail: "manager@example.com" });
+
+    const task = await admin.query(api.tasks.getJd, { companyId, taskId: jdId });
+    await commitImport(admin, {
+      companyId, kind: "jd", importKey: "confirm-export-roundtrip", batchKey: "batch-1",
+      rows: [{ include: true, expectedUpdatedAt: task.task.updatedAt, selectedAssigneeMembershipIds: null, draft: draft({ reference: jdExport.page[0].reference, title: jdExport.page[0].title, confirmationRequired: jdExport.page[0].confirmationRequired, confirmerEmail: jdExport.page[0].confirmerEmail, presentFields: ["reference", "title", "confirmationRequired", "confirmerEmail"], rawAssigneeText: "", assigneeEmails: [] }) }],
+    });
+    expect((await admin.query(api.tasks.getJd, { companyId, taskId: jdId })).task.confirmerMembershipId).toBe(managerMembershipId);
   });
 
   test("exportRows includes description and notes, and imports preserve them across create and update", async () => {

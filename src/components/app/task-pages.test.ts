@@ -24,12 +24,20 @@ const state = vi.hoisted(() => ({
   clockFailAfterFirst: false,
   clockWait: null as Promise<void> | null,
   statusWait: null as Promise<void> | null,
-  detail: null as null | { task: { _id: string; title: string; createdAt: number; priority: string; dueDate: number; assigneeMembershipIds: string[]; evidenceRequired?: boolean; state: { status: string; rawStatus: string; currentCycleStart?: number } }; canUpdate: boolean },
+  detail: null as null | { task: { _id: string; title: string; createdAt: number; priority: string; dueDate: number; assigneeMembershipIds: string[]; evidenceRequired?: boolean; confirmerMembershipId?: string; confirmer?: unknown; state: { status: string; rawStatus: string; currentCycleStart?: number } }; canUpdate: boolean },
   otherAssigneeIds: [] as string[],
   evidenceRequired: [] as string[],
   evidenceResults: [] as unknown[],
-  exported: [] as { evidenceRequired?: boolean }[],
+  exported: [] as { evidenceRequired?: boolean; confirmationRequired?: boolean | null; confirmerEmail?: string | null }[],
   statusWrites: [] as { taskId: string; status: string; evidence?: unknown }[],
+  assignable: [] as unknown[],
+  confirmers: [] as unknown[],
+  confirmersByTask: {} as Record<string, string>,
+  awaitingRows: [] as unknown[],
+  createWrites: [] as Record<string, unknown>[],
+  updateWrites: [] as Record<string, unknown>[],
+  confirmWrites: [] as { requestId: string }[],
+  sendBackWrites: [] as { requestId: string }[],
   pausedIds: [] as string[],
   lifecycleAllowed: true,
   capabilities: [] as string[],
@@ -38,6 +46,7 @@ const state = vi.hoisted(() => ({
   railRows: new Map<string, () => void>(),
   selectMy: null as null | (() => void),
   selectAll: null as null | (() => void),
+  selectAwaiting: null as null | (() => void),
   selects: new Map<string, () => void>(),
   checkboxes: new Map<string, { checked: boolean; onCheckedChange: (value: boolean) => void; onSelect?: (event: { preventDefault: () => void }) => void }>(),
   filterPaused: null as null | ((value: boolean) => void),
@@ -71,7 +80,9 @@ vi.mock("convex/react", () => {
         case "tasks:getJd": return state.detail;
         case "tasks:getCustomView": return state.view;
         case "tasks:getListPreference": return { sort: { mode: "default" }, customOrder: null, revision: 0 };
-        case "tasks:assignableUsers": return { users: [], isTruncated: false };
+        case "tasks:assignableUsers": return { users: state.assignable, isTruncated: false };
+        case "tasks:eligibleConfirmers": return { users: state.confirmers, isTruncated: false };
+        case "tasks:listAwaitingConfirmation": return { isTruncated: false, rows: state.awaitingRows };
         default: return [];
       }
     },
@@ -90,6 +101,7 @@ vi.mock("convex/react", () => {
             pausedAt: state.pausedIds.includes(_id) ? 1 : undefined,
             canPause: state.lifecycleAllowed, canResume: state.lifecycleAllowed,
             evidenceRequired: state.evidenceRequired.includes(_id) || undefined,
+            confirmerMembershipId: state.confirmersByTask[_id],
             assigneeMembershipIds: [state.otherAssigneeIds.includes(_id) ? "other" : "member"], assignees: [], state: state.taskStates[_id] ?? { status: "Due" },
           })),
       };
@@ -108,9 +120,25 @@ vi.mock("convex/react", () => {
         const mutate = async (args: StatusArgs) => { state.statusWrites.push(args); optimistic?.(store, args); if (state.statusWait) await state.statusWait; };
         return Object.assign(mutate, { withOptimisticUpdate: (update: typeof optimistic) => { optimistic = update; return mutate; } });
       }
-      const mutate = ["tasks:saveCustomView", "tasks:saveListOrder"].includes(getFunctionName(ref))
+      const name = getFunctionName(ref);
+      if (name === "tasks:createOneTime" || name === "tasks:createJd") {
+        const create = async (args: Record<string, unknown>) => { state.createWrites.push(args); return "new"; };
+        return Object.assign(create, { withOptimisticUpdate: () => create });
+      }
+      if (name === "tasks:updateOneTime" || name === "tasks:updateJd") {
+        const update = async (args: Record<string, unknown>) => { state.updateWrites.push(args); };
+        return Object.assign(update, { withOptimisticUpdate: () => update });
+      }
+      if (name === "tasks:confirmTaskCompletion" || name === "tasks:sendBackTaskCompletion") {
+        const resolve = async (args: { requestId: string }) => {
+          if (name === "tasks:confirmTaskCompletion") state.confirmWrites.push(args);
+          else state.sendBackWrites.push(args);
+        };
+        return Object.assign(resolve, { withOptimisticUpdate: () => resolve });
+      }
+      const mutate = ["tasks:saveCustomView", "tasks:saveListOrder"].includes(name)
         ? (args: typeof state.writes[number]["args"]) => new Promise<{ orderedIds: string[]; revision: number }>((resolve) => state.writes.push({ args, resolve }))
-        : getFunctionName(ref) === "tasks:setJdPausedBulk"
+        : name === "tasks:setJdPausedBulk"
           ? async (args: { taskIds: string[]; paused: boolean }) => { state.lifecycleWrites.push(args); }
           : vi.fn();
       return Object.assign(mutate, { withOptimisticUpdate: () => mutate });
@@ -139,6 +167,7 @@ vi.mock("./task-rail-scroll", () => ({
         if (label.includes("Custom")) state.selectCustom = button.props.onClick ?? null;
         if (label.includes("My Tasks")) state.selectMy = button.props.onClick ?? null;
         if (label.includes("All Tasks")) state.selectAll = button.props.onClick ?? null;
+        if (label.includes("Awaiting confirmation")) state.selectAwaiting = button.props.onClick ?? null;
       });
     });
     return null;
@@ -219,12 +248,21 @@ afterEach(async () => {
   state.evidenceResults = [];
   state.exported = [];
   state.statusWrites = [];
+  state.assignable = [];
+  state.confirmers = [];
+  state.confirmersByTask = {};
+  state.awaitingRows = [];
+  state.createWrites = [];
+  state.updateWrites = [];
+  state.confirmWrites = [];
+  state.sendBackWrites = [];
   state.pausedIds = [];
   state.lifecycleAllowed = true;
   state.capabilities = [];
   state.ignorePausedQuery = false;
   state.lifecycleWrites = [];
   state.filterPaused = null;
+  state.selectAwaiting = null;
   state.selects.clear();
   state.checkboxes.clear();
   state.writes = [];
@@ -907,6 +945,127 @@ test("exporting selected tasks carries the evidence-required flag", async () => 
   await vi.waitFor(() => expect(state.exported).toHaveLength(1));
   expect(state.exported).toHaveLength(1);
   expect(state.exported[0]).toMatchObject({ reference: "A", evidenceRequired: true });
+});
+
+const confirmerUser = { membership: { _id: "confirmer", role: "Manager" }, user: { name: "Casey", email: "casey@example.com" } };
+const assigneeUser = { membership: { _id: "assignee", role: "Member" }, user: { name: "Ada", email: "ada@example.com" } };
+const awaitingRow = {
+  _id: "req1", taskId: "T1", taskType: "one_time", reference: "T1", title: "Ship report",
+  assignees: [assigneeUser], submittedBy: assigneeUser, submittedAt: 1000, cycleStart: null, cycleEnd: null,
+};
+
+test("exporting selected tasks carries the confirmer and resolves their email", async () => {
+  state.capabilities = ["tasks:jd:export"];
+  state.confirmersByTask = { A: "confirmer", B: "unresolvable" };
+  state.assignable = [confirmerUser];
+  await mount("jd", false);
+  await act(async () => state.railRows.get("A")!());
+  await act(async () => state.railRows.get("B")!());
+  await clickButton("Export 2 selected tasks");
+  await vi.waitFor(() => expect(state.exported).toHaveLength(2));
+  expect(state.exported[0]).toMatchObject({ reference: "A", confirmationRequired: true, confirmerEmail: "casey@example.com" });
+  // Both cells stay blank when the email cannot be resolved client-side, so a
+  // re-import leaves the existing confirmer unchanged.
+  expect(state.exported[1]).toMatchObject({ reference: "B", confirmationRequired: null, confirmerEmail: null });
+});
+
+test("the task dialog requires a confirmer and sends the selection", async () => {
+  state.capabilities = ["tasks:one_time:create"];
+  state.assignable = [assigneeUser];
+  state.confirmers = [confirmerUser];
+  await mount("one", false);
+  await clickButton("New task");
+  const dialog = descendants(container).find((node) => node.getAttribute?.("role") === "dialog");
+  expect(dialog).toBeDefined();
+  const titleInput = descendants(dialog).find((node) => node.getAttribute?.("aria-label") === "Task title");
+  await act(async () => reactProps(titleInput).onChange({ target: { value: "Ship report" } }));
+  const assigneeTrigger = descendants(dialog).find((node) => node.getAttribute?.("aria-label") === "Assigned To (required): Select assignee");
+  await act(async () => assigneeTrigger.dispatchEvent(new Event("click", { bubbles: true, cancelable: true })));
+  await clickButton("Ada");
+  const confirmationToggle = descendants(dialog).find((node) => node.getAttribute?.("role") === "switch" && node.getAttribute?.("aria-label") === "Require confirmation to complete");
+  await act(async () => confirmationToggle.dispatchEvent(new Event("click", { bubbles: true, cancelable: true })));
+  expect(descendants(dialog).some((node) => node.textContent === "Select a confirmer.")).toBe(false);
+
+  const form = descendants(dialog).find((node) => node.tagName === "FORM");
+  await act(async () => { reactProps(form).onSubmit({ preventDefault: () => {} }); await Promise.resolve(); });
+  expect(state.createWrites).toHaveLength(0);
+  expect(descendants(dialog).some((node) => node.textContent === "Select a confirmer.")).toBe(true);
+
+  await act(async () => state.selects.get("Casey")!());
+  await act(async () => { reactProps(form).onSubmit({ preventDefault: () => {} }); await Promise.resolve(); });
+  expect(state.createWrites[0]).toMatchObject({ title: "Ship report", confirmerMembershipId: "confirmer" });
+});
+
+test("turning confirmation off on edit sends null", async () => {
+  state.capabilities = ["tasks:one_time:update:any"];
+  state.confirmers = [confirmerUser];
+  state.assignable = [confirmerUser];
+  state.detail = {
+    task: {
+      _id: "A", title: "A", createdAt: 1, priority: "low", dueDate: Date.now() + 86_400_000,
+      assigneeMembershipIds: ["member"], confirmerMembershipId: "confirmer", confirmer: confirmerUser,
+      state: { status: "Pending", rawStatus: "due" },
+    },
+    canUpdate: true,
+  };
+  container = createMockElement();
+  root = createRoot(container);
+  await act(async () => root!.render(React.createElement(OneTimeTasksLayout, null, React.createElement(TaskDetail, { kind: "one", id: "A" }))));
+  expect(descendants(container).some((node) => node.textContent === "Casey" || node.nodeValue === "Casey")).toBe(true);
+  await clickButton("Edit task");
+  const dialog = descendants(container).find((node) => node.getAttribute?.("role") === "dialog");
+  const confirmationToggle = descendants(dialog).find((node) => node.getAttribute?.("role") === "switch" && node.getAttribute?.("aria-label") === "Require confirmation to complete");
+  expect(confirmationToggle.getAttribute("aria-checked")).toBe("true");
+  await act(async () => confirmationToggle.dispatchEvent(new Event("click", { bubbles: true, cancelable: true })));
+  const form = descendants(dialog).find((node) => node.tagName === "FORM");
+  await act(async () => { reactProps(form).onSubmit({ preventDefault: () => {} }); await Promise.resolve(); });
+  expect(state.updateWrites[0]).toMatchObject({ confirmerMembershipId: null });
+});
+
+test("the edit dialog shows a saved confirmer who is no longer eligible", async () => {
+  state.capabilities = ["tasks:one_time:update:any"];
+  // The saved confirmer lost tasks:confirm, so they are absent from the eligible list.
+  state.confirmers = [];
+  state.detail = {
+    task: {
+      _id: "A", title: "A", createdAt: 1, priority: "low", dueDate: Date.now() + 86_400_000,
+      assigneeMembershipIds: ["member"], confirmerMembershipId: "confirmer", confirmer: confirmerUser,
+      state: { status: "Pending", rawStatus: "due" },
+    },
+    canUpdate: true,
+  };
+  container = createMockElement();
+  root = createRoot(container);
+  await act(async () => root!.render(React.createElement(OneTimeTasksLayout, null, React.createElement(TaskDetail, { kind: "one", id: "A" }))));
+  await clickButton("Edit task");
+  const dialog = descendants(container).find((node) => node.getAttribute?.("role") === "dialog");
+  const trigger = descendants(dialog).find((node) => node.getAttribute?.("aria-label")?.startsWith("Confirmer (required):"));
+  expect(trigger?.getAttribute("aria-label")).toBe("Confirmer (required): Casey (can no longer confirm)");
+});
+
+test("the awaiting confirmation view appears only with tasks:confirm", async () => {
+  await mount("one", false);
+  expect(state.selectAwaiting).toBeNull();
+  await act(async () => root!.unmount());
+  root = undefined;
+  state.selectAwaiting = null;
+  state.capabilities = ["tasks:confirm"];
+  await mount("one", false);
+  expect(state.selectAwaiting).toBeTypeOf("function");
+});
+
+test("the awaiting confirmation view confirms and sends back by request id", async () => {
+  state.capabilities = ["tasks:confirm"];
+  state.awaitingRows = [awaitingRow];
+  await mount("one", false);
+  await act(async () => state.selectAwaiting!());
+  expect(descendants(container).some((node) => node.textContent === "Ship report" || node.nodeValue === "Ship report")).toBe(true);
+  await clickButton("Confirm");
+  expect(state.confirmWrites).toEqual([{ companyId: "company", requestId: "req1" }]);
+  await clickButton("Send back");
+  expect(button("Confirm send back")).toBeDefined();
+  await clickButton("Confirm send back");
+  expect(state.sendBackWrites).toEqual([{ companyId: "company", requestId: "req1" }]);
 });
 
 test("retired evidence from the current cycle is not reported as submitted", async () => {

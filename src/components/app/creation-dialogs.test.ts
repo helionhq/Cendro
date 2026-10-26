@@ -117,6 +117,9 @@ test.each(["jd", "one"] as const)("%s task creation marks only fields required b
   const evidenceToggle = nodes(dialog()).find((node) => node.getAttribute?.("role") === "switch" && node.getAttribute?.("aria-label") === "Require evidence to complete");
   expect(evidenceToggle?.getAttribute("aria-checked")).toBe("false");
   expect(text(evidenceToggle)).toBe("Require evidence to complete");
+  const confirmationToggle = nodes(dialog()).find((node) => node.getAttribute?.("role") === "switch" && node.getAttribute?.("aria-label") === "Require confirmation to complete");
+  expect(confirmationToggle?.getAttribute("aria-checked")).toBe("false");
+  expect(text(confirmationToggle)).toBe("Require confirmation to complete");
   const labels = nodes(dialog()).map((node) => node.getAttribute?.("aria-label"));
   expect(labels).toContain("Assigned To (required): Select assignee");
   expect(labels).toContain(kind === "jd" ? "Frequency (required): Daily" : "Priority (required): Medium");
