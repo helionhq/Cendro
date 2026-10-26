@@ -1798,6 +1798,9 @@ async function setOneTimeStatus(ctx: MutationCtx, companyId: Id<"companies">, ta
       if (evidence && !evidenceMatchesSubmission(activeEvidence, evidence)) {
         throw new ConvexError("This task was already completed with different evidence.");
       }
+      // The completion is already recorded; rewriting the row would move the
+      // stamp to the retry time and actor.
+      if (previousStatus === "completed") return null;
     } else if (evidence) {
       const validated = await validateEvidenceInput(ctx, { companyId, membershipId: membership._id, evidence, now });
       await storeTaskEvidence(ctx, { companyId, taskType: "one_time", taskId, createdByMembershipId: membership._id, now, evidence: validated });

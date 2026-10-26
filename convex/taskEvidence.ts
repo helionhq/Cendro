@@ -39,6 +39,10 @@ type EvidenceFile = Doc<"taskEvidence">["files"][number];
 export function evidenceMatchesSubmission(row: Doc<"taskEvidence">, evidence: EvidenceInput) {
   if ((row.text ?? "") !== (evidence.text?.trim() ?? "")) return false;
   const files = evidence.files ?? [];
+  const submitted = new Set(files.map((file) => file.storageId));
+  // Stored files are unique (validation rejects duplicates), so a repeated id
+  // is a different payload even when it only names blobs the task owns.
+  if (submitted.size !== files.length) return false;
   if (files.length !== row.files.length) return false;
   const stored = new Set(row.files.map((file) => file.storageId));
   return files.every((file) => stored.has(file.storageId));

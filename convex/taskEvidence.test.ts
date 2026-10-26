@@ -105,6 +105,18 @@ describe("task evidence", () => {
       taskId: oneTimeId,
       evidence: { text: "Employee proof." },
     })).resolves.toBeNull();
+    // A retry must not move the completion stamp or reassign it.
+    const completedAt = Date.now() - 60_000;
+    await f.t.run(async (ctx) => ctx.db.patch(oneTimeId, { completedAt }));
+    await admin.mutation(api.tasks.completeOneTime, {
+      companyId: f.companyA,
+      taskId: oneTimeId,
+      evidence: { text: "Employee proof." },
+    });
+    expect(await f.t.run(async (ctx) => ctx.db.get(oneTimeId))).toMatchObject({
+      completedAt,
+      completedByMembershipId: f.employee1M,
+    });
     const oneTimeEvidence = await evidenceFor("one_time", oneTimeId);
     expect(oneTimeEvidence).toHaveLength(1);
     expect(oneTimeEvidence[0].text).toBe("Employee proof.");
@@ -134,6 +146,45 @@ describe("task evidence", () => {
     const jdEvidence = await evidenceFor("jd", jdId);
     expect(jdEvidence).toHaveLength(1);
     expect(jdEvidence[0].text).toBe("Employee proof.");
+  });
+
+  test("a duplicate-file replay of recorded evidence is rejected as a different submission", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    const taskId = await admin.mutation(api.tasks.createOneTime, {
+      companyId: f.companyA,
+      title: "Duplicate replay",
+      dueDate: Date.now() + 86_400_000,
+      priority: "medium",
+      assigneeMembershipIds: [f.adminM],
+      evidenceRequired: true,
+    });
+    const upload = async (fileName: string, contents: string) => {
+      const { claimId } = await admin.mutation(api.tasks.generateEvidenceUploadUrl, { companyId: f.companyA, taskType: "one_time", taskId });
+      const storageId = await f.t.run(async (ctx) => ctx.storage.store(new Blob([contents], { type: "text/plain" })));
+      await admin.mutation(api.tasks.bindEvidenceUploadClaim, { companyId: f.companyA, taskType: "one_time", taskId, claimId, storageId });
+      return { storageId, fileName, claimId };
+    };
+    const first = await upload("first.txt", "first");
+    const second = await upload("second.txt", "second");
+    await admin.mutation(api.tasks.completeOneTime, {
+      companyId: f.companyA,
+      taskId,
+      evidence: { files: [first, second] },
+    });
+
+    // The recorded set still replays idempotently.
+    await expect(admin.mutation(api.tasks.completeOneTime, {
+      companyId: f.companyA,
+      taskId,
+      evidence: { files: [first, second] },
+    })).resolves.toBeNull();
+    // Repeating one stored id while omitting the other is not the recorded set.
+    await expect(admin.mutation(api.tasks.completeOneTime, {
+      companyId: f.companyA,
+      taskId,
+      evidence: { files: [first, first] },
+    })).rejects.toThrow("This task was already completed with different evidence.");
   });
 
   test("reopening a task deletes its evidence row and unreferenced blob", async () => {
