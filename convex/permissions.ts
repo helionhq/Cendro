@@ -671,6 +671,7 @@ export async function assertCanUpdateTask(
  * Changing who confirms a task is structural, not ordinary editing: it must
  * not rely on self-scoped update authority, or an assignee could appoint
  * themselves (or clear their own approver) and self-approve their work.
+ * Managed scope always includes the caller, so an assignee needs update:any.
  */
 export async function canChangeTaskConfirmer(
   ctx: Ctx,
@@ -681,7 +682,11 @@ export async function canChangeTaskConfirmer(
   precomputedCaps?: Set<Capability>
 ) {
   const caps = precomputedCaps ?? (await membershipCapabilities(ctx, m));
-  return await hasNonSelfTaskUpdate(ctx, companyId, m, targets, kind, caps);
+  const prefix = kind === "jd" ? "tasks:jd" : "tasks:one_time";
+  if (caps.has(`${prefix}:update:any` as Capability)) return true;
+  if (!caps.has(`${prefix}:update:managed` as Capability) || targets.includes(m._id)) return false;
+  const scoped = await getManagedMembershipIds(ctx, companyId, m._id);
+  return await hasAllManagedMemberships(ctx, companyId, m._id, targets, scoped);
 }
 
 export async function assertCanChangeTaskConfirmer(

@@ -286,6 +286,50 @@ describe("task completion confirmation", () => {
     expect((await admin.query(api.tasks.getJd, { companyId: f.companyA, taskId: jdId })).task.confirmerMembershipId).toBe(f.managerM);
   });
 
+  test("a manager assignee cannot use managed update authority to appoint or clear their own confirmer", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    const manager = f.asUser("managerA");
+    const taskId = await admin.mutation(api.tasks.createOneTime, {
+      companyId: f.companyA,
+      title: "Manager-approved own work",
+      dueDate: Date.now() + dayMs,
+      priority: "medium",
+      assigneeMembershipIds: [f.managerM],
+      confirmerMembershipId: f.adminM,
+    });
+
+    await expect(manager.mutation(api.tasks.updateOneTimeFields, { companyId: f.companyA, taskId, confirmerMembershipId: f.managerM }))
+      .rejects.toThrow("You cannot change who confirms this task.");
+    await expect(manager.mutation(api.tasks.updateOneTimeFields, { companyId: f.companyA, taskId, confirmerMembershipId: null }))
+      .rejects.toThrow("You cannot change who confirms this task.");
+    expect((await admin.query(api.tasks.getOneTime, { companyId: f.companyA, taskId })).task.confirmerMembershipId).toBe(f.adminM);
+
+    // Managed authority still reaches targets the caller is not part of.
+    const subordinateTaskId = await admin.mutation(api.tasks.createOneTime, {
+      companyId: f.companyA,
+      title: "Subordinate sign-off",
+      dueDate: Date.now() + dayMs,
+      priority: "medium",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.adminM,
+    });
+    await manager.mutation(api.tasks.updateOneTimeFields, { companyId: f.companyA, taskId: subordinateTaskId, confirmerMembershipId: f.managerM });
+    expect((await admin.query(api.tasks.getOneTime, { companyId: f.companyA, taskId: subordinateTaskId })).task.confirmerMembershipId).toBe(f.managerM);
+
+    // update:any is the override, even when the caller is an assignee.
+    const adminAssignedTaskId = await admin.mutation(api.tasks.createOneTime, {
+      companyId: f.companyA,
+      title: "Admin-assigned sign-off",
+      dueDate: Date.now() + dayMs,
+      priority: "medium",
+      assigneeMembershipIds: [f.adminM],
+      confirmerMembershipId: f.managerM,
+    });
+    await admin.mutation(api.tasks.updateOneTimeFields, { companyId: f.companyA, taskId: adminAssignedTaskId, confirmerMembershipId: f.adminM });
+    expect((await admin.query(api.tasks.getOneTime, { companyId: f.companyA, taskId: adminAssignedTaskId })).task.confirmerMembershipId).toBe(f.adminM);
+  });
+
   test("a confirmer re-point finishes off the interactive path and a later edit still wins", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(utc(29));
