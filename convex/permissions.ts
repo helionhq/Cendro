@@ -634,6 +634,24 @@ export async function assertCanAssign(
   throw new ConvexError("You can only assign tasks inside your allowed scope.");
 }
 
+/** Update authority that does not depend on the assignee/creator self scope. */
+async function hasNonSelfTaskUpdate(
+  ctx: Ctx,
+  companyId: Id<"companies">,
+  m: Doc<"companyMemberships">,
+  targets: Id<"companyMemberships">[],
+  kind: "jd" | "one_time",
+  caps: Set<Capability>,
+) {
+  const prefix = kind === "jd" ? "tasks:jd" : "tasks:one_time";
+  if (caps.has(`${prefix}:update:any` as Capability)) return true;
+  if (caps.has(`${prefix}:update:managed` as Capability)) {
+    const scoped = await getManagedMembershipIds(ctx, companyId, m._id);
+    if (await hasAllManagedMemberships(ctx, companyId, m._id, targets, scoped)) return true;
+  }
+  return false;
+}
+
 export async function assertCanUpdateTask(
   ctx: Ctx,
   companyId: Id<"companies">,
@@ -643,14 +661,40 @@ export async function assertCanUpdateTask(
   precomputedCaps?: Set<Capability>
 ) {
   const caps = precomputedCaps ?? (await membershipCapabilities(ctx, m));
+  if (await hasNonSelfTaskUpdate(ctx, companyId, m, targets, kind, caps)) return;
   const prefix = kind === "jd" ? "tasks:jd" : "tasks:one_time";
-  if (caps.has(`${prefix}:update:any` as Capability)) return;
-  if (caps.has(`${prefix}:update:managed` as Capability)) {
-    const scoped = await getManagedMembershipIds(ctx, companyId, m._id);
-    if (await hasAllManagedMemberships(ctx, companyId, m._id, targets, scoped)) return;
-  }
   if (caps.has(`${prefix}:update:self` as Capability) && targets.includes(m._id)) return;
   throw new ConvexError("You cannot update this task.");
+}
+
+/**
+ * Changing who confirms a task is structural, not ordinary editing: it must
+ * not rely on self-scoped update authority, or an assignee could appoint
+ * themselves (or clear their own approver) and self-approve their work.
+ */
+export async function canChangeTaskConfirmer(
+  ctx: Ctx,
+  companyId: Id<"companies">,
+  m: Doc<"companyMemberships">,
+  targets: Id<"companyMemberships">[],
+  kind: "jd" | "one_time",
+  precomputedCaps?: Set<Capability>
+) {
+  const caps = precomputedCaps ?? (await membershipCapabilities(ctx, m));
+  return await hasNonSelfTaskUpdate(ctx, companyId, m, targets, kind, caps);
+}
+
+export async function assertCanChangeTaskConfirmer(
+  ctx: Ctx,
+  companyId: Id<"companies">,
+  m: Doc<"companyMemberships">,
+  targets: Id<"companyMemberships">[],
+  kind: "jd" | "one_time",
+  precomputedCaps?: Set<Capability>
+) {
+  if (!(await canChangeTaskConfirmer(ctx, companyId, m, targets, kind, precomputedCaps))) {
+    throw new ConvexError("You cannot change who confirms this task.");
+  }
 }
 
 export async function assertCanDeleteTask(

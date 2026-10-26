@@ -467,7 +467,10 @@ function taskRows(kind: TaskImportKind, tasks: readonly ExportTask[]): WriteShee
   const rows: WriteSheetData = [headers];
   for (const task of tasks) {
     const evidenceCell = textCell(task.evidenceRequired === true ? "Yes" : "No");
-    const confirmationCell = textCell(task.confirmationRequired === true ? "Yes" : "No");
+    // A missing flag means the caller does not know the state (e.g. a selected
+    // row whose confirmer could not be resolved); a blank cell leaves import
+    // unchanged instead of silently clearing the confirmer.
+    const confirmationCell = task.confirmationRequired == null ? null : textCell(task.confirmationRequired ? "Yes" : "No");
     const confirmerEmailCell = textCell(task.confirmationRequired === true ? task.confirmerEmail : null);
     const values: Cell[] = kind === "jd"
       ? [textCell(task.reference), textCell(task.title), textCell(task.description), textCell(task.notes), textCell(task.recurrence), textCell(task.time), task.quantity == null ? null : { value: task.quantity, type: Number }, textCell(task.assigneeEmails), textCell(task.isActive === false ? "No" : "Yes"), evidenceCell, confirmationCell, confirmerEmailCell]

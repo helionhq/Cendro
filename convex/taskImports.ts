@@ -2,7 +2,7 @@ import { ConvexError, v } from "convex/values";
 import { internalMutation, mutation, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
-import { getManagedMembershipIds, hasAllManagedMemberships, isManagedMembership, membershipCapabilities, requireCapability } from "./permissions";
+import { canChangeTaskConfirmer, getManagedMembershipIds, hasAllManagedMemberships, isManagedMembership, membershipCapabilities, requireCapability } from "./permissions";
 import type { Capability } from "../src/lib/permissions";
 import { effectiveCurrentJdCycle, elapsedJdOccurrences, loadWorkCalendar } from "./workCalendar";
 import { defaultTimeZone } from "./taskCycles";
@@ -59,9 +59,10 @@ const MAX_COMMIT_ROWS = MAX_PREVIEW_ROWS;
 // are consumed by the committing mutation; abandoned ones expire with the
 // sweepExpiredTaskImportPreviews cron after this TTL.
 const PREVIEW_TTL_MS = 24 * 60 * 60 * 1000;
-// A JD update runs two index lookups per elapsed cycle to catch up missed
-// records, plus a few fixed reads per committed row (reference lookup, counter
-// sync, the post-catch-up task read, the current-cycle completion check). The
+// A JD update runs three index lookups per elapsed cycle to catch up missed
+// records (completion, missed record, pending confirmation request), plus a
+// few fixed reads per committed row (reference lookup, counter sync, the
+// post-catch-up task read, the current-cycle completion check). The
 // whole import is one transaction under Convex's index-read limit, so the
 // estimated total is bounded up front: a file past this fails cleanly instead
 // of hitting the limit mid-write. Splitting the file stays the escape hatch.
@@ -367,7 +368,7 @@ function resolveAssignees(auth: ImportAuth, draft: Draft, selected: Id<"companyM
   return { membershipIds: unique, hints, errors };
 }
 
-async function resolveConfirmer(ctx: Ctx, companyId: Id<"companies">, auth: ImportAuth, draft: Draft): Promise<{ membershipId?: Id<"companyMemberships">; error: string | null }> {
+async function resolveConfirmer(ctx: Ctx, companyId: Id<"companies">, auth: ImportAuth, draft: Draft, existing: Task | null): Promise<{ membershipId?: Id<"companyMemberships">; error: string | null }> {
   const email = draft.confirmerEmail?.trim() ?? "";
   // The cross-field rules are reported by validateDraftValues; this resolves
   // the membership once those pass.
@@ -381,6 +382,9 @@ async function resolveConfirmer(ctx: Ctx, companyId: Id<"companies">, auth: Impo
   const matches = auth.activeMembershipIdsByEmail.get(normalized) ?? [];
   if (matches.length === 0) return { error: `Confirmer "${email}" is not an active member of this company.` };
   if (matches.length > 1) return { error: `Confirmer "${email}" matches more than one member.` };
+  // Keeping the current confirmer is not a new appointment: a confirmer who
+  // later lost the capability must not block an unrelated import row.
+  if (existing?.confirmerMembershipId === matches[0]) return { membershipId: matches[0], error: null };
   try {
     await assertConfirmerInCompany(ctx, companyId, matches[0]);
   } catch (error) {
@@ -388,6 +392,30 @@ async function resolveConfirmer(ctx: Ctx, companyId: Id<"companies">, auth: Impo
     return { error: typeof data === "string" ? data : "The selected confirmer cannot confirm task completion." };
   }
   return { membershipId: matches[0], error: null };
+}
+
+/**
+ * The same confirmer-change rules as a task edit, surfaced as a row error so
+ * the preview blocks before the commit writes anything.
+ */
+async function confirmerChangeError(
+  ctx: Ctx,
+  companyId: Id<"companies">,
+  kind: TaskKind,
+  auth: ImportAuth,
+  task: Task | null,
+  nextConfirmer: Id<"companyMemberships"> | undefined,
+) {
+  if (!task || nextConfirmer === task.confirmerMembershipId) return null;
+  const targets = task.assigneeMembershipIds.length ? task.assigneeMembershipIds : [task.createdByMembershipId];
+  if (!(await canChangeTaskConfirmer(ctx, companyId, auth.membership, targets, kind, auth.caps))) {
+    return "You cannot change who confirms this task.";
+  }
+  if (nextConfirmer === undefined) {
+    const pending = await ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", kind).eq("taskId", task._id)).first();
+    if (pending) return "Confirm or send back the pending submissions before turning off confirmation.";
+  }
+  return null;
 }
 
 // Preview is a mutation so it can stage the server-side file record that a
@@ -441,8 +469,16 @@ export const previewTaskImport = mutation({
       }
       const assignees = resolveAssignees(auth, draft, null, task);
       errors.push(...assignees.errors);
-      const confirmer = await resolveConfirmer(ctx, args.companyId, auth, draft);
+      const confirmer = await resolveConfirmer(ctx, args.companyId, auth, draft, task);
       if (confirmer.error) errors.push(confirmer.error);
+      else {
+        const confirmationPatchRequested = hasField(draft, "confirmationRequired") || hasField(draft, "confirmerEmail");
+        const nextConfirmer = task
+          ? (confirmationPatchRequested ? confirmer.membershipId : task.confirmerMembershipId)
+          : confirmer.membershipId;
+        const changeError = await confirmerChangeError(ctx, args.companyId, args.kind, auth, task, nextConfirmer);
+        if (changeError) errors.push(changeError);
+      }
       if (operation === "create" && assignees.membershipIds.length === 0 && !assignees.errors.some((e) => e.includes("assignee"))) {
         errors.push("New tasks need at least one assignee.");
       }
@@ -506,9 +542,14 @@ async function validateCommitRow(ctx: MutationCtx, companyId: Id<"companies">, k
   if (errors.length) fail(errors[0]);
   const resolved = resolveAssignees(auth, draft, row.selectedAssigneeMembershipIds, task);
   if (resolved.errors.length) fail(resolved.errors[0]);
-  const confirmer = await resolveConfirmer(ctx, companyId, auth, draft);
+  const confirmer = await resolveConfirmer(ctx, companyId, auth, draft, task);
   if (confirmer.error) fail(confirmer.error);
   const confirmationPatchRequested = hasField(draft, "confirmationRequired") || hasField(draft, "confirmerEmail");
+  const nextConfirmer = task
+    ? (confirmationPatchRequested ? confirmer.membershipId : task.confirmerMembershipId)
+    : confirmer.membershipId;
+  const changeError = await confirmerChangeError(ctx, companyId, kind, auth, task, nextConfirmer);
+  if (changeError) fail(changeError);
   if (!task && !draft.title?.trim()) fail("New tasks need a title.");
   if (!task && kind === "jd" && !draft.recurrence) fail("New JD tasks need a frequency.");
   if (!task && kind === "one_time" && !draft.priority) fail("New one-time tasks need a priority.");
@@ -568,7 +609,7 @@ export const commitTaskImportBatch = mutation({
       estimatedLookups += FIXED_LOOKUPS_PER_ROW;
       const task = args.kind === "jd" ? item.task as Doc<"jdTasks"> | null : null;
       if (task && task.pausedAt === undefined) {
-        estimatedLookups += 2 * elapsedJdOccurrences(calendar, task.recurrence, task.cycleStartedAt, estimateNow, 200, company.timeZone).occurrences.length;
+        estimatedLookups += 3 * elapsedJdOccurrences(calendar, task.recurrence, task.cycleStartedAt, estimateNow, 200, company.timeZone).occurrences.length;
       }
       if (estimatedLookups > MAX_COMMIT_LOOKUPS) fail("This file needs more work than one import can process. Split it into smaller files and import each.");
     }
@@ -637,7 +678,7 @@ export const commitTaskImportBatch = mutation({
           nextTask.updatedAt = now;
           await ctx.db.replace(task._id, nextTask);
           if (item.confirmationPatchRequested) {
-            await applyConfirmerChange(ctx, { companyId: args.companyId, taskType: "jd", taskId: task._id, previousConfirmer: rolled.confirmerMembershipId, nextConfirmer, actorMembershipId: membership._id, now });
+            await applyConfirmerChange(ctx, { taskType: "jd", taskId: task._id, previousConfirmer: rolled.confirmerMembershipId, nextConfirmer });
           }
           if (previousStatus !== nextTask.status) {
             await ctx.db.insert("taskActivityLogs", { companyId: args.companyId, taskType: "jd", taskId: task._id, actorMembershipId: membership._id, event: "status_changed", fromStatus: previousStatus, toStatus: nextTask.status, createdAt: now });
@@ -687,7 +728,7 @@ export const commitTaskImportBatch = mutation({
           nextTask.updatedAt = now;
           await ctx.db.replace(task._id, nextTask);
           if (item.confirmationPatchRequested) {
-            await applyConfirmerChange(ctx, { companyId: args.companyId, taskType: "one_time", taskId: task._id, previousConfirmer: task.confirmerMembershipId, nextConfirmer, actorMembershipId: membership._id, now });
+            await applyConfirmerChange(ctx, { taskType: "one_time", taskId: task._id, previousConfirmer: task.confirmerMembershipId, nextConfirmer });
           }
         }
         updated += 1;

@@ -5,7 +5,7 @@ import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { currentJdCycle, defaultTimeZone, nextJdCycleStart, type JdRecurrence } from "./taskCycles";
 import { effectiveCurrentJdCycle, elapsedJdOccurrences, loadWorkCalendar, occurrenceDeadline, type WorkCalendar } from "./workCalendar";
-import { activeCompanyMembershipIds, assertCanAssign, assertCanDeleteTask, assertCanUpdateTask, canViewTask, getManagedMembershipIds, hasAllManagedMemberships, hasAnyManagedMembership, memberFirstName, memberFullName, membershipCapabilities, requireCapability, requireMembership, roleNameCapabilities, scanManagedMembershipIds, scopedMembershipIds } from "./permissions";
+import { activeCompanyMembershipIds, assertCanAssign, assertCanChangeTaskConfirmer, assertCanDeleteTask, assertCanUpdateTask, canViewTask, getManagedMembershipIds, hasAllManagedMemberships, hasAnyManagedMembership, memberFirstName, memberFullName, membershipCapabilities, requireCapability, requireMembership, roleNameCapabilities, scanManagedMembershipIds, scopedMembershipIds } from "./permissions";
 import type { Capability } from "../src/lib/permissions";
 import { nonEmpty } from "./validation";
 import { DEFAULT_QUERY_LIMIT, takeWithOverflow } from "./queryLimits";
@@ -141,9 +141,17 @@ function requireTaskAssignee(assignees: Id<"companyMemberships">[]) {
 // edit or a status change unbounded.
 const CONFIRMATION_REQUEST_LIMIT = 100;
 
-async function pendingConfirmationRequest(ctx: Ctx, taskType: TaskKind, taskId: string, cycleStart?: number) {
+/**
+ * The pending request for a JD cycle on the given grid. A request stamped with
+ * another recurrence belongs to a superseded grid and is never "pending" for
+ * the current one.
+ */
+async function pendingConfirmationRequest(ctx: Ctx, taskType: TaskKind, taskId: string, cycleStart?: number, recurrence?: JdRecurrence) {
   if (taskType === "jd") {
-    return await ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", taskType).eq("taskId", taskId).eq("cycleStart", cycleStart!)).first();
+    const request = ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", taskType).eq("taskId", taskId).eq("cycleStart", cycleStart!));
+    return recurrence === undefined
+      ? await request.first()
+      : await request.filter((q) => q.eq(q.field("recurrence"), recurrence)).first();
   }
   return await ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", taskType).eq("taskId", taskId)).filter((q) => q.eq(q.field("cycleStart"), undefined)).first();
 }
@@ -157,7 +165,7 @@ export async function assertConfirmerInCompany(ctx: Ctx, companyId: Id<"companie
 /**
  * Applies the Confirm effect a request represents, in the caller's
  * transaction. Authorization is the caller's job: the confirm mutation checks
- * designation, and turning confirmation off acts as the editor.
+ * designation, and the confirmer's own completion path checks capability.
  */
 async function resolveConfirmationRequest(ctx: MutationCtx, request: Doc<"taskConfirmationRequests">, actorMembershipId: Id<"companyMemberships">, now: number) {
   if (request.taskType === "jd") {
@@ -168,6 +176,10 @@ async function resolveConfirmationRequest(ctx: MutationCtx, request: Doc<"taskCo
       return;
     }
     const cycleStart = request.cycleStart;
+    // A request submitted on an earlier grid shares no cycle identity with the
+    // current one even when their starts coincide. Its confirmation is history:
+    // record the work retired and never touch the current grid's status.
+    const retired = request.recurrence !== task.recurrence;
     if (!(await currentJdCompletion(ctx, taskId, cycleStart))) {
       await ctx.db.insert("jdTaskCompletions", {
         companyId: request.companyId,
@@ -176,7 +188,12 @@ async function resolveConfirmationRequest(ctx: MutationCtx, request: Doc<"taskCo
         cycleEnd: request.cycleEnd,
         completedByMembershipId: request.submittedByMembershipId,
         completedAt: request.submittedAt,
+        ...(retired ? { retiredAt: now } : {}),
       });
+    }
+    if (retired) {
+      await ctx.db.delete(request._id);
+      return;
     }
     const missed = await currentJdCycleRecord(ctx, taskId, cycleStart);
     if (missed) await ctx.db.delete(missed._id);
@@ -198,31 +215,78 @@ async function resolveConfirmationRequest(ctx: MutationCtx, request: Doc<"taskCo
 
 /**
  * Applies an edit that changes the task's confirmer: pending requests follow
- * the new confirmer, and clearing it confirms them as the editor.
+ * the new confirmer. Turning confirmation off is refused while anything is
+ * still pending, so no submission is silently approved by the edit.
  */
 export async function applyConfirmerChange(
   ctx: MutationCtx,
   args: {
-    companyId: Id<"companies">;
     taskType: TaskKind;
     taskId: string;
     previousConfirmer?: Id<"companyMemberships">;
     nextConfirmer?: Id<"companyMemberships">;
-    actorMembershipId: Id<"companyMemberships">;
-    now: number;
   },
 ) {
   if (args.previousConfirmer === args.nextConfirmer) return;
-  const requests = await ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", args.taskType).eq("taskId", args.taskId)).take(CONFIRMATION_REQUEST_LIMIT);
+  const requests = ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", args.taskType).eq("taskId", args.taskId));
   if (args.nextConfirmer === undefined) {
-    for (const request of requests) await resolveConfirmationRequest(ctx, request, args.actorMembershipId, args.now);
+    if (await requests.first()) throw new ConvexError("Confirm or send back the pending submissions before turning off confirmation.");
     return;
   }
-  for (const request of requests) await ctx.db.patch(request._id, { confirmerMembershipId: args.nextConfirmer });
+  const batch = await requests.take(CONFIRMATION_REQUEST_LIMIT);
+  for (const request of batch) {
+    if (request.confirmerMembershipId !== args.nextConfirmer) await ctx.db.patch(request._id, { confirmerMembershipId: args.nextConfirmer });
+  }
+  // A long-running JD task can hold more pending cycles than one transaction
+  // should write; the continuation finishes the re-point from the task's
+  // current confirmer, so a later edit still wins.
+  if (batch.length === CONFIRMATION_REQUEST_LIMIT) {
+    await ctx.scheduler.runAfter(0, internal.tasks.repointConfirmationRequests, { taskType: args.taskType, taskId: args.taskId });
+  }
 }
+
+/** Idempotent continuation of a confirmer re-point across every pending request batch. */
+export const repointConfirmationRequests = internalMutation({
+  args: {
+    taskType: v.union(v.literal("jd"), v.literal("one_time")),
+    taskId: v.string(),
+    cursor: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const normalized = args.taskType === "jd" ? ctx.db.normalizeId("jdTasks", args.taskId) : ctx.db.normalizeId("oneTimeTasks", args.taskId);
+    const task = normalized ? await ctx.db.get(normalized) : null;
+    const confirmer = task?.confirmerMembershipId;
+    // The task may have been deleted or confirmation turned off since the edit.
+    if (confirmer === undefined) return null;
+    const page = await ctx.db.query("taskConfirmationRequests")
+      .withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", args.taskType).eq("taskId", args.taskId))
+      .paginate({ numItems: CONFIRMATION_REQUEST_LIMIT, cursor: args.cursor ?? null });
+    for (const request of page.page) {
+      if (request.confirmerMembershipId !== confirmer) await ctx.db.patch(request._id, { confirmerMembershipId: confirmer });
+    }
+    if (!page.isDone) {
+      await ctx.scheduler.runAfter(0, internal.tasks.repointConfirmationRequests, { taskType: args.taskType, taskId: args.taskId, cursor: page.continueCursor });
+    }
+    return null;
+  },
+});
 
 function updateAuthTargets(task: Pick<Doc<"jdTasks"> | Doc<"oneTimeTasks">, "assigneeMembershipIds" | "createdByMembershipId">) {
   return task.assigneeMembershipIds.length === 0 ? [task.createdByMembershipId] : task.assigneeMembershipIds;
+}
+
+/** A confirmer change needs update authority beyond the self scope. */
+async function assertConfirmerChangeAllowed(
+  ctx: Ctx,
+  companyId: Id<"companies">,
+  membership: Doc<"companyMemberships">,
+  task: Pick<Doc<"jdTasks"> | Doc<"oneTimeTasks">, "assigneeMembershipIds" | "createdByMembershipId" | "confirmerMembershipId">,
+  kind: TaskKind,
+  capabilities: Set<Capability>,
+  nextConfirmer?: Id<"companyMemberships">,
+) {
+  if (nextConfirmer === task.confirmerMembershipId) return;
+  await assertCanChangeTaskConfirmer(ctx, companyId, membership, updateAuthTargets(task), kind, capabilities);
 }
 
 async function canUpdateTask(
@@ -325,7 +389,7 @@ export async function recordMissedJdCycles(ctx: MutationCtx, task: Doc<"jdTasks"
   const [doneDocs, recordDocs, pendingDocs] = await Promise.all([
     Promise.all(occurrences.map((cycle) => currentJdCompletion(ctx, task._id, cycle.start))),
     Promise.all(occurrences.map((cycle) => currentJdCycleRecord(ctx, task._id, cycle.start))),
-    Promise.all(occurrences.map((cycle) => pendingConfirmationRequest(ctx, "jd", task._id, cycle.start))),
+    Promise.all(occurrences.map((cycle) => pendingConfirmationRequest(ctx, "jd", task._id, cycle.start, task.recurrence))),
   ]);
   for (let i = 0; i < occurrences.length; i++) {
     const cycle = occurrences[i];
@@ -1240,9 +1304,12 @@ export const updateJd = mutation({
     requireTaskAssignee(args.assigneeMembershipIds);
     await assertAssigneesInCompany(ctx, args.companyId, args.assigneeMembershipIds);
     const confirmer = args.confirmerMembershipId === undefined ? task.confirmerMembershipId : args.confirmerMembershipId ?? undefined;
-    // Only a newly chosen confirmer is validated, so a confirmer who later
-    // lost the capability never blocks unrelated edits to the task.
-    if (confirmer !== undefined && confirmer !== task.confirmerMembershipId) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    if (confirmer !== task.confirmerMembershipId) {
+      await assertConfirmerChangeAllowed(ctx, args.companyId, membership, task, "jd", capabilities, confirmer);
+      // Only a newly chosen confirmer is validated, so a confirmer who later
+      // lost the capability never blocks unrelated edits to the task.
+      if (confirmer !== undefined) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    }
     const assigneesChanged = task.assigneeMembershipIds.length !== args.assigneeMembershipIds.length || args.assigneeMembershipIds.some((id) => !task.assigneeMembershipIds.includes(id));
     if (assigneesChanged && args.assigneeMembershipIds.length) await assertCanAssign(ctx, args.companyId, membership, args.assigneeMembershipIds, "jd", capabilities);
     const now = Date.now();
@@ -1286,7 +1353,7 @@ export const updateJd = mutation({
     }
     nextTask.updatedAt = now;
     await ctx.db.replace(args.taskId, nextTask);
-    await applyConfirmerChange(ctx, { companyId: args.companyId, taskType: "jd", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer, actorMembershipId: membership._id, now });
+    await applyConfirmerChange(ctx, { taskType: "jd", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer });
     return null;
   },
 });
@@ -1339,9 +1406,12 @@ export const updateJdFields = mutation({
     if (!task || task.companyId !== args.companyId) throw new ConvexError("Task not found.");
     await assertCanUpdateTask(ctx, args.companyId, membership, updateAuthTargets(task), "jd", capabilities);
     const confirmer = args.confirmerMembershipId === undefined ? task.confirmerMembershipId : args.confirmerMembershipId ?? undefined;
-    // Only a newly chosen confirmer is validated, so a confirmer who later
-    // lost the capability never blocks unrelated edits to the task.
-    if (confirmer !== undefined && confirmer !== task.confirmerMembershipId) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    if (confirmer !== task.confirmerMembershipId) {
+      await assertConfirmerChangeAllowed(ctx, args.companyId, membership, task, "jd", capabilities, confirmer);
+      // Only a newly chosen confirmer is validated, so a confirmer who later
+      // lost the capability never blocks unrelated edits to the task.
+      if (confirmer !== undefined) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    }
     if (args.assigneeMembershipIds !== undefined) {
       requireTaskAssignee(args.assigneeMembershipIds);
       await assertAssigneesInCompany(ctx, args.companyId, args.assigneeMembershipIds);
@@ -1397,7 +1467,7 @@ export const updateJdFields = mutation({
     }
     nextTask.updatedAt = now;
     await ctx.db.replace(args.taskId, nextTask);
-    await applyConfirmerChange(ctx, { companyId: args.companyId, taskType: "jd", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer, actorMembershipId: membership._id, now });
+    await applyConfirmerChange(ctx, { taskType: "jd", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer });
     return null;
   },
 });
@@ -1440,16 +1510,23 @@ async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId:
       throw new ConvexError("Evidence is required to complete this task.");
     }
     const confirmer = task.confirmerMembershipId;
-    if (confirmer !== undefined && confirmer !== membership._id && !alreadyCompleted) {
+    const isConfirmer = confirmer !== undefined && confirmer === membership._id;
+    // Losing tasks:confirm also loses the direct-completion bypass; submitting
+    // a request addressed to yourself would leave the task stuck forever.
+    if (isConfirmer && !alreadyCompleted && !capabilities.has("tasks:confirm")) {
+      throw new ConvexError("You can no longer confirm this task. Ask an admin to choose a new confirmer.");
+    }
+    if (confirmer !== undefined && !isConfirmer && !alreadyCompleted) {
       // Someone other than the designated confirmer submitted: hold the
       // cycle. A retry for the same cycle keeps the original submission time.
-      if (!(await pendingConfirmationRequest(ctx, "jd", taskId, cycle.start))) {
+      if (!(await pendingConfirmationRequest(ctx, "jd", taskId, cycle.start, task.recurrence))) {
         await ctx.db.insert("taskConfirmationRequests", {
           companyId,
           taskType: "jd",
           taskId,
           cycleStart: cycle.start,
           cycleEnd: occurrenceDeadline(calendar, task.recurrence, cycle.end, timeZone) ?? cycle.end,
+          recurrence: task.recurrence,
           confirmerMembershipId: confirmer,
           submittedByMembershipId: membership._id,
           submittedAt: now,
@@ -1461,14 +1538,21 @@ async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId:
       if (previousStatus !== "awaiting_confirmation") await logTaskActivity(ctx, { companyId, taskType: "jd", taskId, actorMembershipId: membership._id, event: "status_changed", fromStatus: previousStatus, toStatus: "awaiting_confirmation", createdAt: now });
       return;
     }
-    // The confirmer (or a task without one) completes directly; any pending
-    // request for this cycle is now stale.
-    const pending = await pendingConfirmationRequest(ctx, "jd", taskId, cycle.start);
-    if (pending) await ctx.db.delete(pending._id);
+    const pending = await pendingConfirmationRequest(ctx, "jd", taskId, cycle.start, task.recurrence);
+    if (pending) {
+      if (isConfirmer) {
+        // The confirmer completing the task in the ordinary flow approves the
+        // submission, keeping its original time and author.
+        await resolveConfirmationRequest(ctx, pending, membership._id, now);
+        return;
+      }
+      // A task without a confirmer has no live submission to resolve.
+      await ctx.db.delete(pending._id);
+    }
     if (!existing) await ctx.db.insert("jdTaskCompletions", { companyId, jdTaskId: taskId, cycleStart: cycle.start, cycleEnd: occurrenceDeadline(calendar, task.recurrence, cycle.end, timeZone) ?? cycle.end, completedByMembershipId: membership._id, completedAt: now, note: cleanOptionalText(note) });
   } else {
     // Withdrawing a submission deletes its request along with its evidence.
-    const pending = await pendingConfirmationRequest(ctx, "jd", taskId, cycle.start);
+    const pending = await pendingConfirmationRequest(ctx, "jd", taskId, cycle.start, task.recurrence);
     if (pending) await ctx.db.delete(pending._id);
     await deleteActiveTaskEvidence(ctx, "jd", taskId, cycle.start);
     if (existing) await ctx.db.delete(existing._id);
@@ -1608,7 +1692,7 @@ export const catchUpMissedJdCycles = internalMutation({
               .withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).eq("cycleStart", cycle.start))
               .filter((q) => q.eq(q.field("cycleEnd"), cycle.deadline))
               .first(),
-            pendingConfirmationRequest(ctx, "jd", task._id, cycle.start),
+            pendingConfirmationRequest(ctx, "jd", task._id, cycle.start, args.schedule!.recurrence),
           ] as const),
         ),
       );
@@ -1818,9 +1902,12 @@ export const updateOneTime = mutation({
     requireTaskAssignee(args.assigneeMembershipIds);
     await assertAssigneesInCompany(ctx, args.companyId, args.assigneeMembershipIds);
     const confirmer = args.confirmerMembershipId === undefined ? task.confirmerMembershipId : args.confirmerMembershipId ?? undefined;
-    // Only a newly chosen confirmer is validated, so a confirmer who later
-    // lost the capability never blocks unrelated edits to the task.
-    if (confirmer !== undefined && confirmer !== task.confirmerMembershipId) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    if (confirmer !== task.confirmerMembershipId) {
+      await assertConfirmerChangeAllowed(ctx, args.companyId, membership, task, "one_time", capabilities, confirmer);
+      // Only a newly chosen confirmer is validated, so a confirmer who later
+      // lost the capability never blocks unrelated edits to the task.
+      if (confirmer !== undefined) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    }
     const assigneesChanged = task.assigneeMembershipIds.length !== args.assigneeMembershipIds.length || args.assigneeMembershipIds.some((id) => !task.assigneeMembershipIds.includes(id));
     if (assigneesChanged && args.assigneeMembershipIds.length) await assertCanAssign(ctx, args.companyId, membership, args.assigneeMembershipIds, "one_time", capabilities);
     const nextTask = { ...task };
@@ -1852,7 +1939,7 @@ export const updateOneTime = mutation({
     reconcileOneTimeOverdue(nextTask);
     nextTask.updatedAt = Date.now();
     await ctx.db.replace(args.taskId, nextTask);
-    await applyConfirmerChange(ctx, { companyId: args.companyId, taskType: "one_time", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer, actorMembershipId: membership._id, now: nextTask.updatedAt });
+    await applyConfirmerChange(ctx, { taskType: "one_time", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer });
     return null;
   },
 });
@@ -1906,9 +1993,12 @@ export const updateOneTimeFields = mutation({
     if (!task || task.companyId !== args.companyId) throw new ConvexError("Task not found.");
     await assertCanUpdateTask(ctx, args.companyId, membership, updateAuthTargets(task), "one_time", capabilities);
     const confirmer = args.confirmerMembershipId === undefined ? task.confirmerMembershipId : args.confirmerMembershipId ?? undefined;
-    // Only a newly chosen confirmer is validated, so a confirmer who later
-    // lost the capability never blocks unrelated edits to the task.
-    if (confirmer !== undefined && confirmer !== task.confirmerMembershipId) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    if (confirmer !== task.confirmerMembershipId) {
+      await assertConfirmerChangeAllowed(ctx, args.companyId, membership, task, "one_time", capabilities, confirmer);
+      // Only a newly chosen confirmer is validated, so a confirmer who later
+      // lost the capability never blocks unrelated edits to the task.
+      if (confirmer !== undefined) await assertConfirmerInCompany(ctx, args.companyId, confirmer);
+    }
     if (args.assigneeMembershipIds !== undefined) {
       requireTaskAssignee(args.assigneeMembershipIds);
       await assertAssigneesInCompany(ctx, args.companyId, args.assigneeMembershipIds);
@@ -1954,7 +2044,7 @@ export const updateOneTimeFields = mutation({
     reconcileOneTimeOverdue(nextTask);
     nextTask.updatedAt = Date.now();
     await ctx.db.replace(args.taskId, nextTask);
-    await applyConfirmerChange(ctx, { companyId: args.companyId, taskType: "one_time", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer, actorMembershipId: membership._id, now: nextTask.updatedAt });
+    await applyConfirmerChange(ctx, { taskType: "one_time", taskId: args.taskId, previousConfirmer: task.confirmerMembershipId, nextConfirmer: confirmer });
     return null;
   },
 });
@@ -1991,7 +2081,13 @@ async function setOneTimeStatus(ctx: MutationCtx, companyId: Id<"companies">, ta
       throw new ConvexError("Evidence is required to complete this task.");
     }
     const confirmer = task.confirmerMembershipId;
-    if (confirmer !== undefined && confirmer !== membership._id && task.status !== "completed") {
+    const isConfirmer = confirmer !== undefined && confirmer === membership._id;
+    // Losing tasks:confirm also loses the direct-completion bypass; submitting
+    // a request addressed to yourself would leave the task stuck forever.
+    if (isConfirmer && task.status !== "completed" && !capabilities.has("tasks:confirm")) {
+      throw new ConvexError("You can no longer confirm this task. Ask an admin to choose a new confirmer.");
+    }
+    if (confirmer !== undefined && !isConfirmer && task.status !== "completed") {
       // Someone other than the designated confirmer submitted. A retry keeps
       // the original submission time instead of moving the stamp.
       if (!(await pendingConfirmationRequest(ctx, "one_time", taskId))) {
@@ -1999,6 +2095,7 @@ async function setOneTimeStatus(ctx: MutationCtx, companyId: Id<"companies">, ta
           companyId,
           taskType: "one_time",
           taskId,
+          recurrence: null,
           confirmerMembershipId: confirmer,
           submittedByMembershipId: membership._id,
           submittedAt: now,
@@ -2013,10 +2110,17 @@ async function setOneTimeStatus(ctx: MutationCtx, companyId: Id<"companies">, ta
       if (previousStatus !== "awaiting_confirmation") await logTaskActivity(ctx, { companyId, taskType: "one_time", taskId, actorMembershipId: membership._id, event: "status_changed", fromStatus: previousStatus, toStatus: "awaiting_confirmation", createdAt: now });
       return null;
     }
-    // The confirmer (or a task without one) completes directly; any pending
-    // request is now stale.
     const pending = await pendingConfirmationRequest(ctx, "one_time", taskId);
-    if (pending) await ctx.db.delete(pending._id);
+    if (pending) {
+      if (isConfirmer) {
+        // The confirmer completing the task in the ordinary flow approves the
+        // submission, keeping its original time and author.
+        await resolveConfirmationRequest(ctx, pending, membership._id, now);
+        return null;
+      }
+      // A task without a confirmer has no live submission to resolve.
+      await ctx.db.delete(pending._id);
+    }
   } else {
     // Withdrawing a submission deletes its request along with its evidence.
     const pending = await pendingConfirmationRequest(ctx, "one_time", taskId);
@@ -2071,16 +2175,24 @@ export const sendBackTaskCompletion = mutation({
       const taskId = ctx.db.normalizeId("jdTasks", request.taskId);
       const task = taskId ? await ctx.db.get(taskId) : null;
       if (taskId && task && task.companyId === args.companyId && request.cycleStart !== undefined) {
-        const timeZone = await companyTimeZone(ctx, args.companyId);
-        const calendar = await loadWorkCalendar(ctx, args.companyId);
-        const currentCycleStart = effectiveCurrentJdCycle(calendar, task.recurrence, now, timeZone).start;
-        if (request.cycleStart === currentCycleStart) {
-          await ctx.db.patch(taskId, { status: "in_progress", statusCycleStart: request.cycleStart, updatedAt: now });
-          await logTaskActivity(ctx, { companyId: args.companyId, taskType: "jd", taskId, actorMembershipId: membership._id, event: "status_changed", fromStatus: "awaiting_confirmation", toStatus: "in_progress", createdAt: now });
-        } else if (request.cycleEnd !== undefined && !(await currentJdCycleRecord(ctx, taskId, request.cycleStart))) {
-          // Catch-up deferred this elapsed cycle while it was pending; it is
-          // missed now that the submission is rejected.
-          await ctx.db.insert("jdTaskCycleRecords", { companyId: args.companyId, jdTaskId: taskId, cycleStart: request.cycleStart, cycleEnd: request.cycleEnd, status: "missed", recordedAt: now });
+        if (request.recurrence !== task.recurrence) {
+          // A submission from a superseded grid becomes retired missed
+          // history; the current grid's status and records stay untouched.
+          if (request.cycleEnd !== undefined) {
+            await ctx.db.insert("jdTaskCycleRecords", { companyId: args.companyId, jdTaskId: taskId, cycleStart: request.cycleStart, cycleEnd: request.cycleEnd, status: "missed", recordedAt: now, retiredAt: now });
+          }
+        } else {
+          const timeZone = await companyTimeZone(ctx, args.companyId);
+          const calendar = await loadWorkCalendar(ctx, args.companyId);
+          const currentCycleStart = effectiveCurrentJdCycle(calendar, task.recurrence, now, timeZone).start;
+          if (request.cycleStart === currentCycleStart) {
+            await ctx.db.patch(taskId, { status: "in_progress", statusCycleStart: request.cycleStart, updatedAt: now });
+            await logTaskActivity(ctx, { companyId: args.companyId, taskType: "jd", taskId, actorMembershipId: membership._id, event: "status_changed", fromStatus: "awaiting_confirmation", toStatus: "in_progress", createdAt: now });
+          } else if (request.cycleEnd !== undefined && !(await currentJdCycleRecord(ctx, taskId, request.cycleStart))) {
+            // Catch-up deferred this elapsed cycle while it was pending; it is
+            // missed now that the submission is rejected.
+            await ctx.db.insert("jdTaskCycleRecords", { companyId: args.companyId, jdTaskId: taskId, cycleStart: request.cycleStart, cycleEnd: request.cycleEnd, status: "missed", recordedAt: now });
+          }
         }
       }
     } else {

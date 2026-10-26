@@ -1,12 +1,23 @@
 /// <reference types="vite/client" />
 
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import { createAuthzFixture } from "./authz.fixture";
 import { defaultRoleCapabilities } from "../src/lib/permissions";
 import { nextJdCycleStart, previousJdCycleStart } from "./taskCycles";
 
 const dayMs = 86_400_000;
+const utc = (day: number, month = 5, hour = 12) => Date.UTC(2026, month, day, hour);
+
+afterEach(() => { vi.useRealTimers(); });
+
+// Keep the recurrence grid raw so a daily and weekly cycle can share a start.
+async function useUtcAllWeekCalendar(f: Awaited<ReturnType<typeof createAuthzFixture>>) {
+  await f.t.run(async (ctx) => {
+    await ctx.db.patch(f.companyA, { timeZone: "UTC" });
+    await ctx.db.insert("companyCalendars", { companyId: f.companyA, workingDays: [0, 1, 2, 3, 4, 5, 6], updatedAt: Date.now() });
+  });
+}
 
 describe("task completion confirmation", () => {
   test("a non-confirmer submission waits, and confirming completes it with the submission time and author", async () => {
@@ -207,7 +218,7 @@ describe("task completion confirmation", () => {
     expect(await f.t.mutation(internal.roles.enableTaskConfirmationDefaults, {})).toBe(0);
   });
 
-  test("changing the confirmer re-points a pending submission, and turning confirmation off completes it", async () => {
+  test("changing the confirmer re-points pending submissions, and clearing needs them resolved first", async () => {
     const f = await createAuthzFixture();
     const admin = f.asUser("adminA");
     const manager = f.asUser("managerA");
@@ -221,18 +232,285 @@ describe("task completion confirmation", () => {
       confirmerMembershipId: f.managerM,
     });
     await employee.mutation(api.tasks.completeOneTime, { companyId: f.companyA, taskId });
-    const submittedAt = (await manager.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "one_time" })).rows[0].submittedAt;
 
     await admin.mutation(api.tasks.updateOneTimeFields, { companyId: f.companyA, taskId, confirmerMembershipId: f.adminM });
     expect((await manager.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "one_time" })).rows).toHaveLength(0);
-    expect((await admin.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "one_time" })).rows).toHaveLength(1);
+    const awaitingAdmin = (await admin.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "one_time" })).rows;
+    expect(awaitingAdmin).toHaveLength(1);
 
+    await expect(admin.mutation(api.tasks.updateOneTimeFields, { companyId: f.companyA, taskId, confirmerMembershipId: null }))
+      .rejects.toThrow("Confirm or send back the pending submissions before turning off confirmation.");
+    const stillAwaiting = await admin.query(api.tasks.getOneTime, { companyId: f.companyA, taskId });
+    expect(stillAwaiting.task.state.rawStatus).toBe("awaiting_confirmation");
+    expect(stillAwaiting.task.confirmerMembershipId).toBe(f.adminM);
+
+    await admin.mutation(api.tasks.sendBackTaskCompletion, { companyId: f.companyA, requestId: awaitingAdmin[0]._id });
     await admin.mutation(api.tasks.updateOneTimeFields, { companyId: f.companyA, taskId, confirmerMembershipId: null });
 
-    const completed = await admin.query(api.tasks.getOneTime, { companyId: f.companyA, taskId });
-    expect(completed.task.state.rawStatus).toBe("completed");
-    expect(completed.task.completedAt).toBe(submittedAt);
-    expect(completed.task.completedByMembershipId).toBe(f.employee1M);
+    // Clearing after resolution is a plain edit: it never confirms the work.
+    const returned = await admin.query(api.tasks.getOneTime, { companyId: f.companyA, taskId });
+    expect(returned.task.state.rawStatus).toBe("in_progress");
+    expect(returned.task.confirmerMembershipId).toBeUndefined();
+    expect(returned.task.completedAt).toBeUndefined();
     expect((await admin.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "one_time" })).rows).toHaveLength(0);
+  });
+
+  test("an assignee with self-only update authority cannot set, replace, or clear the confirmer", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    const employee = f.asUser("employeeA1");
+    const oneTimeId = await admin.mutation(api.tasks.createOneTime, {
+      companyId: f.companyA,
+      title: "Self-appointed sign-off",
+      dueDate: Date.now() + dayMs,
+      priority: "medium",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+    const jdId = await admin.mutation(api.tasks.createJd, {
+      companyId: f.companyA,
+      title: "Self-appointed JD sign-off",
+      recurrence: "daily",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+
+    await expect(employee.mutation(api.tasks.updateOneTimeFields, { companyId: f.companyA, taskId: oneTimeId, confirmerMembershipId: f.employee1M }))
+      .rejects.toThrow("You cannot change who confirms this task.");
+    await expect(employee.mutation(api.tasks.updateOneTimeFields, { companyId: f.companyA, taskId: oneTimeId, confirmerMembershipId: null }))
+      .rejects.toThrow("You cannot change who confirms this task.");
+    await expect(employee.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId: jdId, confirmerMembershipId: f.employee1M }))
+      .rejects.toThrow("You cannot change who confirms this task.");
+
+    expect((await admin.query(api.tasks.getOneTime, { companyId: f.companyA, taskId: oneTimeId })).task.confirmerMembershipId).toBe(f.managerM);
+    expect((await admin.query(api.tasks.getJd, { companyId: f.companyA, taskId: jdId })).task.confirmerMembershipId).toBe(f.managerM);
+  });
+
+  test("a confirmer re-point finishes off the interactive path and a later edit still wins", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(utc(29));
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    const taskId = await admin.mutation(api.tasks.createJd, {
+      companyId: f.companyA,
+      title: "Long pending history",
+      recurrence: "daily",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+    // A third eligible confirmer lets the second edit differ from the first.
+    await f.setRoleCapabilities(f.companyA, "Employee", [...defaultRoleCapabilities.Employee, "tasks:confirm"]);
+    await f.t.run(async (ctx) => {
+      for (let i = 0; i < 250; i++) {
+        await ctx.db.insert("taskConfirmationRequests", {
+          companyId: f.companyA,
+          taskType: "jd",
+          taskId,
+          cycleStart: utc(29) - (i + 1) * dayMs,
+          cycleEnd: utc(29) - i * dayMs,
+          recurrence: "daily",
+          confirmerMembershipId: f.managerM,
+          submittedByMembershipId: f.employee1M,
+          submittedAt: utc(29) - (i + 1) * dayMs,
+        });
+      }
+    });
+    const countFor = async (membershipId: typeof f.managerM) => await f.t.run(async (ctx) => (await ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", taskId)).collect()).filter((request) => request.confirmerMembershipId === membershipId).length);
+
+    await admin.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId, confirmerMembershipId: f.adminM });
+    // The first batch re-points inline; the rest wait for the continuation.
+    expect(await countFor(f.adminM)).toBe(100);
+    expect(await countFor(f.managerM)).toBe(150);
+
+    // A second change before the continuation runs must win.
+    await admin.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId, confirmerMembershipId: f.employee1M });
+    await f.t.finishAllScheduledFunctions(() => vi.runAllTimers());
+
+    expect(await countFor(f.employee1M)).toBe(250);
+    expect(await countFor(f.adminM)).toBe(0);
+    expect(await countFor(f.managerM)).toBe(0);
+  });
+
+  test("a confirmer who lost tasks:confirm cannot bypass approval in either status setter", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    const manager = f.asUser("managerA");
+    const oneTimeId = await admin.mutation(api.tasks.createOneTime, {
+      companyId: f.companyA,
+      title: "Former confirmer one-time",
+      dueDate: Date.now() + dayMs,
+      priority: "medium",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+    const jdId = await admin.mutation(api.tasks.createJd, {
+      companyId: f.companyA,
+      title: "Former confirmer JD",
+      recurrence: "daily",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+    await f.setRoleCapabilities(f.companyA, "Manager", defaultRoleCapabilities.Manager.filter((capability) => capability !== "tasks:confirm"));
+
+    await expect(manager.mutation(api.tasks.completeOneTime, { companyId: f.companyA, taskId: oneTimeId }))
+      .rejects.toThrow("You can no longer confirm this task. Ask an admin to choose a new confirmer.");
+    await expect(manager.mutation(api.tasks.completeJd, { companyId: f.companyA, taskId: jdId }))
+      .rejects.toThrow("You can no longer confirm this task. Ask an admin to choose a new confirmer.");
+  });
+
+  test("a confirmer completing a waiting task resolves the submission's time and author", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    const manager = f.asUser("managerA");
+    const employee = f.asUser("employeeA1");
+    const oneTimeId = await admin.mutation(api.tasks.createOneTime, {
+      companyId: f.companyA,
+      title: "Confirmer completes one-time",
+      dueDate: Date.now() + dayMs,
+      priority: "medium",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+    const jdId = await admin.mutation(api.tasks.createJd, {
+      companyId: f.companyA,
+      title: "Confirmer completes JD",
+      recurrence: "daily",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+    await employee.mutation(api.tasks.completeOneTime, { companyId: f.companyA, taskId: oneTimeId });
+    await employee.mutation(api.tasks.completeJd, { companyId: f.companyA, taskId: jdId });
+    const oneTimeRequest = (await manager.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "one_time" })).rows[0];
+    const jdRequest = (await manager.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "jd" })).rows[0];
+
+    await manager.mutation(api.tasks.completeOneTime, { companyId: f.companyA, taskId: oneTimeId });
+    await manager.mutation(api.tasks.completeJd, { companyId: f.companyA, taskId: jdId });
+
+    const oneTime = await admin.query(api.tasks.getOneTime, { companyId: f.companyA, taskId: oneTimeId });
+    expect(oneTime.task.state.rawStatus).toBe("completed");
+    expect(oneTime.task.completedAt).toBe(oneTimeRequest.submittedAt);
+    expect(oneTime.task.completedByMembershipId).toBe(f.employee1M);
+    const completion = await f.t.run(async (ctx) => await ctx.db
+      .query("jdTaskCompletions")
+      .withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", jdId).eq("cycleStart", jdRequest.cycleStart!))
+      .unique());
+    expect(completion).toMatchObject({ completedAt: jdRequest.submittedAt, completedByMembershipId: f.employee1M });
+    expect((await admin.query(api.tasks.getJd, { companyId: f.companyA, taskId: jdId })).task.state.rawStatus).toBe("completed");
+    const requests = await f.t.run(async (ctx) => await ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", jdId)).collect());
+    expect(requests).toEqual([]);
+  });
+
+  test("confirming a request from a previous recurrence records retired history and leaves the new grid alone", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(utc(29));
+    const f = await createAuthzFixture();
+    await useUtcAllWeekCalendar(f);
+    const admin = f.asUser("adminA");
+    const manager = f.asUser("managerA");
+    const employee = f.asUser("employeeA1");
+    const taskId = await admin.mutation(api.tasks.createJd, {
+      companyId: f.companyA,
+      title: "Recurrence change sign-off",
+      recurrence: "daily",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+    await employee.mutation(api.tasks.completeJd, { companyId: f.companyA, taskId });
+    const request = (await manager.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "jd" })).rows[0];
+
+    // Monday's daily cycle becomes Monday's weekly cycle.
+    await admin.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId, recurrence: "weekly" });
+    await manager.mutation(api.tasks.confirmTaskCompletion, { companyId: f.companyA, requestId: request._id });
+
+    const task = await admin.query(api.tasks.getJd, { companyId: f.companyA, taskId });
+    expect(task.task.recurrence).toBe("weekly");
+    expect(task.task.state.rawStatus).toBe("due");
+    const completion = await f.t.run(async (ctx) => await ctx.db
+      .query("jdTaskCompletions")
+      .withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", taskId).eq("cycleStart", request.cycleStart!))
+      .first());
+    expect(completion).toMatchObject({ completedAt: request.submittedAt, completedByMembershipId: f.employee1M });
+    expect(completion?.retiredAt).toBe(utc(29));
+  });
+
+  test("sending back a request from a previous recurrence records its miss as retired history", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(utc(29));
+    const f = await createAuthzFixture();
+    await useUtcAllWeekCalendar(f);
+    const admin = f.asUser("adminA");
+    const manager = f.asUser("managerA");
+    const employee = f.asUser("employeeA1");
+    const taskId = await admin.mutation(api.tasks.createJd, {
+      companyId: f.companyA,
+      title: "Recurrence change send-back",
+      recurrence: "daily",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+    await employee.mutation(api.tasks.completeJd, { companyId: f.companyA, taskId });
+    const request = (await manager.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "jd" })).rows[0];
+
+    await admin.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId, recurrence: "weekly" });
+    await manager.mutation(api.tasks.sendBackTaskCompletion, { companyId: f.companyA, requestId: request._id });
+
+    const task = await admin.query(api.tasks.getJd, { companyId: f.companyA, taskId });
+    expect(task.task.state.rawStatus).toBe("due");
+    const missed = await f.t.run(async (ctx) => await ctx.db
+      .query("jdTaskCycleRecords")
+      .withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", taskId).eq("cycleStart", request.cycleStart!))
+      .first());
+    expect(missed).toMatchObject({ cycleEnd: request.cycleEnd, status: "missed", retiredAt: utc(29) });
+  });
+
+  test("a request from a previous recurrence does not suppress the new grid's missed cycle", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(utc(29));
+    const f = await createAuthzFixture();
+    await useUtcAllWeekCalendar(f);
+    const admin = f.asUser("adminA");
+    const employee = f.asUser("employeeA1");
+    const taskId = await admin.mutation(api.tasks.createJd, {
+      companyId: f.companyA,
+      title: "Old grid pending request",
+      recurrence: "daily",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+    await employee.mutation(api.tasks.completeJd, { companyId: f.companyA, taskId });
+    const request = (await f.asUser("managerA").query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "jd" })).rows[0];
+
+    await admin.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId, recurrence: "weekly" });
+    vi.setSystemTime(utc(6, 6));
+    await f.t.mutation(internal.tasks.recordMissedJdCyclesBatch, {});
+
+    const missed = await f.t.run(async (ctx) => await ctx.db
+      .query("jdTaskCycleRecords")
+      .withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", taskId).eq("cycleStart", request.cycleStart!))
+      .first());
+    expect(missed).toMatchObject({ status: "missed" });
+    expect(missed?.retiredAt).toBeUndefined();
+  });
+
+  test("the dashboard ignores a pending request from a superseded recurrence", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(utc(29));
+    const f = await createAuthzFixture();
+    await useUtcAllWeekCalendar(f);
+    const admin = f.asUser("adminA");
+    const employee = f.asUser("employeeA1");
+    const taskId = await admin.mutation(api.tasks.createJd, {
+      companyId: f.companyA,
+      title: "Dashboard retired hold",
+      recurrence: "daily",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+    await employee.mutation(api.tasks.completeJd, { companyId: f.companyA, taskId });
+    await admin.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId, recurrence: "weekly" });
+
+    vi.setSystemTime(utc(6, 6));
+    const dashboard = await admin.query(api.analytics.dashboard, { companyId: f.companyA, now: utc(6, 6), range: { preset: "last_3_months" } });
+    expect(dashboard.jd.overdue).toBe(1);
   });
 });

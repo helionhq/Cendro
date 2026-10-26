@@ -28,10 +28,11 @@ const state = vi.hoisted(() => ({
   otherAssigneeIds: [] as string[],
   evidenceRequired: [] as string[],
   evidenceResults: [] as unknown[],
-  exported: [] as { evidenceRequired?: boolean }[],
+  exported: [] as { evidenceRequired?: boolean; confirmationRequired?: boolean | null; confirmerEmail?: string | null }[],
   statusWrites: [] as { taskId: string; status: string; evidence?: unknown }[],
   assignable: [] as unknown[],
   confirmers: [] as unknown[],
+  confirmersByTask: {} as Record<string, string>,
   awaitingRows: [] as unknown[],
   createWrites: [] as Record<string, unknown>[],
   updateWrites: [] as Record<string, unknown>[],
@@ -100,6 +101,7 @@ vi.mock("convex/react", () => {
             pausedAt: state.pausedIds.includes(_id) ? 1 : undefined,
             canPause: state.lifecycleAllowed, canResume: state.lifecycleAllowed,
             evidenceRequired: state.evidenceRequired.includes(_id) || undefined,
+            confirmerMembershipId: state.confirmersByTask[_id],
             assigneeMembershipIds: [state.otherAssigneeIds.includes(_id) ? "other" : "member"], assignees: [], state: state.taskStates[_id] ?? { status: "Due" },
           })),
       };
@@ -248,6 +250,7 @@ afterEach(async () => {
   state.statusWrites = [];
   state.assignable = [];
   state.confirmers = [];
+  state.confirmersByTask = {};
   state.awaitingRows = [];
   state.createWrites = [];
   state.updateWrites = [];
@@ -951,6 +954,21 @@ const awaitingRow = {
   assignees: [assigneeUser], submittedBy: assigneeUser, submittedAt: 1000, cycleStart: null, cycleEnd: null,
 };
 
+test("exporting selected tasks carries the confirmer and resolves their email", async () => {
+  state.capabilities = ["tasks:jd:export"];
+  state.confirmersByTask = { A: "confirmer", B: "unresolvable" };
+  state.assignable = [confirmerUser];
+  await mount("jd", false);
+  await act(async () => state.railRows.get("A")!());
+  await act(async () => state.railRows.get("B")!());
+  await clickButton("Export 2 selected tasks");
+  await vi.waitFor(() => expect(state.exported).toHaveLength(2));
+  expect(state.exported[0]).toMatchObject({ reference: "A", confirmationRequired: true, confirmerEmail: "casey@example.com" });
+  // Both cells stay blank when the email cannot be resolved client-side, so a
+  // re-import leaves the existing confirmer unchanged.
+  expect(state.exported[1]).toMatchObject({ reference: "B", confirmationRequired: null, confirmerEmail: null });
+});
+
 test("the task dialog requires a confirmer and sends the selection", async () => {
   state.capabilities = ["tasks:one_time:create"];
   state.assignable = [assigneeUser];
@@ -1002,6 +1020,27 @@ test("turning confirmation off on edit sends null", async () => {
   const form = descendants(dialog).find((node) => node.tagName === "FORM");
   await act(async () => { reactProps(form).onSubmit({ preventDefault: () => {} }); await Promise.resolve(); });
   expect(state.updateWrites[0]).toMatchObject({ confirmerMembershipId: null });
+});
+
+test("the edit dialog shows a saved confirmer who is no longer eligible", async () => {
+  state.capabilities = ["tasks:one_time:update:any"];
+  // The saved confirmer lost tasks:confirm, so they are absent from the eligible list.
+  state.confirmers = [];
+  state.detail = {
+    task: {
+      _id: "A", title: "A", createdAt: 1, priority: "low", dueDate: Date.now() + 86_400_000,
+      assigneeMembershipIds: ["member"], confirmerMembershipId: "confirmer", confirmer: confirmerUser,
+      state: { status: "Pending", rawStatus: "due" },
+    },
+    canUpdate: true,
+  };
+  container = createMockElement();
+  root = createRoot(container);
+  await act(async () => root!.render(React.createElement(OneTimeTasksLayout, null, React.createElement(TaskDetail, { kind: "one", id: "A" }))));
+  await clickButton("Edit task");
+  const dialog = descendants(container).find((node) => node.getAttribute?.("role") === "dialog");
+  const trigger = descendants(dialog).find((node) => node.getAttribute?.("aria-label")?.startsWith("Confirmer (required):"));
+  expect(trigger?.getAttribute("aria-label")).toBe("Confirmer (required): Casey (can no longer confirm)");
 });
 
 test("the awaiting confirmation view appears only with tasks:confirm", async () => {

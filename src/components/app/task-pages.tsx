@@ -1782,6 +1782,21 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
     label: assigneeDisplayName(user),
     helper: user.membership.role,
   }));
+  // A saved confirmer may no longer hold tasks:confirm; the backend keeps them
+  // so their pending approval still resolves. Show that person rather than a
+  // blank "Select confirmer" that hides who the task is actually waiting on.
+  const savedConfirmerId = values.confirmerMembershipId;
+  const savedConfirmerIsIneligible = Boolean(savedConfirmerId) && confirmersResult !== undefined && !confirmerOptions.some((option) => option.value === savedConfirmerId);
+  const savedConfirmer = savedConfirmerIsIneligible
+    ? [
+        task?.confirmer?.membership?._id === savedConfirmerId ? task.confirmer : null,
+        assignable.find((candidate) => candidate.membership?._id === savedConfirmerId) ?? null,
+        task?.assignees?.find((candidate: any) => candidate.membership?._id === savedConfirmerId) ?? null,
+      ].find(Boolean) ?? null
+    : null;
+  const confirmerSelectOptions = savedConfirmerIsIneligible
+    ? [{ value: savedConfirmerId!, label: `${savedConfirmer ? assigneeDisplayName(savedConfirmer) : "Saved confirmer"} (can no longer confirm)` }, ...confirmerOptions]
+    : confirmerOptions;
 
   const titleId = useId();
   const taskAssignees = task?.assignees;
@@ -1933,7 +1948,7 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
                           ariaLabel="Confirmer"
                           required
                           value={values.confirmerMembershipId ?? ""}
-                          options={confirmerOptions}
+                          options={confirmerSelectOptions}
                           onChange={(confirmerMembershipId) => patch({ confirmerMembershipId })}
                           placeholder="Select confirmer"
                         />
@@ -2489,20 +2504,35 @@ function TaskListContent({ kind, selectedId }: { kind: Kind; selectedId?: string
     setExportingSelection(true);
     try {
       const selectedTasks = tasks.filter((t: any) => selectedIds.has(t._id));
-      const exportTasks = selectedTasks.map((t: any) => ({
-        reference: t.reference,
-        title: t.title,
-        description: t.description ?? null,
-        notes: t.notes ?? null,
-        recurrence: kind === "jd" ? t.recurrence : undefined,
-        dueDate: kind === "one" ? (t.dueDate ?? null) : undefined,
-        priority: kind === "one" ? t.priority : undefined,
-        time: t.time ?? null,
-        quantity: t.quantity ?? null,
-        assigneeEmails: t.assignees?.map((a: any) => a.user.email).join("; ") ?? "",
-        isActive: kind === "jd" ? t.pausedAt === undefined : undefined,
-        evidenceRequired: t.evidenceRequired === true,
-      }));
+      // List rows carry the confirmer id but not their email. Resolve it from
+      // the enriched member lists the page already holds; if it cannot be
+      // resolved, both export cells stay blank so a re-import leaves the
+      // confirmer unchanged instead of clearing it with a "No".
+      const memberEmails = new Map<string, string>();
+      for (const member of [...(assignable ?? []), ...(filterableAssignees ?? [])]) {
+        const membershipId = member?.membership?._id;
+        const memberEmail = member?.user?.email;
+        if (membershipId && memberEmail && !memberEmails.has(membershipId)) memberEmails.set(membershipId, memberEmail);
+      }
+      const exportTasks = selectedTasks.map((t: any) => {
+        const confirmerEmail = t.confirmerMembershipId ? memberEmails.get(t.confirmerMembershipId) ?? null : null;
+        return {
+          reference: t.reference,
+          title: t.title,
+          description: t.description ?? null,
+          notes: t.notes ?? null,
+          recurrence: kind === "jd" ? t.recurrence : undefined,
+          dueDate: kind === "one" ? (t.dueDate ?? null) : undefined,
+          priority: kind === "one" ? t.priority : undefined,
+          time: t.time ?? null,
+          quantity: t.quantity ?? null,
+          assigneeEmails: t.assignees?.map((a: any) => a.user.email).join("; ") ?? "",
+          isActive: kind === "jd" ? t.pausedAt === undefined : undefined,
+          evidenceRequired: t.evidenceRequired === true,
+          confirmationRequired: t.confirmerMembershipId ? (confirmerEmail ? true : null) : false,
+          confirmerEmail,
+        };
+      });
       const { exportTaskWorkbook, downloadBlob } = await loadWorkbook();
       const workbook = await exportTaskWorkbook(
         kind === "jd" ? "jd" : "one_time",

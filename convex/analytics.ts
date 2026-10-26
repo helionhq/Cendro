@@ -392,7 +392,7 @@ export const dashboard = query({
         ),
         takeBudgetedRows(
           taskPhase,
-          (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id)).take(limit),
+          (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", range.start - jdCompletionLookbackMs).lte("cycleStart", range.end)).take(limit),
         ),
       ]);
       ledgersByTask.set(task._id, { completions, missed, pending, truncated: taskPhase.isTruncated });
@@ -405,7 +405,9 @@ export const dashboard = query({
         return [];
       }
       const { completions, missed, pending } = ledger;
-      const pendingStarts = new Set(pending.flatMap((request) => request.cycleStart === undefined ? [] : [request.cycleStart]));
+      // A request from a superseded recurrence is history, not a live hold on
+      // the current grid's cycle.
+      const pendingStarts = new Set(pending.flatMap((request) => request.cycleStart === undefined || request.recurrence !== task.recurrence ? [] : [request.cycleStart]));
 
       const cycles = new Map<string, { start: number; retired: boolean; dueAt: number; completed: boolean; stored: boolean }>();
       // Group rows by grid lifetime as well as start: retired work must not
