@@ -6,7 +6,7 @@ import { getManagedMembershipIds, hasAllManagedMemberships, isManagedMembership,
 import type { Capability } from "../src/lib/permissions";
 import { effectiveCurrentJdCycle, elapsedJdOccurrences, loadWorkCalendar } from "./workCalendar";
 import { defaultTimeZone } from "./taskCycles";
-import { canManageJdLifecycle, preserveJdCompletionStamp, reconcileOneTimeOverdue, recordMissedJdCycles, retireJdHistoryAtCycle, transitionJdTaskActiveState, type TaskVisibilityAuth } from "./tasks";
+import { applyConfirmerChange, assertConfirmerInCompany, canManageJdLifecycle, preserveJdCompletionStamp, reconcileOneTimeOverdue, recordMissedJdCycles, retireJdHistoryAtCycle, transitionJdTaskActiveState, type TaskVisibilityAuth } from "./tasks";
 import { syncReferenceCounter } from "./references";
 import { normalizeEmail, nonEmpty } from "./validation";
 
@@ -17,7 +17,7 @@ const priorityValidator = v.union(v.literal("low"), v.literal("medium"), v.liter
 const statusValidator = v.union(v.literal("due"), v.literal("in_progress"), v.literal("completed"));
 const nullableString = v.union(v.string(), v.null());
 const nullableNumber = v.union(v.number(), v.null());
-const presentFieldValidator = v.union(v.literal("reference"), v.literal("title"), v.literal("description"), v.literal("notes"), v.literal("recurrence"), v.literal("dueDate"), v.literal("priority"), v.literal("time"), v.literal("quantity"), v.literal("assignees"), v.literal("status"), v.literal("isActive"), v.literal("evidenceRequired"));
+const presentFieldValidator = v.union(v.literal("reference"), v.literal("title"), v.literal("description"), v.literal("notes"), v.literal("recurrence"), v.literal("dueDate"), v.literal("priority"), v.literal("time"), v.literal("quantity"), v.literal("assignees"), v.literal("status"), v.literal("isActive"), v.literal("evidenceRequired"), v.literal("confirmationRequired"), v.literal("confirmerEmail"));
 const draftValidator = v.object({
   rowKey: v.string(),
   sourceSheet: v.string(),
@@ -39,6 +39,8 @@ const draftValidator = v.object({
   // Optional on the wire so clients running the pre-column bundle still validate; missing reads as null everywhere below.
   isActive: v.optional(v.union(v.boolean(), v.null())),
   evidenceRequired: v.optional(v.union(v.boolean(), v.null())),
+  confirmationRequired: v.optional(v.union(v.boolean(), v.null())),
+  confirmerEmail: v.optional(nullableString),
   presentFields: v.array(presentFieldValidator),
   warnings: v.array(v.string()),
 });
@@ -89,6 +91,8 @@ type Draft = {
   status: "due" | "in_progress" | "completed" | null;
   isActive?: boolean | null;
   evidenceRequired?: boolean | null;
+  confirmationRequired?: boolean | null;
+  confirmerEmail?: string | null;
   presentFields: string[];
   warnings: string[];
 };
@@ -102,6 +106,7 @@ type ImportAuth = {
   scoped: Set<Id<"companyMemberships">>;
   assignable: Set<Id<"companyMemberships">>;
   membershipIdsByEmail: Map<string, Id<"companyMemberships">[]>;
+  activeMembershipIdsByEmail: Map<string, Id<"companyMemberships">[]>;
   companyMemberEmails: Set<string>;
 };
 
@@ -142,7 +147,7 @@ function capabilitiesForImport(caps: Set<Capability>, kind: TaskKind) {
 }
 
 function extractAssigneeTargets(
-  drafts: Iterable<{ assigneeEmails?: string[] }>,
+  drafts: Iterable<{ assigneeEmails?: string[]; confirmerEmail?: string | null }>,
   selectedMembershipIds?: Iterable<Id<"companyMemberships">[] | null | undefined>
 ) {
   const emails = new Set<string>();
@@ -154,6 +159,13 @@ function extractAssigneeTargets(
         } catch {
           // Unparseable emails are handled during draft validation / resolution
         }
+      }
+    }
+    if (item.confirmerEmail) {
+      try {
+        emails.add(normalizeEmail(item.confirmerEmail));
+      } catch {
+        // Unparseable emails are handled during draft validation / resolution
       }
     }
   }
@@ -199,6 +211,7 @@ async function buildImportAuth(
   }
 
   const membershipIdsByEmail = new Map<string, Id<"companyMemberships">[]>();
+  const activeMembershipIdsByEmail = new Map<string, Id<"companyMemberships">[]>();
   const companyMemberEmails = new Set<string>();
   const assignable = new Set<Id<"companyMemberships">>();
 
@@ -220,6 +233,13 @@ async function buildImportAuth(
 
       if (candidate && candidate.active) {
         companyMemberEmails.add(email);
+        // A confirmer need not be assignable, but resolves through the same
+        // email → active-membership lookup so unknown and inactive emails
+        // behave consistently across assignees and confirmers.
+        const activeCurrent = activeMembershipIdsByEmail.get(email) ?? [];
+        if (!activeCurrent.includes(candidate._id)) {
+          activeMembershipIdsByEmail.set(email, [...activeCurrent, candidate._id]);
+        }
         if (await isAssignable(candidate)) {
           assignable.add(candidate._id);
           const current = membershipIdsByEmail.get(email) ?? [];
@@ -242,7 +262,7 @@ async function buildImportAuth(
     }
   }
 
-  return { ...capabilitiesForImport(caps, kind), caps, membership, scoped, assignable, membershipIdsByEmail, companyMemberEmails } satisfies ImportAuth;
+  return { ...capabilitiesForImport(caps, kind), caps, membership, scoped, assignable, membershipIdsByEmail, activeMembershipIdsByEmail, companyMemberEmails } satisfies ImportAuth;
 }
 
 async function taskByReference(ctx: Ctx, companyId: Id<"companies">, kind: TaskKind, reference: string) {
@@ -270,7 +290,7 @@ function validateDraftValues(row: Draft, kind: TaskKind) {
   if (row.notes !== null && row.notes.length > 20_000) errors.push("Notes is too long.");
   if (row.time !== null && row.time.length > 200) errors.push("Time is too long.");
   if (row.quantity !== null && (!Number.isFinite(row.quantity) || row.quantity <= 0)) errors.push("Quantity must be a positive number.");
-  if (row.presentFields.length > 13 || new Set(row.presentFields).size !== row.presentFields.length) errors.push("Import row contains invalid field markers.");
+  if (row.presentFields.length > 15 || new Set(row.presentFields).size !== row.presentFields.length) errors.push("Import row contains invalid field markers.");
   if (row.reference !== null && !hasField(row, "reference")) errors.push("Reference was not marked as present in the source.");
   if (row.rawAssigneeText.length > 2_000 || row.assigneeEmails.length > 50 || row.assigneeEmails.some((email) => email.length > 320)) errors.push("Assignee data is too large.");
   if (row.warnings.length > 20 || row.warnings.some((warning) => warning.length > 500)) errors.push("Import warnings are too large.");
@@ -281,6 +301,11 @@ function validateDraftValues(row: Draft, kind: TaskKind) {
   if (kind === "one_time" && (row.isActive != null || hasField(row, "isActive"))) errors.push("One-time rows contain an active state.");
   if (kind === "jd" && row.isActive == null && hasField(row, "isActive")) errors.push("Is active must be Yes or No.");
   if (hasField(row, "evidenceRequired") && row.evidenceRequired == null) errors.push("Evidence required must be Yes or No.");
+  if (hasField(row, "confirmationRequired") && row.confirmationRequired == null) errors.push("Confirmation required must be Yes or No.");
+  const confirmerEmail = row.confirmerEmail?.trim() ?? "";
+  if (confirmerEmail.length > 320) errors.push("Confirmer email is too long.");
+  if (row.confirmationRequired === true && !confirmerEmail) errors.push("Confirmation required needs a confirmer email.");
+  if (row.confirmationRequired !== true && confirmerEmail) errors.push("Confirmer email is only allowed when confirmation is required.");
   if (kind === "jd" && row.recurrence === null && hasField(row, "recurrence")) errors.push("Frequency is required and must be valid.");
   if (kind === "one_time" && row.priority === null && hasField(row, "priority")) errors.push("Priority is required and must be valid.");
   if (kind === "one_time" && row.dueDate !== null && !Number.isFinite(row.dueDate)) errors.push("Due date is invalid.");
@@ -342,6 +367,29 @@ function resolveAssignees(auth: ImportAuth, draft: Draft, selected: Id<"companyM
   return { membershipIds: unique, hints, errors };
 }
 
+async function resolveConfirmer(ctx: Ctx, companyId: Id<"companies">, auth: ImportAuth, draft: Draft): Promise<{ membershipId?: Id<"companyMemberships">; error: string | null }> {
+  const email = draft.confirmerEmail?.trim() ?? "";
+  // The cross-field rules are reported by validateDraftValues; this resolves
+  // the membership once those pass.
+  if (draft.confirmationRequired !== true || !email) return { error: null };
+  let normalized: string;
+  try {
+    normalized = normalizeEmail(email);
+  } catch {
+    return { error: `Confirmer email "${email}" is invalid.` };
+  }
+  const matches = auth.activeMembershipIdsByEmail.get(normalized) ?? [];
+  if (matches.length === 0) return { error: `Confirmer "${email}" is not an active member of this company.` };
+  if (matches.length > 1) return { error: `Confirmer "${email}" matches more than one member.` };
+  try {
+    await assertConfirmerInCompany(ctx, companyId, matches[0]);
+  } catch (error) {
+    const data = (error as { data?: unknown } | null)?.data;
+    return { error: typeof data === "string" ? data : "The selected confirmer cannot confirm task completion." };
+  }
+  return { membershipId: matches[0], error: null };
+}
+
 // Preview is a mutation so it can stage the server-side file record that a
 // later commit is bound to. It writes only taskImportPreviews rows.
 export const previewTaskImport = mutation({
@@ -393,6 +441,8 @@ export const previewTaskImport = mutation({
       }
       const assignees = resolveAssignees(auth, draft, null, task);
       errors.push(...assignees.errors);
+      const confirmer = await resolveConfirmer(ctx, args.companyId, auth, draft);
+      if (confirmer.error) errors.push(confirmer.error);
       if (operation === "create" && assignees.membershipIds.length === 0 && !assignees.errors.some((e) => e.includes("assignee"))) {
         errors.push("New tasks need at least one assignee.");
       }
@@ -410,7 +460,7 @@ export const previewTaskImport = mutation({
         else if (lifecycle.change === "resume") warnings.push("This task will be made active.");
       }
       if (args.kind === "one_time" && draft.dueDate !== null && draft.dueDate < Date.now() && (!task || task.status !== "completed")) warnings.push("This task will be overdue immediately.");
-      rows.push({ rowKey: draft.rowKey, sourceSheet: draft.sourceSheet, sourceRow: draft.sourceRow, operation: errors.length > 0 ? "blocked" : operation, reference: reference ?? null, draft, current: task ? editableSnapshot(task, args.kind) : null, proposedAssigneeMembershipIds: assignees.membershipIds, unresolvedAssigneeHints: assignees.hints, errors, warnings, include: errors.length === 0 });
+      rows.push({ rowKey: draft.rowKey, sourceSheet: draft.sourceSheet, sourceRow: draft.sourceRow, operation: errors.length > 0 ? "blocked" : operation, reference: reference ?? null, draft, current: task ? editableSnapshot(task, args.kind) : null, proposedAssigneeMembershipIds: assignees.membershipIds, proposedConfirmerMembershipId: confirmer.membershipId ?? null, unresolvedAssigneeHints: assignees.hints, errors, warnings, include: errors.length === 0 });
     }
     // Stage the whole-file record a commit must match: commits that omit rows,
     // alter drafts, or arrive from older clients without a previewId are
@@ -456,6 +506,9 @@ async function validateCommitRow(ctx: MutationCtx, companyId: Id<"companies">, k
   if (errors.length) fail(errors[0]);
   const resolved = resolveAssignees(auth, draft, row.selectedAssigneeMembershipIds, task);
   if (resolved.errors.length) fail(resolved.errors[0]);
+  const confirmer = await resolveConfirmer(ctx, companyId, auth, draft);
+  if (confirmer.error) fail(confirmer.error);
+  const confirmationPatchRequested = hasField(draft, "confirmationRequired") || hasField(draft, "confirmerEmail");
   if (!task && !draft.title?.trim()) fail("New tasks need a title.");
   if (!task && kind === "jd" && !draft.recurrence) fail("New JD tasks need a frequency.");
   if (!task && kind === "one_time" && !draft.priority) fail("New one-time tasks need a priority.");
@@ -464,7 +517,7 @@ async function validateCommitRow(ctx: MutationCtx, companyId: Id<"companies">, k
   if (assigneePatchRequested && resolved.membershipIds.length === 0) fail("Tasks need at least one assignee.");
   const lifecycle = kind === "jd" ? await checkJdLifecycleChange(ctx, companyId, auth, draft, task ? { ...(task as Doc<"jdTasks">), assigneeMembershipIds: resolved.membershipIds } : null) : { change: null, error: null };
   if (lifecycle.error) fail(lifecycle.error);
-  return { draft, task, reference, assigneeMembershipIds: resolved.membershipIds, assigneePatchRequested, lifecycleChange: lifecycle.change };
+  return { draft, task, reference, assigneeMembershipIds: resolved.membershipIds, assigneePatchRequested, confirmerMembershipId: confirmer.membershipId, confirmationPatchRequested, lifecycleChange: lifecycle.change };
 }
 
 export const commitTaskImportBatch = mutation({
@@ -564,6 +617,11 @@ export const commitTaskImportBatch = mutation({
             if (item.draft.evidenceRequired === true) nextTask.evidenceRequired = true;
             else delete nextTask.evidenceRequired;
           }
+          const nextConfirmer = item.confirmationPatchRequested ? item.confirmerMembershipId : rolled.confirmerMembershipId;
+          if (item.confirmationPatchRequested) {
+            if (nextConfirmer === undefined) delete nextTask.confirmerMembershipId;
+            else nextTask.confirmerMembershipId = nextConfirmer;
+          }
           if (nextCycleStart !== undefined) {
             // Inactivating alone preserves even an in-cycle completion stamp;
             // a combined frequency + inactive row must not lose it to the reset.
@@ -578,6 +636,9 @@ export const commitTaskImportBatch = mutation({
           }
           nextTask.updatedAt = now;
           await ctx.db.replace(task._id, nextTask);
+          if (item.confirmationPatchRequested) {
+            await applyConfirmerChange(ctx, { companyId: args.companyId, taskType: "jd", taskId: task._id, previousConfirmer: rolled.confirmerMembershipId, nextConfirmer, actorMembershipId: membership._id, now });
+          }
           if (previousStatus !== nextTask.status) {
             await ctx.db.insert("taskActivityLogs", { companyId: args.companyId, taskType: "jd", taskId: task._id, actorMembershipId: membership._id, event: "status_changed", fromStatus: previousStatus, toStatus: nextTask.status, createdAt: now });
           }
@@ -617,9 +678,17 @@ export const commitTaskImportBatch = mutation({
             if (item.draft.evidenceRequired === true) nextTask.evidenceRequired = true;
             else delete nextTask.evidenceRequired;
           }
+          const nextConfirmer = item.confirmationPatchRequested ? item.confirmerMembershipId : task.confirmerMembershipId;
+          if (item.confirmationPatchRequested) {
+            if (nextConfirmer === undefined) delete nextTask.confirmerMembershipId;
+            else nextTask.confirmerMembershipId = nextConfirmer;
+          }
           reconcileOneTimeOverdue(nextTask, now);
           nextTask.updatedAt = now;
           await ctx.db.replace(task._id, nextTask);
+          if (item.confirmationPatchRequested) {
+            await applyConfirmerChange(ctx, { companyId: args.companyId, taskType: "one_time", taskId: task._id, previousConfirmer: task.confirmerMembershipId, nextConfirmer, actorMembershipId: membership._id, now });
+          }
         }
         updated += 1;
         taskReferences.push(item.task.reference);
@@ -627,10 +696,10 @@ export const commitTaskImportBatch = mutation({
         const reference = item.reference;
         if (args.kind === "jd") {
           const cycle = effectiveCurrentJdCycle(calendar, item.draft.recurrence!, now, company.timeZone);
-          const id = await ctx.db.insert("jdTasks", { companyId: args.companyId, reference, title: nonEmpty(item.draft.title ?? "", "Task title"), description: cleanText(item.draft.description), notes: cleanText(item.draft.notes), time: cleanText(item.draft.time), quantity: item.draft.quantity ?? undefined, recurrence: item.draft.recurrence!, cycleStartedAt: now, status: "due", statusCycleStart: cycle.start, evidenceRequired: item.draft.evidenceRequired === true ? true : undefined, assigneeMembershipIds: item.assigneeMembershipIds, createdByMembershipId: membership._id, createdAt: now, updatedAt: now, pausedAt: item.lifecycleChange === "pause" ? now : undefined });
+          const id = await ctx.db.insert("jdTasks", { companyId: args.companyId, reference, title: nonEmpty(item.draft.title ?? "", "Task title"), description: cleanText(item.draft.description), notes: cleanText(item.draft.notes), time: cleanText(item.draft.time), quantity: item.draft.quantity ?? undefined, recurrence: item.draft.recurrence!, cycleStartedAt: now, status: "due", statusCycleStart: cycle.start, evidenceRequired: item.draft.evidenceRequired === true ? true : undefined, confirmerMembershipId: item.confirmerMembershipId, assigneeMembershipIds: item.assigneeMembershipIds, createdByMembershipId: membership._id, createdAt: now, updatedAt: now, pausedAt: item.lifecycleChange === "pause" ? now : undefined });
           await ctx.db.insert("taskActivityLogs", { companyId: args.companyId, taskType: "jd", taskId: id, actorMembershipId: membership._id, event: "created", createdAt: now });
         } else {
-          const id = await ctx.db.insert("oneTimeTasks", { companyId: args.companyId, reference, title: nonEmpty(item.draft.title ?? "", "Task title"), description: cleanText(item.draft.description), notes: cleanText(item.draft.notes), dueDate: item.draft.dueDate ?? undefined, time: cleanText(item.draft.time), quantity: item.draft.quantity ?? undefined, assigneeMembershipIds: item.assigneeMembershipIds, createdByMembershipId: membership._id, priority: item.draft.priority!, status: "due", evidenceRequired: item.draft.evidenceRequired === true ? true : undefined, createdAt: now, updatedAt: now });
+          const id = await ctx.db.insert("oneTimeTasks", { companyId: args.companyId, reference, title: nonEmpty(item.draft.title ?? "", "Task title"), description: cleanText(item.draft.description), notes: cleanText(item.draft.notes), dueDate: item.draft.dueDate ?? undefined, time: cleanText(item.draft.time), quantity: item.draft.quantity ?? undefined, assigneeMembershipIds: item.assigneeMembershipIds, createdByMembershipId: membership._id, priority: item.draft.priority!, status: "due", evidenceRequired: item.draft.evidenceRequired === true ? true : undefined, confirmerMembershipId: item.confirmerMembershipId, createdAt: now, updatedAt: now });
           await ctx.db.insert("taskActivityLogs", { companyId: args.companyId, taskType: "one_time", taskId: id, actorMembershipId: membership._id, event: "created", createdAt: now });
         }
         created += 1;

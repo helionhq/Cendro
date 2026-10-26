@@ -76,39 +76,49 @@ describe("task workbook pure helpers", () => {
 
   test("exports and parses a Cendro workbook without task IDs or a Status column", async () => {
     const workbook = await exportTaskWorkbook("one_time", "company-1", "Acme", [
-      { reference: "TSK-001", title: "=literal text", description: "Body", notes: "Important note", dueDate: Date.UTC(2026, 1, 1, 23, 59, 59), priority: "high", time: "30m", quantity: 2, assigneeEmails: "a@example.com", evidenceRequired: true },
+      { reference: "TSK-001", title: "=literal text", description: "Body", notes: "Important note", dueDate: Date.UTC(2026, 1, 1, 23, 59, 59), priority: "high", time: "30m", quantity: 2, assigneeEmails: "a@example.com", evidenceRequired: true, confirmationRequired: true, confirmerEmail: "Manager@Example.com" },
       { reference: "TSK-002", title: "Critical task", priority: "critical" },
     ]);
     const sheets = await readXlsxFile(await workbook.toBlob());
     const taskSheet = sheets.find((sheet) => sheet.sheet === "One-Time Tasks")!;
-    expect(taskSheet.data[0]).toEqual(["Code", "Title", "Description", "Notes", "Due Date", "Priority", "Time", "Quantity", "Assignee Emails", "Evidence Required"]);
+    expect(taskSheet.data[0]).toEqual(["Code", "Title", "Description", "Notes", "Due Date", "Priority", "Time", "Quantity", "Assignee Emails", "Evidence Required", "Confirmation required", "Confirmer email"]);
     expect(taskSheet.data[1][9]).toBe("Yes");
     expect(taskSheet.data[2][9]).toBe("No");
+    expect(taskSheet.data[1][10]).toBe("Yes");
+    expect(taskSheet.data[2][10]).toBe("No");
+    expect(taskSheet.data[1][11]).toBe("Manager@Example.com");
+    expect(taskSheet.data[2][11]).toBeNull();
     const parsed = parseCendroWorkbookSheets(sheets, "company-1", "one_time");
     expect(parsed.rows).toHaveLength(2);
-    expect(parsed.rows[0]).toMatchObject({ reference: "TSK-001", title: "=literal text", description: "Body", notes: "Important note", priority: "high", quantity: 2, assigneeEmails: ["a@example.com"], status: null, evidenceRequired: true });
+    expect(parsed.rows[0]).toMatchObject({ reference: "TSK-001", title: "=literal text", description: "Body", notes: "Important note", priority: "high", quantity: 2, assigneeEmails: ["a@example.com"], status: null, evidenceRequired: true, confirmationRequired: true, confirmerEmail: "manager@example.com" });
     expect(parsed.rows[0].dueDate).toBeTypeOf("number");
-    expect(parsed.rows[1]).toMatchObject({ reference: "TSK-002", title: "Critical task", priority: "critical", status: null, evidenceRequired: false });
+    expect(parsed.rows[1]).toMatchObject({ reference: "TSK-002", title: "Critical task", priority: "critical", status: null, evidenceRequired: false, confirmationRequired: false, confirmerEmail: null });
   });
 
   test("exports and parses a JD task workbook preserving description, notes and active state", async () => {
     const workbook = await exportTaskWorkbook("jd", "company-1", "Acme", [
-      { reference: "JD-001", title: "Daily maintenance", description: "Inspect equipment", notes: "Check oil level", recurrence: "daily", time: "1h", quantity: 1, assigneeEmails: "admin@example.com", isActive: true, evidenceRequired: true },
+      { reference: "JD-001", title: "Daily maintenance", description: "Inspect equipment", notes: "Check oil level", recurrence: "daily", time: "1h", quantity: 1, assigneeEmails: "admin@example.com", isActive: true, evidenceRequired: true, confirmationRequired: true, confirmerEmail: "manager@example.com" },
       { reference: "JD-002", title: "Paused checklist", recurrence: "weekly", isActive: false },
     ]);
     const sheets = await readXlsxFile(await workbook.toBlob());
     const taskSheet = sheets.find((sheet) => sheet.sheet === "JD Tasks")!;
-    expect(taskSheet.data[0]).toEqual(["Code", "Title", "Description", "Notes", "Frequency", "Time", "Quantity", "Assignee Emails", "Is Active", "Evidence Required"]);
+    expect(taskSheet.data[0]).toEqual(["Code", "Title", "Description", "Notes", "Frequency", "Time", "Quantity", "Assignee Emails", "Is Active", "Evidence Required", "Confirmation required", "Confirmer email"]);
     expect(taskSheet.data[1][8]).toBe("Yes");
     expect(taskSheet.data[2][8]).toBe("No");
     expect(taskSheet.data[1][9]).toBe("Yes");
     expect(taskSheet.data[2][9]).toBe("No");
+    expect(taskSheet.data[1][10]).toBe("Yes");
+    expect(taskSheet.data[2][10]).toBe("No");
+    expect(taskSheet.data[1][11]).toBe("manager@example.com");
+    expect(taskSheet.data[2][11]).toBeNull();
     const parsed = parseCendroWorkbookSheets(sheets, "company-1", "jd");
     expect(parsed.rows).toHaveLength(2);
-    expect(parsed.rows[0]).toMatchObject({ reference: "JD-001", title: "Daily maintenance", description: "Inspect equipment", notes: "Check oil level", recurrence: "daily", status: null, isActive: true, evidenceRequired: true });
+    expect(parsed.rows[0]).toMatchObject({ reference: "JD-001", title: "Daily maintenance", description: "Inspect equipment", notes: "Check oil level", recurrence: "daily", status: null, isActive: true, evidenceRequired: true, confirmationRequired: true, confirmerEmail: "manager@example.com" });
     expect(parsed.rows[0].presentFields).toContain("isActive");
     expect(parsed.rows[0].presentFields).toContain("evidenceRequired");
-    expect(parsed.rows[1]).toMatchObject({ reference: "JD-002", isActive: false, evidenceRequired: false });
+    expect(parsed.rows[0].presentFields).toContain("confirmationRequired");
+    expect(parsed.rows[0].presentFields).toContain("confirmerEmail");
+    expect(parsed.rows[1]).toMatchObject({ reference: "JD-002", isActive: false, evidenceRequired: false, confirmationRequired: false, confirmerEmail: null });
   });
 
   test("parses older JD sheets without an Is active column", () => {
@@ -210,6 +220,30 @@ describe("task workbook pure helpers", () => {
     expect(parsed.rows[0].presentFields).not.toContain("evidenceRequired");
     expect(parsed.rows[0].warnings).toContain("Column 10 has a value but its header is not \"Evidence Required\"; the value was ignored.");
     expect(parsed.rows[1].warnings).toHaveLength(0);
+  });
+
+  test("parses confirmation columns case-insensitively and rejects contradictory values", () => {
+    const parsed = parseCendroWorkbookSheets([
+      { sheet: "Cendro Metadata", data: [["Format identifier", "cendro-task-export"], ["Schema version", 1], ["Task kind", "one_time"], ["Source company ID", "company-1"], ["Source company name", "Acme"], ["Export timestamp", "2026-01-01T00:00:00.000Z"]] },
+      { sheet: "One-Time Tasks", data: [
+        ["Code", "Title", "Description", "Notes", "Due Date", "Priority", "Time", "Quantity", "Assignee Emails", "Evidence Required", "Confirmation required", "Confirmer email"],
+        ["TSK-001", "Confirmed", "", "", "", "medium", "", "", "admin@example.com", "", "YES", "Manager@Example.com"],
+        ["TSK-002", "Not confirmed", "", "", "", "medium", "", "", "admin@example.com", "", "no", ""],
+        ["TSK-003", "Blank", "", "", "", "medium", "", "", "admin@example.com", "", "", ""],
+        ["TSK-004", "Missing email", "", "", "", "medium", "", "", "admin@example.com", "", "Yes", ""],
+        ["TSK-005", "Email without confirmation", "", "", "", "medium", "", "", "admin@example.com", "", "No", "manager@example.com"],
+        ["TSK-006", "Invalid", "", "", "", "medium", "", "", "admin@example.com", "", "maybe", ""],
+      ] },
+    ], "company-1", "one_time");
+    expect(parsed.rows[0]).toMatchObject({ confirmationRequired: true, confirmerEmail: "manager@example.com" });
+    expect(parsed.rows[0].presentFields).toEqual(expect.arrayContaining(["confirmationRequired", "confirmerEmail"]));
+    expect(parsed.rows[1]).toMatchObject({ confirmationRequired: false, confirmerEmail: null });
+    // Blank leaves both fields absent so an update preserves the current confirmer.
+    expect(parsed.rows[2]).toMatchObject({ confirmationRequired: null, confirmerEmail: null });
+    expect(parsed.rows[2].presentFields).not.toContain("confirmationRequired");
+    expect(parsed.rows[3].warnings).toContain("Confirmation required needs a confirmer email.");
+    expect(parsed.rows[4].warnings).toContain("Confirmer email is only allowed when confirmation is required.");
+    expect(parsed.rows[5].warnings).toContain("Confirmation required must be Yes or No.");
   });
 
   test("handles sheets with trailing empty rows like Google Sheets exports and ignores an old Status column", () => {

@@ -8,7 +8,7 @@ export type TaskRailScrollOptions = {
   railRef: RefObject<HTMLElement | null>;
   activeCompanyId?: string | null;
   canUseAllTasks: boolean;
-  effectiveTaskView: "all" | "my" | "custom";
+  effectiveTaskView: "all" | "my" | "custom" | "awaiting";
 };
 
 export function syncToggleScrollState(node: HTMLElement | null) {

@@ -370,7 +370,7 @@ export const dashboard = query({
 
     // Read only active, visible task ledgers. Company-wide scans also include
     // preserved paused history, which must not consume the active report budget.
-    type TaskLedger = { completions: Doc<"jdTaskCompletions">[]; missed: Doc<"jdTaskCycleRecords">[]; truncated: boolean };
+    type TaskLedger = { completions: Doc<"jdTaskCompletions">[]; missed: Doc<"jdTaskCycleRecords">[]; pending: Doc<"taskConfirmationRequests">[]; truncated: boolean };
     const ledgersByTask = new Map<Id<"jdTasks">, TaskLedger>();
     await mapInWaves(visibleJdTasks, async ({ task }) => {
       // Reserve before yielding and keep each task's completeness separate:
@@ -381,7 +381,7 @@ export const dashboard = query({
         isTruncated: false,
         truncatedReads: 0,
       };
-      const [completions, missed] = await Promise.all([
+      const [completions, missed, pending] = await Promise.all([
         takeBudgetedRows(
           taskPhase,
           (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", range.start - jdCompletionLookbackMs).lte("cycleStart", range.end)).order("desc").take(limit),
@@ -390,8 +390,12 @@ export const dashboard = query({
           taskPhase,
           (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleEnd", (q) => q.eq("jdTaskId", task._id).gte("cycleEnd", range.start + 1).lte("cycleEnd", range.end + 1)).take(limit),
         ),
+        takeBudgetedRows(
+          taskPhase,
+          (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id)).take(limit),
+        ),
       ]);
-      ledgersByTask.set(task._id, { completions, missed, truncated: taskPhase.isTruncated });
+      ledgersByTask.set(task._id, { completions, missed, pending, truncated: taskPhase.isTruncated });
     });
 
     const jdItemGroups = visibleJdTasks.map(({ task, assignees }) => {
@@ -400,7 +404,8 @@ export const dashboard = query({
         completeness.isTruncated = true;
         return [];
       }
-      const { completions, missed } = ledger;
+      const { completions, missed, pending } = ledger;
+      const pendingStarts = new Set(pending.flatMap((request) => request.cycleStart === undefined ? [] : [request.cycleStart]));
 
       const cycles = new Map<string, { start: number; retired: boolean; dueAt: number; completed: boolean; stored: boolean }>();
       // Group rows by grid lifetime as well as start: retired work must not
@@ -457,7 +462,9 @@ export const dashboard = query({
       for (const cycle of cycles.values()) {
         if (cycle.start <= now && cycle.dueAt >= range.start && cycle.dueAt <= range.end) {
           const completed = cycle.completed || (!cycle.retired && task.status === "completed" && task.statusCycleStart === cycle.start);
-          taskItems.push({ kind: "jd", at: cycle.dueAt, completed, overdue: !completed && cycle.dueAt < now, assigneeIds: assignees });
+          // A cycle waiting on its confirmer is neither completed nor missed.
+          const overdue = !completed && !pendingStarts.has(cycle.start) && cycle.dueAt < now;
+          taskItems.push({ kind: "jd", at: cycle.dueAt, completed, overdue, assigneeIds: assignees });
         }
       }
       return taskItems;
@@ -467,7 +474,7 @@ export const dashboard = query({
       const assignees = visibleAssigneeMembershipIds(task.assigneeMembershipIds, effectiveIds);
       if (!assignees.length) continue;
       const completed = task.status === "completed";
-      const overdue = !completed && (task.overdueAt !== undefined || (task.dueDate !== undefined && task.dueDate < now));
+      const overdue = !completed && (task.overdueAt !== undefined || (task.status !== "awaiting_confirmation" && task.dueDate !== undefined && task.dueDate < now));
       items.push({ kind: "task", at: task.createdAt, completed, overdue, assigneeIds: assignees });
     }
 
@@ -644,7 +651,7 @@ async function analyticsSummary(ctx: QueryCtx, args: { companyId: Id<"companies"
   ]);
   const visibleJd = jd.filter((task) => task.pausedAt === undefined && taskHasVisibleAssignee(task, scoped));
   const visibleOne = one.filter((task) => taskHasVisibleAssignee(task, scoped));
-  const overdueOne = visibleOne.filter((t) => t.status !== "completed" && (t.overdueAt || (t.dueDate && t.dueDate < Date.now()))).length;
+  const overdueOne = visibleOne.filter((t) => t.status !== "completed" && (t.overdueAt || (t.status !== "awaiting_confirmation" && t.dueDate && t.dueDate < Date.now()))).length;
   const completedOne = visibleOne.filter((t) => t.status === "completed").length;
   const markTruncated = () => { completeness.isTruncated = true; };
   const sopVisibility = sops.length

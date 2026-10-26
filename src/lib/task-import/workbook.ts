@@ -49,6 +49,8 @@ export type WorkbookTaskRow = {
   assigneeEmails?: string | null;
   isActive?: boolean | null;
   evidenceRequired?: boolean | null;
+  confirmationRequired?: boolean | null;
+  confirmerEmail?: string | null;
 };
 
 export type ExportTask = WorkbookTaskRow & { reference: string };
@@ -66,16 +68,19 @@ export type ParsedWorkbook = {
   rows: TaskImportDraft[];
 };
 
-// "Is Active" and "Evidence Required" trail the JD headers so older sheets
-// without them still parse; export always writes both and import treats them
-// as optional. Optional columns are resolved by header name where possible,
-// because deleting an earlier optional column shifts later ones.
+// "Is Active", "Evidence Required", "Confirmation required" and "Confirmer
+// email" trail the required headers so older sheets without them still parse;
+// export always writes them and import treats them as optional. Optional
+// columns are resolved by header name where possible, because deleting an
+// earlier optional column shifts later ones.
 const jdRequiredHeaderCount = 8;
 const evidenceFallbackIndex = 9;
-const jdHeaders = ["Code", "Title", "Description", "Notes", "Frequency", "Time", "Quantity", "Assignee Emails", "Is Active", "Evidence Required"] as const;
-const oneTimeHeaders = ["Code", "Title", "Description", "Notes", "Due Date", "Priority", "Time", "Quantity", "Assignee Emails", "Evidence Required"] as const;
-// "Evidence Required" trails the one-time headers for the same reason.
-const oneTimeRequiredHeaderCount = oneTimeHeaders.length - 1;
+const confirmationFallbackIndex = 10;
+const confirmerEmailFallbackIndex = 11;
+const jdHeaders = ["Code", "Title", "Description", "Notes", "Frequency", "Time", "Quantity", "Assignee Emails", "Is Active", "Evidence Required", "Confirmation required", "Confirmer email"] as const;
+const oneTimeHeaders = ["Code", "Title", "Description", "Notes", "Due Date", "Priority", "Time", "Quantity", "Assignee Emails", "Evidence Required", "Confirmation required", "Confirmer email"] as const;
+// The trailing optional columns are not required for the one-time sheet.
+const oneTimeRequiredHeaderCount = 9;
 
 const metadataKeyAliases: Record<string, keyof WorkbookMetadata> = {
   format: "format",
@@ -254,30 +259,36 @@ function headerIndex(row: readonly unknown[], name: string) {
   return row.findIndex((cell) => normalizeHeader(cell) === name);
 }
 
+function optionalColumnState(row: readonly unknown[], name: string, fallbackIndex: number, shiftedHeaders: readonly string[]): OptionalColumn {
+  const found = headerIndex(row, name);
+  if (found >= 0) return { index: found, state: "present" };
+  const header = normalizeHeader(row[fallbackIndex]);
+  return { index: fallbackIndex, state: header === "" || shiftedHeaders.includes(header) ? "absent" : "unrecognized" };
+}
+
 // The legacy "Status" column from older exports is silently ignored; any
 // other nonempty ninth header (e.g. a misspelled "Is Actve") is flagged per
 // row so lifecycle edits cannot vanish without a warning. A sheet whose
-// optional Is Active column was deleted may hold "Evidence Required" in that
-// slot, which is not an active-state header and must stay quiet.
+// optional Is Active column was deleted may hold a later optional column in
+// that slot, which is not an active-state header and must stay quiet.
 function activeColumnState(row: readonly unknown[], kind: TaskImportKind): OptionalColumn {
   if (kind !== "jd") return { index: jdRequiredHeaderCount, state: "absent" };
-  const found = headerIndex(row, "is active");
-  if (found >= 0) return { index: found, state: "present" };
-  const header = normalizeHeader(row[jdRequiredHeaderCount]);
-  return {
-    index: jdRequiredHeaderCount,
-    state: header === "" || header === "status" || header === "evidence required" ? "absent" : "unrecognized",
-  };
+  return optionalColumnState(row, "is active", jdRequiredHeaderCount, ["status", "evidence required", "confirmation required", "confirmer email"]);
 }
 
-// "Evidence Required" is optional for both kinds and resolved by name so it
-// survives optional-column shifts. When the header is missing, a nonempty
-// value in its usual slot is surfaced so the dropped value is not silent.
+// The remaining optional columns resolve by name so they survive optional-
+// column shifts. When a header is missing, a nonempty value in its usual slot
+// is surfaced so the dropped value is not silent.
 function evidenceColumnState(row: readonly unknown[]): OptionalColumn {
-  const found = headerIndex(row, "evidence required");
-  if (found >= 0) return { index: found, state: "present" };
-  const header = normalizeHeader(row[evidenceFallbackIndex]);
-  return { index: evidenceFallbackIndex, state: header === "" ? "absent" : "unrecognized" };
+  return optionalColumnState(row, "evidence required", evidenceFallbackIndex, ["confirmation required", "confirmer email"]);
+}
+
+function confirmationColumnState(row: readonly unknown[]): OptionalColumn {
+  return optionalColumnState(row, "confirmation required", confirmationFallbackIndex, ["confirmer email"]);
+}
+
+function confirmerEmailColumnState(row: readonly unknown[]): OptionalColumn {
+  return optionalColumnState(row, "confirmer email", confirmerEmailFallbackIndex, []);
 }
 
 function valueAt(row: readonly unknown[], index: number) {
@@ -291,7 +302,7 @@ function normalizeYesNo(value: unknown): boolean | null {
   return null;
 }
 
-function makeDraft(kind: TaskImportKind, sourceSheet: string, sourceRow: number, row: readonly unknown[], activeColumn: OptionalColumn, evidenceColumn: OptionalColumn): TaskImportDraft {
+function makeDraft(kind: TaskImportKind, sourceSheet: string, sourceRow: number, row: readonly unknown[], activeColumn: OptionalColumn, evidenceColumn: OptionalColumn, confirmationColumn: OptionalColumn, confirmerEmailColumn: OptionalColumn): TaskImportDraft {
   const referenceResult = referenceForKind(sourceText(valueAt(row, 0)), kind);
   const assignees = parseAssigneeEmails(sourceText(valueAt(row, kind === "jd" ? 7 : 8)));
   const title = sourceText(valueAt(row, 1)) || null;
@@ -310,6 +321,12 @@ function makeDraft(kind: TaskImportKind, sourceSheet: string, sourceRow: number,
   const evidenceCellText = sourceText(valueAt(row, evidenceColumn.index));
   const evidenceText = evidenceColumn.state === "present" ? evidenceCellText : "";
   const evidenceRequired = evidenceText ? normalizeYesNo(evidenceText) : null;
+  const confirmationCellText = sourceText(valueAt(row, confirmationColumn.index));
+  const confirmationText = confirmationColumn.state === "present" ? confirmationCellText : "";
+  const confirmationRequired = confirmationText ? normalizeYesNo(confirmationText) : null;
+  const confirmerCellText = sourceText(valueAt(row, confirmerEmailColumn.index));
+  const confirmerText = confirmerEmailColumn.state === "present" ? confirmerCellText : "";
+  const confirmerEmail = confirmerText ? confirmerText.toLowerCase() : null;
   const warnings = [
     ...(referenceResult.error ? [referenceResult.error] : []),
     ...(parsedDate.error ? [parsedDate.error] : []),
@@ -320,6 +337,11 @@ function makeDraft(kind: TaskImportKind, sourceSheet: string, sourceRow: number,
     ...(activeColumn.state === "unrecognized" && activeCellText ? [`Column ${activeColumn.index + 1} has a value but its header is not "Is Active"; the value was ignored.`] : []),
     ...(evidenceText && evidenceRequired === null ? ["Evidence required must be Yes or No."] : []),
     ...(evidenceColumn.state !== "present" && evidenceCellText ? [`Column ${evidenceColumn.index + 1} has a value but its header is not "Evidence Required"; the value was ignored.`] : []),
+    ...(confirmationText && confirmationRequired === null ? ["Confirmation required must be Yes or No."] : []),
+    ...(confirmationRequired === true && !confirmerText ? ["Confirmation required needs a confirmer email."] : []),
+    ...(confirmationRequired !== true && confirmerText ? ["Confirmer email is only allowed when confirmation is required."] : []),
+    ...(confirmationColumn.state !== "present" && confirmationCellText ? [`Column ${confirmationColumn.index + 1} has a value but its header is not "Confirmation required"; the value was ignored.`] : []),
+    ...(confirmerEmailColumn.state !== "present" && confirmerCellText ? [`Column ${confirmerEmailColumn.index + 1} has a value but its header is not "Confirmer email"; the value was ignored.`] : []),
     ...(isFormulaLikeValue(valueAt(row, 0)) || isFormulaLikeValue(valueAt(row, 1)) ? ["Formula-like text was rejected as an input value."] : []),
   ];
   const presentFields = [
@@ -333,6 +355,8 @@ function makeDraft(kind: TaskImportKind, sourceSheet: string, sourceRow: number,
     "assignees",
     ...(isActiveText ? ["isActive"] : []),
     ...(evidenceText ? ["evidenceRequired"] : []),
+    ...(confirmationText ? ["confirmationRequired"] : []),
+    ...(confirmerText ? ["confirmerEmail"] : []),
   ] as TaskImportDraft["presentFields"];
   return taskImportDraftSchema.parse({
     rowKey: `${sourceSheet}:${sourceRow}`,
@@ -354,6 +378,8 @@ function makeDraft(kind: TaskImportKind, sourceSheet: string, sourceRow: number,
     status: null,
     isActive,
     evidenceRequired,
+    confirmationRequired,
+    confirmerEmail,
     presentFields,
     warnings,
   });
@@ -364,7 +390,9 @@ function parseTaskSheet(rows: SheetData, kind: TaskImportKind, sheetName: string
   if (headerIndex < 0) return { rows: [] as TaskImportDraft[], headerIndex };
   const activeColumn = activeColumnState(rows[headerIndex], kind);
   const evidenceColumn = evidenceColumnState(rows[headerIndex]);
-  const drafts = rows.slice(headerIndex + 1).map((row, index) => ({ row, index })).filter(({ row }) => rowHasValues(row)).map(({ row, index }) => makeDraft(kind, sheetName, headerIndex + index + 2, row, activeColumn, evidenceColumn));
+  const confirmationColumn = confirmationColumnState(rows[headerIndex]);
+  const confirmerEmailColumn = confirmerEmailColumnState(rows[headerIndex]);
+  const drafts = rows.slice(headerIndex + 1).map((row, index) => ({ row, index })).filter(({ row }) => rowHasValues(row)).map(({ row, index }) => makeDraft(kind, sheetName, headerIndex + index + 2, row, activeColumn, evidenceColumn, confirmationColumn, confirmerEmailColumn));
   return { rows: drafts, headerIndex };
 }
 
@@ -439,9 +467,11 @@ function taskRows(kind: TaskImportKind, tasks: readonly ExportTask[]): WriteShee
   const rows: WriteSheetData = [headers];
   for (const task of tasks) {
     const evidenceCell = textCell(task.evidenceRequired === true ? "Yes" : "No");
+    const confirmationCell = textCell(task.confirmationRequired === true ? "Yes" : "No");
+    const confirmerEmailCell = textCell(task.confirmationRequired === true ? task.confirmerEmail : null);
     const values: Cell[] = kind === "jd"
-      ? [textCell(task.reference), textCell(task.title), textCell(task.description), textCell(task.notes), textCell(task.recurrence), textCell(task.time), task.quantity == null ? null : { value: task.quantity, type: Number }, textCell(task.assigneeEmails), textCell(task.isActive === false ? "No" : "Yes"), evidenceCell]
-      : [textCell(task.reference), textCell(task.title), textCell(task.description), textCell(task.notes), dateCell(task.dueDate), textCell(task.priority), textCell(task.time), task.quantity == null ? null : { value: task.quantity, type: Number }, textCell(task.assigneeEmails), evidenceCell];
+      ? [textCell(task.reference), textCell(task.title), textCell(task.description), textCell(task.notes), textCell(task.recurrence), textCell(task.time), task.quantity == null ? null : { value: task.quantity, type: Number }, textCell(task.assigneeEmails), textCell(task.isActive === false ? "No" : "Yes"), evidenceCell, confirmationCell, confirmerEmailCell]
+      : [textCell(task.reference), textCell(task.title), textCell(task.description), textCell(task.notes), dateCell(task.dueDate), textCell(task.priority), textCell(task.time), task.quantity == null ? null : { value: task.quantity, type: Number }, textCell(task.assigneeEmails), evidenceCell, confirmationCell, confirmerEmailCell];
     rows.push(values);
   }
   return rows;
@@ -461,6 +491,8 @@ function metadataRows(metadata: WorkbookMetadata): WriteSheetData {
     [textCell("Priority values"), textCell(Object.entries(priorityLabels).map(([key, label]) => `${key} = ${label}`).join("; "))],
     [textCell("Is active values"), textCell("JD tasks only: Yes or No. No makes the task inactive; blank leaves the current state unchanged.")],
     [textCell("Evidence required values"), textCell("Yes or No. Blank leaves the current state unchanged; new tasks default to No.")],
+    [textCell("Confirmation required values"), textCell("Yes or No. Blank leaves the current state unchanged; new tasks default to No. Yes requires a confirmer email.")],
+    [textCell("Confirmer email values"), textCell("Email of the company member who confirms completion. Required when confirmation is required; blank otherwise.")],
   ];
 }
 

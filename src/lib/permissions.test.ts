@@ -44,6 +44,7 @@ describe("permissions catalog and defaults", () => {
       "tasks:one_time:delete:self",
       "tasks:one_time:import",
       "tasks:one_time:export",
+      "tasks:confirm",
       "tasks:comment",
       "tasks:attachment:add",
       "tasks:attachment:delete:own",
