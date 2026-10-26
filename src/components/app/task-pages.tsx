@@ -18,6 +18,7 @@ import {
   Download,
   Flag,
   Hash,
+  ImagePlus,
   Inbox,
   ListOrdered,
   PanelRight,
@@ -49,10 +50,13 @@ import { ListPreferenceController, type ListPreference, type ListPreferenceContr
 import { mergeFilteredListOrder, restoreListCustomOrder, sameListOrder } from "@/lib/list-order";
 import { insertListItem } from "@/lib/list-drag";
 import { useIsCoarsePointer } from "@/lib/use-is-coarse-pointer";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { RequiredIndicator } from "@/components/ui/required-indicator";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import {
   restoreTaskListCustomOrder,
   sortTaskListRows,
@@ -95,8 +99,12 @@ type TaskFormValues = {
   dueDate: string;
   quantity: string;
   time: string;
+  evidenceRequired: boolean;
   files: File[];
 };
+
+type EvidenceFileUpload = { storageId: Id<"_storage">; fileName: string; claimId: Id<"taskUploadClaims"> };
+type EvidenceSubmission = { text?: string; files: EvidenceFileUpload[] };
 
 type TaskRowAssignee = {
   membership: { _id: string; role: string };
@@ -153,6 +161,8 @@ const frequencies: { value: Frequency; label: string }[] = [
 const priorities: Priority[] = ["low", "medium", "high", "critical"];
 const TASK_PAGE_SIZE = 200;
 const TASK_LIST_ORDER_LIMIT = 2_000;
+const MAX_EVIDENCE_FILES = 5;
+const MAX_EVIDENCE_TEXT_LENGTH = 5_000;
 const manualStatuses: { value: ManualStatus; label: string }[] = [
   { value: "due", label: "Pending" },
   { value: "in_progress", label: "In Progress" },
@@ -181,7 +191,7 @@ const toneClasses: Record<string, string> = {
 };
 
 function emptyForm(kind: Kind): TaskFormValues {
-  return { title: "", description: "", notes: "", assigneeMembershipIds: [], recurrence: "daily", priority: "medium", dueDate: kind === "one" ? toDateField(Date.now() + 86_400_000) : "", quantity: "", time: "", files: [] };
+  return { title: "", description: "", notes: "", assigneeMembershipIds: [], recurrence: "daily", priority: "medium", dueDate: kind === "one" ? toDateField(Date.now() + 86_400_000) : "", quantity: "", time: "", evidenceRequired: false, files: [] };
 }
 
 function formFromTask(kind: Kind, task: any): TaskFormValues {
@@ -195,6 +205,7 @@ function formFromTask(kind: Kind, task: any): TaskFormValues {
     dueDate: kind === "one" && task.dueDate ? toDateField(task.dueDate, dateHasExplicitTime(task.dueDate)) : "",
     quantity: task.quantity != null ? String(task.quantity) : "",
     time: task.time ?? "",
+    evidenceRequired: task.evidenceRequired === true,
     files: [],
   };
 }
@@ -447,11 +458,15 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
   // Patch the loaded list/detail queries so every view of this task — the row,
   // the open detail pane, and status filters — reflects the change immediately.
   const updateJdStatus = useMutation(api.tasks.updateJdStatus).withOptimisticUpdate((localStore, args) => {
+    // Evidence completions wait for the server so a rejected upload is never
+    // shown as completed first.
+    if (args.evidence) return;
     const patch = (row: any) => ({ ...row, state: optimisticTaskState(row, args.status), ...(args.status === "completed" ? { completedAt: Date.now() } : {}) });
     updateInListPages(localStore, api.tasks.listJdRows, args.taskId, patch);
     updateInDetailQueries(localStore, api.tasks.getJd, args.taskId, patch);
   });
   const updateOneStatus = useMutation(api.tasks.updateOneTimeStatus).withOptimisticUpdate((localStore, args) => {
+    if (args.evidence) return;
     const patch = (row: any) => ({ ...row, state: optimisticTaskState(row, args.status), ...(args.status === "completed" ? { completedAt: Date.now() } : {}) });
     updateInListPages(localStore, api.tasks.listOneTimeRows, args.taskId, patch);
     updateInDetailQueries(localStore, api.tasks.getOneTime, args.taskId, patch);
@@ -459,6 +474,7 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
   const [pending, setPending] = useState(false);
   const [failed, setFailed] = useState(false);
   const [open, setOpen] = useState(false);
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
   const status = statusText(task);
   const raw = rawStatus(task);
   const deadlineClock = useContext(TaskDeadlineContext);
@@ -471,6 +487,13 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
 
   async function change(nextStatus: ManualStatus) {
     if (!activeCompanyId || locked || pending || awaitingClock) return;
+    // Evidence-required tasks enter completed only through the dialog, so the
+    // row never shows a completed state the server did not accept.
+    if (nextStatus === "completed" && task.evidenceRequired === true && raw !== "completed") {
+      setFailed(false);
+      setEvidenceOpen(true);
+      return;
+    }
     setPending(true);
     setFailed(false);
     try {
@@ -479,6 +502,21 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
     } catch {
       // The optimistic store reverts on failure; flag it so the retry affordance is clear.
       setFailed(true);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function completeWithEvidence(evidence: EvidenceSubmission) {
+    if (!activeCompanyId) throw new Error("No active company.");
+    setPending(true);
+    setFailed(false);
+    try {
+      if (kind === "jd") await updateJdStatus({ companyId: activeCompanyId, taskId: task._id, status: "completed", evidence });
+      else await updateOneStatus({ companyId: activeCompanyId, taskId: task._id, status: "completed", evidence });
+    } catch (error) {
+      setFailed(true);
+      throw error;
     } finally {
       setPending(false);
     }
@@ -495,43 +533,53 @@ function StatusBadge({ kind, task, size = "sm", canUpdateOverride, cellTrigger =
     </span>
   );
 
+  const completionDialog = evidenceOpen ? (
+    <EvidenceCompletionDialog kind={kind} task={task} onOpenChange={setEvidenceOpen} onComplete={completeWithEvidence} />
+  ) : null;
+
   if (cellTrigger || isAssignee) {
     return (
-      <TaskCellPopover open={open} onOpenChange={setOpen} disabled={pending || awaitingClock} pending={pending} ariaLabel="Change status" header={pill}>
-        {manualStatuses.map((option) => (
-          <button key={option.value} type="button" disabled={pending || awaitingClock} onClick={() => { setOpen(false); void change(option.value); }} className="task-cell-popover-item">
-            <span className={cn("task-pill h-[22px] px-2", toneClasses[statusTone(option.label)])}>
-              <span className={cn("task-pill-dot", statusDotClass(option.value))} />
-              {option.label}
-            </span>
-            <span className="flex-1" />
-            {raw === option.value && <Check className="h-3.5 w-3.5 text-[var(--ink-faint)]" />}
-          </button>
-        ))}
-      </TaskCellPopover>
+      <>
+        <TaskCellPopover open={open} onOpenChange={setOpen} disabled={pending || awaitingClock} pending={pending} ariaLabel="Change status" header={pill}>
+          {manualStatuses.map((option) => (
+            <button key={option.value} type="button" disabled={pending || awaitingClock} onClick={() => { setOpen(false); void change(option.value); }} className="task-cell-popover-item">
+              <span className={cn("task-pill h-[22px] px-2", toneClasses[statusTone(option.label)])}>
+                <span className={cn("task-pill-dot", statusDotClass(option.value))} />
+                {option.label}
+              </span>
+              <span className="flex-1" />
+              {raw === option.value && <Check className="h-3.5 w-3.5 text-[var(--ink-faint)]" />}
+            </button>
+          ))}
+        </TaskCellPopover>
+        {completionDialog}
+      </>
     );
   }
 
   return (
-    <DropdownMenu.Root open={open} onOpenChange={setOpen}>
-      <DropdownMenu.Trigger asChild>
-        <button type="button" disabled={pending || awaitingClock} onClick={(event) => event.stopPropagation()} data-interactive="true" className={cn("task-pill", toneClasses[statusTone(status)], pad)} aria-label="Change status">
-          <span className={cn("task-pill-dot", statusDotClass(raw))} />
-          {manualStatuses.find((option) => option.value === raw)?.label ?? status}
-        </button>
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content align="start" sideOffset={4} className="task-menu" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
-          {manualStatuses.map((option) => (
-            <DropdownMenu.Item key={option.value} disabled={pending || awaitingClock} onSelect={() => change(option.value)} className="task-menu-item">
-              <span className={cn("task-pill-dot", statusDotClass(option.value))} />
-              <span className="flex-1">{option.label}</span>
-              {raw === option.value && <Check className="h-3.5 w-3.5 text-[var(--primary)]" />}
-            </DropdownMenu.Item>
-          ))}
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
+    <>
+      <DropdownMenu.Root open={open} onOpenChange={setOpen}>
+        <DropdownMenu.Trigger asChild>
+          <button type="button" disabled={pending || awaitingClock} onClick={(event) => event.stopPropagation()} data-interactive="true" className={cn("task-pill", toneClasses[statusTone(status)], pad)} aria-label="Change status">
+            <span className={cn("task-pill-dot", statusDotClass(raw))} />
+            {manualStatuses.find((option) => option.value === raw)?.label ?? status}
+          </button>
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content align="start" sideOffset={4} className="task-menu" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
+            {manualStatuses.map((option) => (
+              <DropdownMenu.Item key={option.value} disabled={pending || awaitingClock} onSelect={() => change(option.value)} className="task-menu-item">
+                <span className={cn("task-pill-dot", statusDotClass(option.value))} />
+                <span className="flex-1">{option.label}</span>
+                {raw === option.value && <Check className="h-3.5 w-3.5 text-[var(--primary)]" />}
+              </DropdownMenu.Item>
+            ))}
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
+      {completionDialog}
+    </>
   );
 }
 
@@ -1312,6 +1360,146 @@ function InlineAssigneeCell({ assignable, assignees, selected, onSave, pending =
   );
 }
 
+function fileIdentity(file: File) {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
+function EvidenceFilePicker({ files, onChange, disabled = false }: { files: File[]; onChange: (files: File[]) => void; disabled?: boolean }) {
+  const [previews, setPreviews] = useState<Record<string, string>>({});
+
+  // Object URLs live only as long as the current selection.
+  useEffect(() => {
+    if (typeof URL.createObjectURL !== "function") return;
+    const next: Record<string, string> = {};
+    for (const file of files) if (file.type.startsWith("image/")) next[fileIdentity(file)] = URL.createObjectURL(file);
+    setPreviews(next);
+    return () => { for (const url of Object.values(next)) URL.revokeObjectURL(url); };
+  }, [files]);
+
+  function addFiles(incoming: File[]) {
+    const merged = [...files];
+    for (const file of incoming) {
+      if (merged.length >= MAX_EVIDENCE_FILES) break;
+      if (!merged.some((existing) => fileIdentity(existing) === fileIdentity(file))) merged.push(file);
+    }
+    onChange(merged);
+  }
+
+  const full = files.length >= MAX_EVIDENCE_FILES;
+  const blocked = disabled || full;
+  return (
+    <div className="grid gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <label className={cn("task-inline-control cursor-pointer", blocked && "cursor-not-allowed opacity-60")}>
+          <ImagePlus className="h-4 w-4 shrink-0 text-[var(--ink-faint)]" />
+          <span className="truncate text-[var(--ink-faint)]">Add images</span>
+          <input className="sr-only" type="file" accept="image/*" multiple disabled={blocked} onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.currentTarget.value = ""; }} />
+        </label>
+        <label className={cn("task-inline-control cursor-pointer", blocked && "cursor-not-allowed opacity-60")}>
+          <Paperclip className="h-4 w-4 shrink-0 text-[var(--ink-faint)]" />
+          <span className="truncate text-[var(--ink-faint)]">Add files</span>
+          <input className="sr-only" type="file" multiple disabled={blocked} onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.currentTarget.value = ""; }} />
+        </label>
+        <span className="text-[12px] text-[var(--ink-faint)]">{files.length} of {MAX_EVIDENCE_FILES} files</span>
+      </div>
+      {files.length > 0 && (
+        <div className="grid gap-1.5">
+          {files.map((file, index) => {
+            const preview = previews[fileIdentity(file)];
+            return (
+              <div key={fileIdentity(file)} className="flex min-h-9 items-center gap-2 rounded-md border border-[var(--hairline)] bg-[var(--surface)] px-2.5 py-1.5 text-[13px]">
+                {preview ? <span role="img" aria-label={file.name} className="h-9 w-9 shrink-0 rounded bg-cover bg-center" style={{ backgroundImage: `url(${preview})` }} /> : <Paperclip className="h-3.5 w-3.5 shrink-0 text-[var(--ink-faint)]" />}
+                <span className="min-w-0 flex-1 truncate text-[var(--ink-secondary)]">{file.name}</span>
+                <span className="shrink-0 text-[12px] text-[var(--ink-faint)]">{humanSize(file.size)}</span>
+                <button type="button" disabled={disabled} onClick={() => onChange(files.filter((_, fileIndex) => fileIndex !== index))} className="task-icon-btn h-6 w-6 rounded" aria-label={`Remove ${file.name}`}><X className="h-3.5 w-3.5" /></button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EvidenceCompletionDialog({ kind, task, onOpenChange, onComplete }: { kind: Kind; task: any; onOpenChange: (open: boolean) => void; onComplete: (evidence: EvidenceSubmission) => Promise<void> }) {
+  const { activeCompanyId } = useCompany();
+  const generateUploadUrl = useMutation(api.tasks.generateEvidenceUploadUrl);
+  const bindUploadClaim = useMutation(api.tasks.bindEvidenceUploadClaim);
+  const discardUpload = useMutation(api.tasks.discardEvidenceUpload);
+  const [text, setText] = useState("");
+  const [files, setFiles] = useState<File[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const textId = useId();
+  const empty = !text.trim() && files.length === 0;
+
+  async function submit() {
+    if (!activeCompanyId || submitting || empty) return;
+    setSubmitting(true);
+    setError(null);
+    // Track every claim as soon as it exists so a later failure can release it.
+    const claims: Id<"taskUploadClaims">[] = [];
+    const uploads: EvidenceFileUpload[] = [];
+    try {
+      for (const file of files) {
+        const upload = await generateUploadUrl({ companyId: activeCompanyId, taskType: taskTypeFor(kind), taskId: task._id as string });
+        claims.push(upload.claimId);
+        let response: Response;
+        try {
+          response = await fetch(upload.url, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file });
+        } catch {
+          throw new Error(`Could not upload ${file.name}.`);
+        }
+        if (!response.ok) throw new Error(`Could not upload ${file.name}.`);
+        const json = await response.json() as { storageId?: Id<"_storage"> };
+        if (!json.storageId) throw new Error(`Could not upload ${file.name}.`);
+        // Bind immediately: the claim becomes the only token cleanup may use
+        // to delete this blob, and submission requires the binding.
+        await bindUploadClaim({ companyId: activeCompanyId, taskType: taskTypeFor(kind), taskId: task._id as string, claimId: upload.claimId, storageId: json.storageId });
+        uploads.push({ storageId: json.storageId, fileName: file.name, claimId: upload.claimId });
+      }
+      await onComplete({ text: text.trim() || undefined, files: uploads });
+      onOpenChange(false);
+    } catch (err) {
+      // Nothing was saved: release every uploaded claim and its bound blob.
+      await Promise.all(claims.map((claimId) => discardUpload({ companyId: activeCompanyId, claimId }).catch(() => {})));
+      setError(err instanceof Error ? err.message : "Could not complete the task.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Dialog.Root open onOpenChange={(next) => { if (!submitting) onOpenChange(next); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-40 bg-black/40 backdrop-blur-[2px]" />
+        <Dialog.Content
+          onPointerDownOutside={(event) => event.preventDefault()}
+          onInteractOutside={(event) => event.preventDefault()}
+          className="fixed left-1/2 top-1/2 z-50 flex max-h-[min(680px,92dvh)] w-[min(520px,calc(100vw-24px))] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-[var(--hairline)] bg-[var(--surface)] shadow-[var(--shadow-elevated)]"
+        >
+          <div className="flex shrink-0 items-center justify-between border-b border-[var(--hairline)] px-6 py-4">
+            <Dialog.Title className="text-[15px] font-semibold tracking-[-0.01em] text-[var(--ink)]">Add completion evidence</Dialog.Title>
+            <Dialog.Close asChild><button type="button" className="task-icon-btn" aria-label="Close" disabled={submitting}><X className="h-4 w-4" /></button></Dialog.Close>
+          </div>
+          <Dialog.Description className="sr-only">This task requires evidence before it can be marked complete. Add text, images, or files.</Dialog.Description>
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+            <label htmlFor={textId} className="mb-1 block text-[13px] text-[var(--ink-muted)]">Evidence</label>
+            <Textarea id={textId} aria-label="Evidence" value={text} maxLength={MAX_EVIDENCE_TEXT_LENGTH} disabled={submitting} autoFocus placeholder="Describe what was done, attach a photo, or add a file." onChange={(event) => setText(event.target.value)} />
+            <div className="mt-2 text-[12px] text-[var(--ink-faint)]">{text.length} / {MAX_EVIDENCE_TEXT_LENGTH}</div>
+            <div className="mt-4"><EvidenceFilePicker files={files} onChange={setFiles} disabled={submitting} /></div>
+            {error && <p className="alert-error mt-4 rounded-md px-3 py-2 text-[13px]" role="alert">{error}</p>}
+          </div>
+          <div className="flex shrink-0 items-center justify-end gap-2 border-t border-[var(--hairline)] px-6 py-4">
+            <Button type="button" variant="secondary" disabled={submitting} onClick={() => onOpenChange(false)}>Cancel</Button>
+            <Button type="button" size="lg" variant="primary" disabled={submitting || empty} onClick={() => void submit()}>{submitting ? "Completing..." : "Complete task"}</Button>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
 function AttachmentPicker({ files, onChange }: { files: File[]; onChange: (files: File[]) => void }) {
   function addFiles(nextFiles: File[]) {
     const merged = [...files];
@@ -1377,7 +1565,7 @@ function isPendingTask(task: { _id: string }) {
   return String(task._id).startsWith("pending:");
 }
 
-function pendingTaskRow(args: { title: string; description?: string; notes?: string; time?: string; quantity?: number | null; recurrence?: string; priority?: string; dueDate?: number | null; assigneeMembershipIds?: string[] }, assignable: any[]) {
+function pendingTaskRow(args: { title: string; description?: string; notes?: string; time?: string; quantity?: number | null; recurrence?: string; priority?: string; dueDate?: number | null; evidenceRequired?: boolean; assigneeMembershipIds?: string[] }, assignable: any[]) {
   const now = Date.now();
   const assigneeMembershipIds = (args.assigneeMembershipIds ?? []) as string[];
   return {
@@ -1391,6 +1579,7 @@ function pendingTaskRow(args: { title: string; description?: string; notes?: str
     recurrence: args.recurrence,
     priority: args.priority,
     dueDate: args.dueDate ?? null,
+    evidenceRequired: args.evidenceRequired === true,
     createdAt: now,
     assigneeMembershipIds,
     assignees: assigneeMembershipIds.map((id) => assignable.find((candidate) => candidate.membership?._id === id)).filter(Boolean),
@@ -1453,9 +1642,9 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
         await bindUploadClaim({ companyId: activeCompanyId, claimId: upload.claimId, storageId: json.storageId });
         await addAttachment({ companyId: activeCompanyId, taskType: taskTypeFor(kind), taskId, storageId: json.storageId, fileName: file.name, contentType: file.type || "application/octet-stream", size: file.size, claimId: upload.claimId });
       } catch (err) {
-        // The blob is already stored; reclaim it so the failure does not leak
-        // storage — the storageId binds the claim even if binding never ran.
-        void deleteOrphanedUpload({ companyId: activeCompanyId, claimId: upload.claimId, storageId: json.storageId }).catch(() => {});
+        // The blob is already stored; reclaim the blob bound to the claim.
+        // An unbound claim names no blob, so cleanup leaves storage alone.
+        void deleteOrphanedUpload({ companyId: activeCompanyId, claimId: upload.claimId }).catch(() => {});
         throw err;
       }
       setValues((current) => ({ ...current, files: current.files.filter((candidate) => candidate !== file) }));
@@ -1471,7 +1660,7 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
     setError(null);
     try {
       let taskId = task?._id as string | undefined;
-      const common = { companyId: activeCompanyId, title: values.title.trim(), description: values.description, notes: values.notes, time: values.time, quantity: quantityFromInput(values.quantity), assigneeMembershipIds: values.assigneeMembershipIds as Id<"companyMemberships">[] };
+      const common = { companyId: activeCompanyId, title: values.title.trim(), description: values.description, notes: values.notes, time: values.time, quantity: quantityFromInput(values.quantity), evidenceRequired: values.evidenceRequired, assigneeMembershipIds: values.assigneeMembershipIds as Id<"companyMemberships">[] };
       if (kind === "jd") {
         if (mode === "create") taskId = await createJd({ ...common, recurrence: values.recurrence });
         else await updateJd({ ...common, taskId: task._id, recurrence: values.recurrence });
@@ -1544,6 +1733,14 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
                 <div className="grid grid-cols-[120px_1fr] items-center gap-3 py-2">
                   <span className="text-[13px] text-[var(--ink-muted)]">Time</span>
                   <div className="min-w-0"><input aria-label="Time estimate" className="h-9 w-full rounded-md border border-transparent bg-transparent px-2 text-[13px] text-[var(--ink)] outline-none placeholder:text-[var(--ink-faint)]" value={values.time} onChange={(event) => patch({ time: event.target.value })} placeholder="None" /></div>
+                </div>
+                <div className="grid grid-cols-[120px_1fr] items-center gap-3 py-2">
+                  <span className="text-[13px] text-[var(--ink-muted)]">Evidence</span>
+                  <div className="min-w-0">
+                    <Switch checked={values.evidenceRequired} onCheckedChange={(evidenceRequired) => patch({ evidenceRequired })} aria-label="Require evidence to complete">
+                      Require evidence to complete
+                    </Switch>
+                  </div>
                 </div>
                 <div className="grid grid-cols-[120px_1fr] items-start gap-3 py-2">
                   <span className="pt-2 text-[13px] text-[var(--ink-muted)]">Description</span>
@@ -2091,6 +2288,7 @@ function TaskListContent({ kind, selectedId }: { kind: Kind; selectedId?: string
         quantity: t.quantity ?? null,
         assigneeEmails: t.assignees?.map((a: any) => a.user.email).join("; ") ?? "",
         isActive: kind === "jd" ? t.pausedAt === undefined : undefined,
+        evidenceRequired: t.evidenceRequired === true,
       }));
       const { exportTaskWorkbook, downloadBlob } = await loadWorkbook();
       const workbook = await exportTaskWorkbook(
@@ -2707,6 +2905,94 @@ function AttachmentList({ attachments, pendingUploads = [], canDelete, onDelete 
   );
 }
 
+function EvidenceSection({ kind, task, taskId }: { kind: Kind; task: any; taskId: string }) {
+  const { activeCompanyId } = useCompany();
+  const taskType = taskTypeFor(kind);
+  const evidenceQuery = usePaginatedQuery(
+    api.tasks.getTaskEvidence,
+    activeCompanyId ? { companyId: activeCompanyId, taskType, taskId } : "skip",
+    { initialNumItems: 25 },
+  );
+  const entries = evidenceQuery.results as any[];
+  const required = task.evidenceRequired === true;
+  const loading = evidenceQuery.status === "LoadingFirstPage";
+  const currentCycleStart = kind === "jd" ? task.state?.currentCycleStart ?? null : null;
+  // A retired row can share the current cycleStart after a same-day schedule
+  // change; it is history, not evidence for the cycle the server now demands.
+  const currentSubmitted = kind === "jd"
+    ? currentCycleStart != null && entries.some((entry) => entry.cycleStart === currentCycleStart && entry.retiredAt == null)
+    : entries.some((entry) => entry.retiredAt == null);
+
+  return (
+    <section className="task-section">
+      <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <h2 className="task-section-title !mb-0">Evidence</h2>
+          {required && <Badge tone="yellow">Required to complete</Badge>}
+        </div>
+        {evidenceQuery.status === "CanLoadMore" && <Button size="sm" variant="ghost" onClick={() => evidenceQuery.loadMore(25)}>Load more</Button>}
+      </div>
+      {kind === "jd" && currentCycleStart != null && !loading && (
+        <p className="mb-2 text-[12.5px] text-[var(--ink-muted)]">
+          {currentSubmitted ? "Evidence for the current cycle has been submitted." : "No evidence has been submitted for the current cycle yet."}
+        </p>
+      )}
+      {entries.length === 0 ? (
+        <div className="text-[13px] text-[var(--ink-faint)]">
+          {loading ? "Loading evidence…" : required ? "No evidence yet. Completing this task will ask for evidence." : "No evidence has been submitted."}
+        </div>
+      ) : (
+        <div className="grid gap-2.5">
+          {entries.map((entry) => (
+            <article key={entry._id} className="rounded-lg border border-[var(--hairline)] bg-[var(--canvas-soft)] px-3 py-2.5">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <span className="text-[12.5px] font-medium text-[var(--ink-secondary)]">
+                  {entry.cycleStart != null ? `Cycle of ${formatDate(entry.cycleStart)}` : "Completion evidence"}
+                </span>
+                {entry.cycleStart != null && entry.cycleStart === currentCycleStart && entry.retiredAt == null && <Badge tone="green">Current cycle</Badge>}
+                {entry.retiredAt != null && <Badge tone="neutral">Previous schedule</Badge>}
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[12px] text-[var(--ink-faint)]">
+                {entry.createdBy && <Avatar name={entry.createdBy.user.name} email={entry.createdBy.user.email} imageUrl={entry.createdBy.user.imageUrl} />}
+                <span className="max-w-full truncate">{entry.createdBy?.user.fullName || entry.createdBy?.user.name || entry.createdBy?.user.email || "Unknown member"}</span>
+                <span aria-hidden="true">·</span>
+                <span>{formatDate(entry.createdAt)}</span>
+              </div>
+              {entry.text && <p className="mt-2 whitespace-pre-wrap break-words text-[13px] leading-6 text-[var(--ink-secondary)]">{entry.text}</p>}
+              {entry.files.length > 0 && (
+                <div className="mt-2 grid gap-1.5">
+                  {entry.files.map((file: any, fileIndex: number) => {
+                    const isImage = typeof file.contentType === "string" && file.contentType.startsWith("image/");
+                    const body = (
+                      <>
+                        {isImage && file.url ? (
+                          <span role="img" aria-label={file.fileName} className="h-14 w-14 shrink-0 rounded-md bg-cover bg-center" style={{ backgroundImage: `url(${file.url})` }} />
+                        ) : (
+                          <Paperclip className="h-4 w-4 shrink-0 text-[var(--ink-faint)]" />
+                        )}
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[13px] text-[var(--ink-secondary)]">{file.fileName}</span>
+                          <span className="block truncate text-[12px] text-[var(--ink-faint)]">{file.contentType}{file.size ? ` · ${humanSize(file.size)}` : ""}</span>
+                        </span>
+                        {file.url === null && <span className="shrink-0 text-[12px] text-[var(--danger)]">Unavailable</span>}
+                      </>
+                    );
+                    return file.url ? (
+                      <a key={fileIndex} href={file.url} target="_blank" rel="noreferrer" className="task-attachment-item" title={`${file.fileName} · ${humanSize(file.size)}`}>{body}</a>
+                    ) : (
+                      <div key={fileIndex} className="task-attachment-item">{body}</div>
+                    );
+                  })}
+                </div>
+              )}
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function PeekBar({ kind, canEdit, onEdit }: { kind: Kind; canEdit: boolean; onEdit: () => void }) {
   const router = useRouter();
   const base = kind === "jd" ? "/jd-tasks" : "/one-time-tasks";
@@ -2893,7 +3179,7 @@ function TaskDetailContent({ kind, id }: { kind: Kind; id: string }) {
           await bindUploadClaim({ companyId: activeCompanyId, claimId: upload.claimId, storageId: json.storageId });
           await addAttachment({ companyId: activeCompanyId, taskType, taskId: id, storageId: json.storageId, fileName: file.name, contentType: file.type || "application/octet-stream", size: file.size, claimId: upload.claimId });
         } catch (attachErr) {
-          void deleteOrphanedUpload({ companyId: activeCompanyId, claimId: upload.claimId, storageId: json.storageId }).catch(() => {});
+          void deleteOrphanedUpload({ companyId: activeCompanyId, claimId: upload.claimId }).catch(() => {});
           throw attachErr;
         }
       } catch (err) {
@@ -3044,6 +3330,8 @@ function TaskDetailContent({ kind, id }: { kind: Kind; id: string }) {
         <h2 className="task-section-title">Notes</h2>
         <EditableTaskText value={task.notes ?? ""} placeholder={canEdit ? "Add notes..." : "No notes."} ariaLabel="Edit task notes" canEdit={canEdit} variant="description" onSave={(notes) => saveTaskText({ notes })} />
       </section>
+
+      <EvidenceSection kind={kind} task={task} taskId={id} />
 
       <section className="task-section">
         <div className="mb-2.5 flex items-center justify-between">

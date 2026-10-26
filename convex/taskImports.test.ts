@@ -431,6 +431,94 @@ describe("task import backend", () => {
     expect(logs.some((l) => l.event === "status_changed")).toBe(false);
   });
 
+  test("evidenceRequired imports create, preserve, and clear the flag", async () => {
+    const { t, companyId, adminMembershipId } = await seed();
+    const admin = t.withIdentity(identity("admin"));
+
+    // New tasks default to not requiring evidence.
+    const plainId = await admin.mutation(api.tasks.createJd, { companyId, title: "Plain", recurrence: "daily", assigneeMembershipIds: [adminMembershipId] });
+    expect((await admin.query(api.tasks.getJd, { companyId, taskId: plainId })).task.evidenceRequired).toBeUndefined();
+
+    // Create with Yes.
+    await commitImport(admin, {
+      companyId, kind: "jd", importKey: "evidence-create", batchKey: "batch-1",
+      rows: [{
+        include: true,
+        selectedAssigneeMembershipIds: [adminMembershipId],
+        draft: draft({ reference: "JD-002", title: "Evidence task", evidenceRequired: true, presentFields: ["reference", "title", "recurrence", "assignees", "evidenceRequired"] }),
+      }],
+    });
+    const created = (await admin.query(api.tasks.listJdRows, { companyId, search: "Evidence task", paginationOpts: { numItems: 10, cursor: null } })).page[0];
+    expect(created.evidenceRequired).toBe(true);
+
+    // A blank column preserves the existing value on update.
+    await commitImport(admin, {
+      companyId, kind: "jd", importKey: "evidence-blank", batchKey: "batch-1",
+      rows: [{
+        include: true,
+        expectedUpdatedAt: created.updatedAt,
+        selectedAssigneeMembershipIds: null,
+        draft: draft({ reference: "JD-002", title: "Renamed", presentFields: ["reference", "title"], rawAssigneeText: "", assigneeEmails: [] }),
+      }],
+    });
+    const preserved = await admin.query(api.tasks.getJd, { companyId, taskId: created._id });
+    expect(preserved.task.title).toBe("Renamed");
+    expect(preserved.task.evidenceRequired).toBe(true);
+
+    // No clears the flag.
+    await commitImport(admin, {
+      companyId, kind: "jd", importKey: "evidence-clear", batchKey: "batch-1",
+      rows: [{
+        include: true,
+        expectedUpdatedAt: preserved.task.updatedAt,
+        selectedAssigneeMembershipIds: null,
+        draft: draft({ reference: "JD-002", evidenceRequired: false, presentFields: ["reference", "evidenceRequired"], rawAssigneeText: "", assigneeEmails: [] }),
+      }],
+    });
+    expect((await admin.query(api.tasks.getJd, { companyId, taskId: created._id })).task.evidenceRequired).toBeUndefined();
+
+    // The one-time branch applies the same create/clear semantics.
+    const oneTimeDraft = {
+      ...draft(),
+      rowKey: "One-Time Tasks:2",
+      sourceSheet: "One-Time Tasks",
+      kind: "one_time" as const,
+      reference: "TSK-002",
+      title: "Evidence one-time",
+      recurrence: null,
+      dueDate: null,
+      priority: "medium" as const,
+      evidenceRequired: true,
+      presentFields: ["reference", "title", "priority", "assignees", "evidenceRequired"] as ("reference" | "title" | "priority" | "assignees" | "evidenceRequired")[],
+      rawAssigneeText: "",
+      assigneeEmails: [],
+    };
+    await commitImport(admin, {
+      companyId, kind: "one_time", importKey: "evidence-one-time-create", batchKey: "batch-1",
+      rows: [{ include: true, selectedAssigneeMembershipIds: [adminMembershipId], draft: oneTimeDraft }],
+    });
+    const oneTime = (await admin.query(api.tasks.listOneTimeRows, { companyId, search: "Evidence one-time", paginationOpts: { numItems: 10, cursor: null } })).page[0];
+    expect(oneTime.evidenceRequired).toBe(true);
+    await commitImport(admin, {
+      companyId, kind: "one_time", importKey: "evidence-one-time-clear", batchKey: "batch-1",
+      rows: [{
+        include: true,
+        expectedUpdatedAt: oneTime.updatedAt,
+        selectedAssigneeMembershipIds: null,
+        draft: { ...oneTimeDraft, evidenceRequired: false, presentFields: ["reference", "evidenceRequired"] as ("reference" | "evidenceRequired")[], title: null },
+      }],
+    });
+    expect((await admin.query(api.tasks.getOneTime, { companyId, taskId: oneTime._id })).task.evidenceRequired).toBeUndefined();
+
+    // A present cell that normalized to neither Yes nor No blocks the row.
+    const blocked = await admin.mutation(api.taskImports.previewTaskImport, {
+      companyId, kind: "jd",
+      drafts: [draft({ reference: "JD-003", evidenceRequired: null, presentFields: ["reference", "title", "recurrence", "assignees", "evidenceRequired"] })],
+    });
+    expect(blocked.rows[0].operation).toBe("blocked");
+    expect(blocked.rows[0].errors).toContain("Evidence required must be Yes or No.");
+  });
+
   test("exportRows includes description and notes, and imports preserve them across create and update", async () => {
     const { t, companyId, adminMembershipId } = await seed();
     const admin = t.withIdentity(identity("admin"));

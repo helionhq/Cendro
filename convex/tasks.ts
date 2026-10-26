@@ -13,6 +13,18 @@ import { paletteSearchInput, searchPaletteRows, referenceSearchKey } from "./sea
 import { ASSIGNEE_SEARCH_MAX_LENGTH } from "../src/lib/assignee-search";
 import { nextReference } from "./references";
 import {
+  activeTaskEvidence,
+  deleteActiveTaskEvidence,
+  deleteTaskEvidenceBatch,
+  evidenceInputValidator,
+  isBlobReferenced,
+  retireTaskEvidenceAtCycle,
+  storeTaskEvidence,
+  TASK_UPLOAD_CLAIM_TTL_MS,
+  validateEvidenceInput,
+  type EvidenceInput,
+} from "./taskEvidence";
+import {
   assertTaskListSort,
   taskListPreferenceResultValidator,
   taskListSortValidator,
@@ -201,6 +213,7 @@ export async function retireJdHistoryAtCycle(ctx: MutationCtx, taskId: Id<"jdTas
   const [done, missed] = await Promise.all([currentJdCompletion(ctx, taskId, cycleStart), currentJdCycleRecord(ctx, taskId, cycleStart)]);
   if (done) await ctx.db.patch(done._id, { retiredAt: now });
   if (missed) await ctx.db.patch(missed._id, { retiredAt: now });
+  await retireTaskEvidenceAtCycle(ctx, taskId, cycleStart, now);
 }
 
 async function currentJdCycleRecord(ctx: Ctx, taskId: Id<"jdTasks">, cycleStart: number) {
@@ -664,7 +677,7 @@ export const exportRows = query({
       const visibleTasks = page.page.filter((_, index) => visibleFlags[index]);
       const assigneeRows = await enrich(ctx, visibleTasks.flatMap((task) => task.assigneeMembershipIds.filter((id) => scoped.has(id))));
       const assigneeById = new Map(assigneeRows.map((row) => [row.membership._id, row]));
-      const rows = visibleTasks.map((task) => ({ reference: task.reference, title: task.title, description: task.description ?? null, notes: task.notes ?? null, recurrence: task.recurrence, time: task.time ?? null, quantity: task.quantity ?? null, assigneeEmails: task.assigneeMembershipIds.filter((id) => scoped.has(id)).map((id) => assigneeById.get(id)?.user.email).filter(Boolean).join("; "), isActive: task.pausedAt === undefined }));
+      const rows = visibleTasks.map((task) => ({ reference: task.reference, title: task.title, description: task.description ?? null, notes: task.notes ?? null, recurrence: task.recurrence, time: task.time ?? null, quantity: task.quantity ?? null, assigneeEmails: task.assigneeMembershipIds.filter((id) => scoped.has(id)).map((id) => assigneeById.get(id)?.user.email).filter(Boolean).join("; "), isActive: task.pausedAt === undefined, evidenceRequired: task.evidenceRequired === true }));
       return { ...page, page: rows };
     }
     const page = await ctx.db.query("oneTimeTasks").withIndex("by_company", (q) => q.eq("companyId", args.companyId)).order("asc").paginate(args.paginationOpts);
@@ -672,7 +685,7 @@ export const exportRows = query({
     const visibleTasks = page.page.filter((_, index) => visibleFlags[index]);
     const assigneeRows = await enrich(ctx, visibleTasks.flatMap((task) => task.assigneeMembershipIds.filter((id) => scoped.has(id))));
     const assigneeById = new Map(assigneeRows.map((row) => [row.membership._id, row]));
-    const rows = visibleTasks.map((task) => ({ reference: task.reference, title: task.title, description: task.description ?? null, notes: task.notes ?? null, dueDate: task.dueDate ?? null, priority: task.priority, time: task.time ?? null, quantity: task.quantity ?? null, assigneeEmails: task.assigneeMembershipIds.filter((id) => scoped.has(id)).map((id) => assigneeById.get(id)?.user.email).filter(Boolean).join("; ") }));
+    const rows = visibleTasks.map((task) => ({ reference: task.reference, title: task.title, description: task.description ?? null, notes: task.notes ?? null, dueDate: task.dueDate ?? null, priority: task.priority, time: task.time ?? null, quantity: task.quantity ?? null, assigneeEmails: task.assigneeMembershipIds.filter((id) => scoped.has(id)).map((id) => assigneeById.get(id)?.user.email).filter(Boolean).join("; "), evidenceRequired: task.evidenceRequired === true }));
     return { ...page, page: rows };
   },
 });
@@ -1091,7 +1104,7 @@ export const getJd = query({
 });
 
 export const createJd = mutation({
-  args: { companyId: v.id("companies"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), time: v.optional(v.string()), quantity: v.optional(v.number()), recurrence: recurrenceValidator, assigneeMembershipIds: v.array(v.id("companyMemberships")) },
+  args: { companyId: v.id("companies"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), time: v.optional(v.string()), quantity: v.optional(v.number()), recurrence: recurrenceValidator, evidenceRequired: v.optional(v.boolean()), assigneeMembershipIds: v.array(v.id("companyMemberships")) },
   handler: async (ctx, args) => {
     const { membership, user, company, capabilities } = await requireCapability(ctx, args.companyId, "tasks:jd:create");
     const title = nonEmpty(args.title, "Task title");
@@ -1101,7 +1114,7 @@ export const createJd = mutation({
     const now = Date.now();
     const reference = await nextReference(ctx, args.companyId, "jd");
     const calendar = await loadWorkCalendar(ctx, args.companyId);
-    const id = await ctx.db.insert("jdTasks", { companyId: args.companyId, reference, title, description: cleanOptionalText(args.description), notes: cleanOptionalText(args.notes), time: cleanOptionalText(args.time), quantity: cleanOptionalQuantity(args.quantity), recurrence: args.recurrence, cycleStartedAt: now, status: "due", statusCycleStart: effectiveCurrentJdCycle(calendar, args.recurrence, now, company.timeZone).start, assigneeMembershipIds: args.assigneeMembershipIds, createdByMembershipId: membership._id, createdAt: now, updatedAt: now });
+    const id = await ctx.db.insert("jdTasks", { companyId: args.companyId, reference, title, description: cleanOptionalText(args.description), notes: cleanOptionalText(args.notes), time: cleanOptionalText(args.time), quantity: cleanOptionalQuantity(args.quantity), recurrence: args.recurrence, cycleStartedAt: now, status: "due", statusCycleStart: effectiveCurrentJdCycle(calendar, args.recurrence, now, company.timeZone).start, evidenceRequired: args.evidenceRequired === true ? true : undefined, assigneeMembershipIds: args.assigneeMembershipIds, createdByMembershipId: membership._id, createdAt: now, updatedAt: now });
     await logTaskActivity(ctx, { companyId: args.companyId, taskType: "jd", taskId: id, actorMembershipId: membership._id, event: "created", createdAt: now });
     await ctx.db.insert("auditEvents", { companyId: args.companyId, actorUserId: user._id, action: "jd_task.create", targetType: "jdTask", targetId: id, createdAt: now });
     return id;
@@ -1109,7 +1122,7 @@ export const createJd = mutation({
 });
 
 export const updateJd = mutation({
-  args: { companyId: v.id("companies"), taskId: v.id("jdTasks"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), time: v.optional(v.string()), quantity: v.optional(v.number()), recurrence: recurrenceValidator, assigneeMembershipIds: v.array(v.id("companyMemberships")) },
+  args: { companyId: v.id("companies"), taskId: v.id("jdTasks"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), time: v.optional(v.string()), quantity: v.optional(v.number()), recurrence: recurrenceValidator, evidenceRequired: v.optional(v.boolean()), assigneeMembershipIds: v.array(v.id("companyMemberships")) },
   handler: async (ctx, args) => {
     const { membership, capabilities } = await requireMembership(ctx, args.companyId);
     const task = await ctx.db.get(args.taskId);
@@ -1143,6 +1156,10 @@ export const updateJd = mutation({
     if (q === undefined) delete nextTask.quantity;
     else nextTask.quantity = q;
     nextTask.recurrence = args.recurrence;
+    if (args.evidenceRequired !== undefined) {
+      if (args.evidenceRequired) nextTask.evidenceRequired = true;
+      else delete nextTask.evidenceRequired;
+    }
     nextTask.assigneeMembershipIds = args.assigneeMembershipIds;
     if (args.recurrence !== task.recurrence) {
       await retireJdHistoryAtCycle(ctx, task._id, nextCycleStart, now);
@@ -1192,10 +1209,11 @@ export const updateJdFields = mutation({
     time: v.optional(v.string()),
     quantity: v.optional(v.union(v.number(), v.null())),
     recurrence: v.optional(recurrenceValidator),
+    evidenceRequired: v.optional(v.boolean()),
     assigneeMembershipIds: v.optional(v.array(v.id("companyMemberships"))),
   },
   handler: async (ctx, args) => {
-    const hasUpdate = args.title !== undefined || args.description !== undefined || args.notes !== undefined || args.time !== undefined || args.quantity !== undefined || args.recurrence !== undefined || args.assigneeMembershipIds !== undefined;
+    const hasUpdate = args.title !== undefined || args.description !== undefined || args.notes !== undefined || args.time !== undefined || args.quantity !== undefined || args.recurrence !== undefined || args.evidenceRequired !== undefined || args.assigneeMembershipIds !== undefined;
     if (!hasUpdate) return null;
     const { membership, capabilities } = await requireMembership(ctx, args.companyId);
     const task = await ctx.db.get(args.taskId);
@@ -1246,13 +1264,17 @@ export const updateJdFields = mutation({
       }
     }
     if (args.assigneeMembershipIds !== undefined) nextTask.assigneeMembershipIds = args.assigneeMembershipIds;
+    if (args.evidenceRequired !== undefined) {
+      if (args.evidenceRequired) nextTask.evidenceRequired = true;
+      else delete nextTask.evidenceRequired;
+    }
     nextTask.updatedAt = now;
     await ctx.db.replace(args.taskId, nextTask);
     return null;
   },
 });
 
-async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId: Id<"jdTasks">, status: ManualStatus, note?: string) {
+async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId: Id<"jdTasks">, status: ManualStatus, note?: string, evidence?: EvidenceInput) {
   const { membership, capabilities } = await requireMembership(ctx, companyId);
   const task = await ctx.db.get(taskId);
   if (!task || task.companyId !== companyId) throw new ConvexError("Task not found.");
@@ -1269,11 +1291,24 @@ async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId:
   await preserveJdCompletionStamp(ctx, task, cycle.start, timeZone, calendar);
   await scheduleMissedJdCycleCatchUp(ctx, task, cycle.start);
   const existing = await currentJdCompletion(ctx, taskId, cycle.start);
-  const previousStatus: ManualStatus = existing || (task.statusCycleStart === cycle.start && task.status === "completed") ? "completed" : task.statusCycleStart === cycle.start ? task.status : "due";
+  const alreadyCompleted = Boolean(existing) || (task.statusCycleStart === cycle.start && task.status === "completed");
+  const previousStatus: ManualStatus = alreadyCompleted ? "completed" : task.statusCycleStart === cycle.start ? task.status : "due";
   if (status === "completed") {
+    const activeEvidence = await activeTaskEvidence(ctx, "jd", taskId, cycle.start);
+    // A retry of an already-recorded completion keeps its evidence and must
+    // not re-validate claims that the first attempt already consumed.
+    if (evidence && !activeEvidence) {
+      const validated = await validateEvidenceInput(ctx, { companyId, membershipId: membership._id, evidence, now });
+      await storeTaskEvidence(ctx, { companyId, taskType: "jd", taskId, cycleStart: cycle.start, createdByMembershipId: membership._id, now, evidence: validated });
+    } else if (!activeEvidence && task.evidenceRequired === true && !alreadyCompleted) {
+      // Reaffirming Completed is an idempotent no-op, so enabling the flag
+      // after the fact must not strand the task in an unchangeable state.
+      throw new ConvexError("Evidence is required to complete this task.");
+    }
     if (!existing) await ctx.db.insert("jdTaskCompletions", { companyId, jdTaskId: taskId, cycleStart: cycle.start, cycleEnd: occurrenceDeadline(calendar, task.recurrence, cycle.end, timeZone) ?? cycle.end, completedByMembershipId: membership._id, completedAt: now, note: cleanOptionalText(note) });
-  } else if (existing) {
-    await ctx.db.delete(existing._id);
+  } else {
+    await deleteActiveTaskEvidence(ctx, "jd", taskId, cycle.start);
+    if (existing) await ctx.db.delete(existing._id);
   }
   await ctx.db.patch(taskId, { status, statusCycleStart: cycle.start, updatedAt: now });
   if (previousStatus !== status) await logTaskActivity(ctx, { companyId, taskType: "jd", taskId, actorMembershipId: membership._id, event: "status_changed", fromStatus: previousStatus, toStatus: status, createdAt: now });
@@ -1337,13 +1372,13 @@ export async function transitionJdTaskActiveState(
 }
 
 export const updateJdStatus = mutation({
-  args: { companyId: v.id("companies"), taskId: v.id("jdTasks"), status: statusValidator },
-  handler: async (ctx, args) => { await setJdStatus(ctx, args.companyId, args.taskId, args.status); return null; },
+  args: { companyId: v.id("companies"), taskId: v.id("jdTasks"), status: statusValidator, evidence: v.optional(evidenceInputValidator) },
+  handler: async (ctx, args) => { await setJdStatus(ctx, args.companyId, args.taskId, args.status, undefined, args.evidence); return null; },
 });
 
 export const completeJd = mutation({
-  args: { companyId: v.id("companies"), taskId: v.id("jdTasks"), note: v.optional(v.string()) },
-  handler: async (ctx, args) => { await setJdStatus(ctx, args.companyId, args.taskId, "completed", args.note); return null; },
+  args: { companyId: v.id("companies"), taskId: v.id("jdTasks"), note: v.optional(v.string()), evidence: v.optional(evidenceInputValidator) },
+  handler: async (ctx, args) => { await setJdStatus(ctx, args.companyId, args.taskId, "completed", args.note, args.evidence); return null; },
 });
 
 export const listJdCycleRecords = query({
@@ -1588,7 +1623,7 @@ export const getOneTime = query({
 });
 
 export const createOneTime = mutation({
-  args: { companyId: v.id("companies"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), dueDate: v.optional(v.number()), time: v.optional(v.string()), quantity: v.optional(v.number()), assigneeMembershipIds: v.array(v.id("companyMemberships")), priority: priorityValidator },
+  args: { companyId: v.id("companies"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), dueDate: v.optional(v.number()), time: v.optional(v.string()), quantity: v.optional(v.number()), assigneeMembershipIds: v.array(v.id("companyMemberships")), priority: priorityValidator, evidenceRequired: v.optional(v.boolean()) },
   handler: async (ctx, args) => {
     const { membership, user, capabilities } = await requireCapability(ctx, args.companyId, "tasks:one_time:create");
     const title = nonEmpty(args.title, "Task title");
@@ -1597,7 +1632,7 @@ export const createOneTime = mutation({
     await assertCanAssign(ctx, args.companyId, membership, args.assigneeMembershipIds, "one_time", capabilities);
     const now = Date.now();
     const reference = await nextReference(ctx, args.companyId, "one_time");
-    const id = await ctx.db.insert("oneTimeTasks", { companyId: args.companyId, reference, title, description: cleanOptionalText(args.description), notes: cleanOptionalText(args.notes), dueDate: args.dueDate, time: cleanOptionalText(args.time), quantity: cleanOptionalQuantity(args.quantity), assigneeMembershipIds: args.assigneeMembershipIds, createdByMembershipId: membership._id, priority: args.priority, status: "due", createdAt: now, updatedAt: now });
+    const id = await ctx.db.insert("oneTimeTasks", { companyId: args.companyId, reference, title, description: cleanOptionalText(args.description), notes: cleanOptionalText(args.notes), dueDate: args.dueDate, time: cleanOptionalText(args.time), quantity: cleanOptionalQuantity(args.quantity), assigneeMembershipIds: args.assigneeMembershipIds, createdByMembershipId: membership._id, priority: args.priority, status: "due", evidenceRequired: args.evidenceRequired === true ? true : undefined, createdAt: now, updatedAt: now });
     await logTaskActivity(ctx, { companyId: args.companyId, taskType: "one_time", taskId: id, actorMembershipId: membership._id, event: "created", createdAt: now });
     await ctx.db.insert("auditEvents", { companyId: args.companyId, actorUserId: user._id, action: "one_time_task.create", targetType: "oneTimeTask", targetId: id, createdAt: now });
     return id;
@@ -1605,7 +1640,7 @@ export const createOneTime = mutation({
 });
 
 export const updateOneTime = mutation({
-  args: { companyId: v.id("companies"), taskId: v.id("oneTimeTasks"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), dueDate: v.optional(v.number()), time: v.optional(v.string()), quantity: v.optional(v.number()), assigneeMembershipIds: v.array(v.id("companyMemberships")), priority: priorityValidator },
+  args: { companyId: v.id("companies"), taskId: v.id("oneTimeTasks"), title: v.string(), description: v.optional(v.string()), notes: v.optional(v.string()), dueDate: v.optional(v.number()), time: v.optional(v.string()), quantity: v.optional(v.number()), assigneeMembershipIds: v.array(v.id("companyMemberships")), priority: priorityValidator, evidenceRequired: v.optional(v.boolean()) },
   handler: async (ctx, args) => {
     const { membership, capabilities } = await requireMembership(ctx, args.companyId);
     const task = await ctx.db.get(args.taskId);
@@ -1633,6 +1668,10 @@ export const updateOneTime = mutation({
     else nextTask.quantity = q;
     nextTask.assigneeMembershipIds = args.assigneeMembershipIds;
     nextTask.priority = args.priority;
+    if (args.evidenceRequired !== undefined) {
+      if (args.evidenceRequired) nextTask.evidenceRequired = true;
+      else delete nextTask.evidenceRequired;
+    }
     reconcileOneTimeOverdue(nextTask);
     nextTask.updatedAt = Date.now();
     await ctx.db.replace(args.taskId, nextTask);
@@ -1678,9 +1717,10 @@ export const updateOneTimeFields = mutation({
     quantity: v.optional(v.union(v.number(), v.null())),
     assigneeMembershipIds: v.optional(v.array(v.id("companyMemberships"))),
     priority: v.optional(priorityValidator),
+    evidenceRequired: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    const hasUpdate = args.title !== undefined || args.description !== undefined || args.notes !== undefined || args.dueDate !== undefined || args.time !== undefined || args.quantity !== undefined || args.assigneeMembershipIds !== undefined || args.priority !== undefined;
+    const hasUpdate = args.title !== undefined || args.description !== undefined || args.notes !== undefined || args.dueDate !== undefined || args.time !== undefined || args.quantity !== undefined || args.assigneeMembershipIds !== undefined || args.priority !== undefined || args.evidenceRequired !== undefined;
     if (!hasUpdate) return null;
     const { membership, capabilities } = await requireMembership(ctx, args.companyId);
     const task = await ctx.db.get(args.taskId);
@@ -1720,6 +1760,10 @@ export const updateOneTimeFields = mutation({
     }
     if (args.assigneeMembershipIds !== undefined) nextTask.assigneeMembershipIds = args.assigneeMembershipIds;
     if (args.priority !== undefined) nextTask.priority = args.priority;
+    if (args.evidenceRequired !== undefined) {
+      if (args.evidenceRequired) nextTask.evidenceRequired = true;
+      else delete nextTask.evidenceRequired;
+    }
     reconcileOneTimeOverdue(nextTask);
     nextTask.updatedAt = Date.now();
     await ctx.db.replace(args.taskId, nextTask);
@@ -1727,7 +1771,7 @@ export const updateOneTimeFields = mutation({
   },
 });
 
-async function setOneTimeStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId: Id<"oneTimeTasks">, status: ManualStatus) {
+async function setOneTimeStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId: Id<"oneTimeTasks">, status: ManualStatus, evidence?: EvidenceInput) {
   const { membership, capabilities } = await requireMembership(ctx, companyId);
   const task = await ctx.db.get(taskId);
   if (!task || task.companyId !== companyId) throw new ConvexError("Task not found.");
@@ -1739,6 +1783,19 @@ async function setOneTimeStatus(ctx: MutationCtx, companyId: Id<"companies">, ta
   }
   const now = Date.now();
   const previousStatus = state.rawStatus as ManualStatus;
+  if (status === "completed") {
+    const activeEvidence = await activeTaskEvidence(ctx, "one_time", taskId);
+    if (evidence && !activeEvidence) {
+      const validated = await validateEvidenceInput(ctx, { companyId, membershipId: membership._id, evidence, now });
+      await storeTaskEvidence(ctx, { companyId, taskType: "one_time", taskId, createdByMembershipId: membership._id, now, evidence: validated });
+    } else if (!activeEvidence && task.evidenceRequired === true && previousStatus !== "completed") {
+      // Reaffirming Completed is an idempotent no-op, so enabling the flag
+      // after the fact must not strand the task in an unchangeable state.
+      throw new ConvexError("Evidence is required to complete this task.");
+    }
+  } else {
+    await deleteActiveTaskEvidence(ctx, "one_time", taskId);
+  }
   const nextTask = { ...task, status, updatedAt: now };
   if (status === "completed") {
     nextTask.completedAt = now;
@@ -1752,13 +1809,13 @@ async function setOneTimeStatus(ctx: MutationCtx, companyId: Id<"companies">, ta
 }
 
 export const updateOneTimeStatus = mutation({
-  args: { companyId: v.id("companies"), taskId: v.id("oneTimeTasks"), status: statusValidator },
-  handler: async (ctx, args) => { await setOneTimeStatus(ctx, args.companyId, args.taskId, args.status); return null; },
+  args: { companyId: v.id("companies"), taskId: v.id("oneTimeTasks"), status: statusValidator, evidence: v.optional(evidenceInputValidator) },
+  handler: async (ctx, args) => { await setOneTimeStatus(ctx, args.companyId, args.taskId, args.status, args.evidence); return null; },
 });
 
 export const completeOneTime = mutation({
-  args: { companyId: v.id("companies"), taskId: v.id("oneTimeTasks") },
-  handler: async (ctx, args) => { await setOneTimeStatus(ctx, args.companyId, args.taskId, "completed"); return null; },
+  args: { companyId: v.id("companies"), taskId: v.id("oneTimeTasks"), evidence: v.optional(evidenceInputValidator) },
+  handler: async (ctx, args) => { await setOneTimeStatus(ctx, args.companyId, args.taskId, "completed", args.evidence); return null; },
 });
 
 const DELETE_RELATED_BATCH = 500;
@@ -1772,6 +1829,7 @@ const DELETE_BULK_TASK_LIMIT = 100;
  * what remains.
  */
 async function deleteTaskRelatedBatch(ctx: MutationCtx, taskType: TaskKind, taskId: string): Promise<boolean> {
+  if (await deleteTaskEvidenceBatch(ctx, taskType, taskId)) return true;
   const loaders: (() => Promise<{ _id: Id<"jdTaskCompletions" | "jdTaskCycleRecords" | "taskComments" | "taskActivityLogs" | "taskAttachments">; storageId?: Id<"_storage"> }[]>)[] = [];
   if (taskType === "jd") {
     const jdTaskId = taskId as Id<"jdTasks">;
@@ -1935,19 +1993,32 @@ export const addAttachment = mutation({
 // Binds the blob produced by an upload POST to the claim issued with its URL.
 // Binding is what makes the claim a single-use cleanup token: orphan cleanup
 // can only ever delete this exact blob.
+async function bindClaimToStorage(
+  ctx: MutationCtx,
+  companyId: Id<"companies">,
+  membershipId: Id<"companyMemberships">,
+  claimId: Id<"taskUploadClaims">,
+  storageId: Id<"_storage">,
+) {
+  const claim = await ctx.db.get(claimId);
+  if (!claim || claim.companyId !== companyId || claim.membershipId !== membershipId) throw new ConvexError("Upload claim not found.");
+  if (claim.storageId) {
+    if (claim.storageId !== storageId) throw new ConvexError("Upload claim is already bound.");
+    return;
+  }
+  const metadata = await ctx.db.system.get("_storage", storageId);
+  if (!metadata) throw new ConvexError("Uploaded file not found.");
+  // A claim cannot adopt a blob that task data already owns, so binding can
+  // never turn another row's file into this upload's cleanup target.
+  if (await isBlobReferenced(ctx, storageId)) throw new ConvexError("This file is already attached.");
+  await ctx.db.patch(claimId, { storageId });
+}
+
 export const bindUploadClaim = mutation({
   args: { companyId: v.id("companies"), claimId: v.id("taskUploadClaims"), storageId: v.id("_storage") },
   handler: async (ctx, args) => {
     const { membership } = await requireCapability(ctx, args.companyId, "tasks:attachment:add");
-    const claim = await ctx.db.get(args.claimId);
-    if (!claim || claim.companyId !== args.companyId || claim.membershipId !== membership._id) throw new ConvexError("Upload claim not found.");
-    if (claim.storageId) {
-      if (claim.storageId !== args.storageId) throw new ConvexError("Upload claim is already bound.");
-      return null;
-    }
-    const metadata = await ctx.db.system.get("_storage", args.storageId);
-    if (!metadata) throw new ConvexError("Uploaded file not found.");
-    await ctx.db.patch(args.claimId, { storageId: args.storageId });
+    await bindClaimToStorage(ctx, args.companyId, membership._id, args.claimId, args.storageId);
     return null;
   },
 });
@@ -1983,33 +2054,115 @@ export const deleteAttachment = mutation({
   },
 });
 
-// Abandoned claims (failed uploads, closed tabs) are swept after the upload
-// URL's lifetime ends; a claim that survives stays valid for reclaiming the
-// caller's own orphan, so expiry must not strand an unreferenced blob.
-const TASK_UPLOAD_CLAIM_TTL_MS = 2 * 60 * 60 * 1000;
+// Reclaims the blob when recording an upload as an attachment or evidence
+// failed (e.g. the task was deleted mid-upload, the dialog closed, or the
+// completion was rejected). Only the blob already bound to the claim is
+// eligible: a caller-supplied storageId is never trusted, so one member can
+// never name another member's or tenant's blob for deletion.
+async function discardUploadClaim(
+  ctx: MutationCtx,
+  companyId: Id<"companies">,
+  membershipId: Id<"companyMemberships">,
+  claimId: Id<"taskUploadClaims">,
+) {
+  const claim = await ctx.db.get(claimId);
+  if (!claim || claim.companyId !== companyId || claim.membershipId !== membershipId) throw new ConvexError("Upload claim not found.");
+  const blobId = claim.storageId;
+  await ctx.db.delete(claimId);
+  if (!blobId) return;
+  const [referenced, metadata] = await Promise.all([
+    isBlobReferenced(ctx, blobId),
+    ctx.db.system.get("_storage", blobId),
+  ]);
+  if (!referenced && metadata) await ctx.storage.delete(blobId);
+}
 
-// Reclaims the bound blob when recording an upload as an attachment failed
-// (e.g. the task was deleted mid-upload). The claim both proves the caller
-// was issued this upload slot and names the only blob cleanup may delete,
-// so a caller can never touch another tenant's pending upload. When the
-// upload POST completed but bindUploadClaim never committed, the caller's
-// storageId is bound here so the blob is never discarded unidentified.
 export const deleteOrphanedUpload = mutation({
-  args: { companyId: v.id("companies"), claimId: v.id("taskUploadClaims"), storageId: v.optional(v.id("_storage")) },
+  args: { companyId: v.id("companies"), claimId: v.id("taskUploadClaims") },
   handler: async (ctx, args) => {
     const { membership } = await requireCapability(ctx, args.companyId, "tasks:attachment:add");
-    const claim = await ctx.db.get(args.claimId);
-    if (!claim || claim.companyId !== args.companyId || claim.membershipId !== membership._id) throw new ConvexError("Upload claim not found.");
-    if (claim.storageId && args.storageId && claim.storageId !== args.storageId) throw new ConvexError("Upload claim is bound to a different file.");
-    const blobId = claim.storageId ?? args.storageId;
-    await ctx.db.delete(args.claimId);
-    if (!blobId) return null;
-    const [referenced, metadata] = await Promise.all([
-      ctx.db.query("taskAttachments").withIndex("by_storageId", (q) => q.eq("storageId", blobId)).first(),
-      ctx.db.system.get("_storage", blobId),
-    ]);
-    if (!referenced && metadata) await ctx.storage.delete(blobId);
+    await discardUploadClaim(ctx, args.companyId, membership._id, args.claimId);
     return null;
+  },
+});
+
+// Evidence follows the same rule as completion: assignees always qualify;
+// everyone else needs normal task update access. Both issuing and binding an
+// evidence upload claim run through this check.
+async function requireEvidenceSubmission(
+  ctx: MutationCtx,
+  companyId: Id<"companies">,
+  taskType: TaskKind,
+  taskId: string,
+) {
+  const { membership, capabilities } = await requireMembership(ctx, companyId);
+  const normalized = taskType === "jd" ? ctx.db.normalizeId("jdTasks", taskId) : ctx.db.normalizeId("oneTimeTasks", taskId);
+  if (!normalized) throw new ConvexError("Task not found.");
+  const task = await ctx.db.get(normalized);
+  if (!task || task.companyId !== companyId) throw new ConvexError("Task not found.");
+  await assertCanUpdateTaskStatus(ctx, companyId, membership, task, taskType, capabilities);
+  return membership;
+}
+
+export const generateEvidenceUploadUrl = mutation({
+  args: { companyId: v.id("companies"), taskType: v.union(v.literal("jd"), v.literal("one_time")), taskId: v.string() },
+  handler: async (ctx, args) => {
+    const membership = await requireEvidenceSubmission(ctx, args.companyId, args.taskType, args.taskId);
+    const claimId = await ctx.db.insert("taskUploadClaims", { companyId: args.companyId, membershipId: membership._id, createdAt: Date.now() });
+    return { url: await ctx.storage.generateUploadUrl(), claimId };
+  },
+});
+
+// Binds an evidence upload to its claim with evidence-completion rights (the
+// attachment capability is irrelevant here). Without the binding, submission
+// would accept any storageId the caller happened to know.
+export const bindEvidenceUploadClaim = mutation({
+  args: { companyId: v.id("companies"), taskType: v.union(v.literal("jd"), v.literal("one_time")), taskId: v.string(), claimId: v.id("taskUploadClaims"), storageId: v.id("_storage") },
+  handler: async (ctx, args) => {
+    const membership = await requireEvidenceSubmission(ctx, args.companyId, args.taskType, args.taskId);
+    await bindClaimToStorage(ctx, args.companyId, membership._id, args.claimId, args.storageId);
+    return null;
+  },
+});
+
+export const discardEvidenceUpload = mutation({
+  args: { companyId: v.id("companies"), claimId: v.id("taskUploadClaims") },
+  handler: async (ctx, args) => {
+    const { membership } = await requireMembership(ctx, args.companyId);
+    await discardUploadClaim(ctx, args.companyId, membership._id, args.claimId);
+    return null;
+  },
+});
+
+export const getTaskEvidence = query({
+  args: { companyId: v.id("companies"), taskType: v.union(v.literal("jd"), v.literal("one_time")), taskId: v.string(), paginationOpts: paginationOptsValidator },
+  handler: async (ctx, args) => {
+    const { membership, capabilities } = await requireMembership(ctx, args.companyId);
+    const auth = await taskVisibilityAuth(ctx, args.companyId, membership, capabilities);
+    const { task, normalized } = await getVisibleTask(ctx, args.companyId, membership, args.taskType, args.taskId, auth);
+    // Full history, newest first. Storage IDs never leave the server; clients
+    // receive short-lived signed URLs instead.
+    const page = await ctx.db.query("taskEvidence").withIndex("by_task", (q) => q.eq("taskType", args.taskType).eq("taskId", normalized)).order("desc").paginate(args.paginationOpts);
+    const authors = await enrich(ctx, page.page.map((row) => row.createdByMembershipId));
+    const authorById = new Map(authors.map((author) => [author.membership._id, author]));
+    return {
+      ...page,
+      evidenceRequired: task.evidenceRequired === true,
+      page: await Promise.all(page.page.map(async (row) => ({
+        _id: row._id,
+        text: row.text ?? null,
+        files: await Promise.all(row.files.map(async (file) => ({
+          fileName: file.fileName,
+          contentType: file.contentType,
+          size: file.size,
+          url: await ctx.storage.getUrl(file.storageId),
+        }))),
+        cycleStart: row.cycleStart ?? null,
+        createdAt: row.createdAt,
+        createdBy: authorById.get(row.createdByMembershipId) ?? null,
+        retiredAt: row.retiredAt ?? null,
+      }))),
+    };
   },
 });
 
@@ -2025,11 +2178,7 @@ export const sweepExpiredTaskUploadClaims = internalMutation({
       // Rows scan in creation order — a fresh claim means the rest are fresh.
       if (claim.createdAt >= cutoff) return null;
       if (claim.storageId) {
-        const referenced = await ctx.db
-          .query("taskAttachments")
-          .withIndex("by_storageId", (q) => q.eq("storageId", claim.storageId!))
-          .first();
-        if (!referenced) await ctx.storage.delete(claim.storageId);
+        if (!(await isBlobReferenced(ctx, claim.storageId))) await ctx.storage.delete(claim.storageId);
       }
       await ctx.db.delete(claim._id);
     }
@@ -2133,11 +2282,11 @@ function visibleAssigneeIds(task: Doc<"jdTasks"> | Doc<"oneTimeTasks">, scopedMe
 }
 
 function aiJdRow(task: Doc<"jdTasks">, state: { status: string; dueAt: number | null }, scopedMembershipIds: Set<Id<"companyMemberships">> | undefined, assignees: Map<Id<"companyMemberships">, AiAssignee>) {
-  return { kind: "jd" as const, id: task._id, reference: task.reference, title: task.title, description: task.description, notes: task.notes, status: state.status, dueAt: state.dueAt, recurrence: task.recurrence, quantity: task.quantity, time: task.time, assignees: visibleAssigneeIds(task, scopedMembershipIds).map((id) => assignees.get(id)).filter(Boolean) };
+  return { kind: "jd" as const, id: task._id, reference: task.reference, title: task.title, description: task.description, notes: task.notes, status: state.status, dueAt: state.dueAt, recurrence: task.recurrence, quantity: task.quantity, time: task.time, evidenceRequired: task.evidenceRequired === true, assignees: visibleAssigneeIds(task, scopedMembershipIds).map((id) => assignees.get(id)).filter(Boolean) };
 }
 
 function aiOneTimeRow(task: Doc<"oneTimeTasks">, state: { status: string; dueAt: number | null }, scopedMembershipIds: Set<Id<"companyMemberships">> | undefined, assignees: Map<Id<"companyMemberships">, AiAssignee>) {
-  return { kind: "one_time" as const, id: task._id, reference: task.reference, title: task.title, description: task.description, notes: task.notes, status: state.status, dueAt: task.dueDate, priority: task.priority, quantity: task.quantity, time: task.time, assignees: visibleAssigneeIds(task, scopedMembershipIds).map((id) => assignees.get(id)).filter(Boolean) };
+  return { kind: "one_time" as const, id: task._id, reference: task.reference, title: task.title, description: task.description, notes: task.notes, status: state.status, dueAt: task.dueDate, priority: task.priority, quantity: task.quantity, time: task.time, evidenceRequired: task.evidenceRequired === true, assignees: visibleAssigneeIds(task, scopedMembershipIds).map((id) => assignees.get(id)).filter(Boolean) };
 }
 
 // Single-task wrapper for the mutation/detail paths — the list path batches
@@ -2238,7 +2387,12 @@ export const aiSetStatus = mutation({
   args: { companyId: v.id("companies"), kind: v.union(v.literal("jd"), v.literal("one_time")), taskId: v.string(), status: statusValidator, note: v.optional(v.string()) },
   handler: async (ctx, args) => {
     const { membership, capabilities } = await requireMembership(ctx, args.companyId);
-    const { normalized } = await getVisibleTask(ctx, args.companyId, membership, args.kind, args.taskId, await taskVisibilityAuth(ctx, args.companyId, membership, capabilities));
+    const { normalized, task } = await getVisibleTask(ctx, args.companyId, membership, args.kind, args.taskId, await taskVisibilityAuth(ctx, args.companyId, membership, capabilities));
+    // Evidence is captured through the task's completion dialog, so the agent
+    // must not complete these tasks on the user's behalf.
+    if (args.status === "completed" && task.evidenceRequired === true) {
+      throw new ConvexError("This task requires evidence to complete. Complete it from the task's completion dialog.");
+    }
     if (args.kind === "jd") {
       if (args.note !== undefined && args.status !== "completed") throw new ConvexError("Status notes are only saved when completing a task.");
       await setJdStatus(ctx, args.companyId, normalized as Id<"jdTasks">, args.status, args.note);

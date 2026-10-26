@@ -114,6 +114,9 @@ test.each(["jd", "one"] as const)("%s task creation marks only fields required b
   await mount(kind === "one" ? React.createElement(TaskDeadlineProvider, null, list) : list, "New task");
   expect(requiredLabels()).toEqual(["Title", "Assigned To", kind === "jd" ? "Frequency" : "Priority"]);
   expectAccessibleIndicators("Task title");
+  const evidenceToggle = nodes(dialog()).find((node) => node.getAttribute?.("role") === "switch" && node.getAttribute?.("aria-label") === "Require evidence to complete");
+  expect(evidenceToggle?.getAttribute("aria-checked")).toBe("false");
+  expect(text(evidenceToggle)).toBe("Require evidence to complete");
   const labels = nodes(dialog()).map((node) => node.getAttribute?.("aria-label"));
   expect(labels).toContain("Assigned To (required): Select assignee");
   expect(labels).toContain(kind === "jd" ? "Frequency (required): Daily" : "Priority (required): Medium");

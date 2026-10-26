@@ -25,6 +25,7 @@ export const taskImportFieldNames = [
   "assignees",
   "status",
   "isActive",
+  "evidenceRequired",
 ] as const;
 
 export type TaskImportField = (typeof taskImportFieldNames)[number];
@@ -60,6 +61,8 @@ export const taskImportDraftSchema = z.object({
   assigneeEmails: z.array(z.string().max(320)).max(50),
   status: statusSchema.nullable(),
   isActive: z.boolean().nullable(),
+  // Optional on the wire so older clients still validate during a rolling deploy.
+  evidenceRequired: z.boolean().nullable().optional(),
   presentFields: z.array(presentFieldSchema).max(taskImportFieldNames.length),
   warnings: z.array(z.string().max(500)).max(20),
 }).strict().superRefine((row, context) => {

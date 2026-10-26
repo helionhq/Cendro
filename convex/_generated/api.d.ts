@@ -26,6 +26,7 @@ import type * as searchText from "../searchText.js";
 import type * as sopListPreferences from "../sopListPreferences.js";
 import type * as sops from "../sops.js";
 import type * as taskCycles from "../taskCycles.js";
+import type * as taskEvidence from "../taskEvidence.js";
 import type * as taskImports from "../taskImports.js";
 import type * as taskListPreferences from "../taskListPreferences.js";
 import type * as tasks from "../tasks.js";
@@ -58,6 +59,7 @@ declare const fullApi: ApiFromModules<{
   sopListPreferences: typeof sopListPreferences;
   sops: typeof sops;
   taskCycles: typeof taskCycles;
+  taskEvidence: typeof taskEvidence;
   taskImports: typeof taskImports;
   taskListPreferences: typeof taskListPreferences;
   tasks: typeof tasks;
