@@ -130,7 +130,7 @@ describe("task authorization hardening", () => {
       f.asUser("adminB").mutation(api.tasks.bindUploadClaim, { companyId: f.companyB, claimId, storageId })
     ).rejects.toThrow("Upload claim not found.");
     await expect(
-      f.asUser("adminB").mutation(api.tasks.deleteOrphanedUpload, { companyId: f.companyB, claimId, storageId })
+      f.asUser("adminB").mutation(api.tasks.deleteOrphanedUpload, { companyId: f.companyB, claimId })
     ).rejects.toThrow("Upload claim not found.");
 
     // The owner binds the uploaded blob; rebinding to another blob is refused.
@@ -141,34 +141,31 @@ describe("task authorization hardening", () => {
     await expect(
       f.asUser("adminA").mutation(api.tasks.bindUploadClaim, { companyId: f.companyA, claimId, storageId: otherStorageId })
     ).rejects.toThrow("Upload claim is already bound.");
-    await expect(
-      f.asUser("adminA").mutation(api.tasks.deleteOrphanedUpload, { companyId: f.companyA, claimId, storageId: otherStorageId })
-    ).rejects.toThrow("Upload claim is bound to a different file.");
-
     // Cleanup deletes the bound unreferenced blob and consumes the claim.
     await expect(
-      f.asUser("adminA").mutation(api.tasks.deleteOrphanedUpload, { companyId: f.companyA, claimId, storageId })
+      f.asUser("adminA").mutation(api.tasks.deleteOrphanedUpload, { companyId: f.companyA, claimId })
     ).resolves.toBeNull();
     expect(await f.t.run(async (ctx) => ctx.db.system.get("_storage", storageId))).toBeNull();
     expect(await f.t.run(async (ctx) => ctx.db.get(claimId))).toBeNull();
     expect(await f.t.run(async (ctx) => ctx.db.system.get("_storage", otherStorageId))).not.toBeNull();
   });
 
-  test("Orphan cleanup binds an unbound claim so a skipped bind cannot leak the blob", async () => {
+  test("Orphan cleanup deletes only the claim's bound blob and never a referenced one", async () => {
     const f = await createAuthzFixture();
 
-    // Simulate an upload POST that completed while bindUploadClaim never ran.
-    const claimId = await f.t.run(async (ctx) =>
-      ctx.db.insert("taskUploadClaims", { companyId: f.companyA, membershipId: f.adminM, createdAt: Date.now() })
-    );
+    // An unbound claim names no blob; cleanup must not trust a caller-supplied
+    // storageId, so the blob survives (the client never learned it).
+    const { claimId } = await f.asUser("adminA").mutation(api.tasks.generateAttachmentUploadUrl, { companyId: f.companyA });
     const storageId = await f.t.run(async (ctx) => ctx.storage.store(new Blob(["late-bind"], { type: "text/plain" })));
 
     await expect(
-      f.asUser("adminA").mutation(api.tasks.deleteOrphanedUpload, { companyId: f.companyA, claimId, storageId })
+      f.asUser("adminA").mutation(api.tasks.deleteOrphanedUpload, { companyId: f.companyA, claimId })
     ).resolves.toBeNull();
-    expect(await f.t.run(async (ctx) => ctx.db.system.get("_storage", storageId))).toBeNull();
+    expect(await f.t.run(async (ctx) => ctx.db.get(claimId))).toBeNull();
+    expect(await f.t.run(async (ctx) => ctx.db.system.get("_storage", storageId))).not.toBeNull();
 
-    // A blob already recorded as an attachment is never reclaimed.
+    // A blob already recorded as an attachment is never reclaimed, even when
+    // a bound claim names it.
     const jdTaskId = await f.asUser("adminA").mutation(api.tasks.createJd, {
       companyId: f.companyA,
       title: "Attach target",
@@ -189,7 +186,7 @@ describe("task authorization hardening", () => {
       ctx.db.insert("taskUploadClaims", { companyId: f.companyA, membershipId: f.adminM, storageId: attachedStorageId, createdAt: Date.now() })
     );
     await expect(
-      f.asUser("adminA").mutation(api.tasks.deleteOrphanedUpload, { companyId: f.companyA, claimId: attachedClaimId, storageId: attachedStorageId })
+      f.asUser("adminA").mutation(api.tasks.deleteOrphanedUpload, { companyId: f.companyA, claimId: attachedClaimId })
     ).resolves.toBeNull();
     expect(await f.t.run(async (ctx) => ctx.db.system.get("_storage", attachedStorageId))).not.toBeNull();
   });

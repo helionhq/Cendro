@@ -24,8 +24,12 @@ const state = vi.hoisted(() => ({
   clockFailAfterFirst: false,
   clockWait: null as Promise<void> | null,
   statusWait: null as Promise<void> | null,
-  detail: null as null | { task: { _id: string; title: string; createdAt: number; priority: string; dueDate: number; assigneeMembershipIds: string[]; state: { status: string; rawStatus: string } }; canUpdate: boolean },
+  detail: null as null | { task: { _id: string; title: string; createdAt: number; priority: string; dueDate: number; assigneeMembershipIds: string[]; evidenceRequired?: boolean; state: { status: string; rawStatus: string; currentCycleStart?: number } }; canUpdate: boolean },
   otherAssigneeIds: [] as string[],
+  evidenceRequired: [] as string[],
+  evidenceResults: [] as unknown[],
+  exported: [] as { evidenceRequired?: boolean }[],
+  statusWrites: [] as { taskId: string; status: string; evidence?: unknown }[],
   pausedIds: [] as string[],
   lifecycleAllowed: true,
   capabilities: [] as string[],
@@ -49,7 +53,7 @@ vi.mock("motion/react", () => ({
   motion: { div: ({ children, className }: { children: ReactNode; className: string }) => React.createElement("div", { className }, children) },
 }));
 vi.mock("./company-context", () => ({ useCompany: () => ({
-  activeCompanyId: "company", active: { membership: { _id: "member" }, capabilities: state.capabilities },
+  activeCompanyId: "company", active: { membership: { _id: "member" }, company: { name: "Company" }, capabilities: state.capabilities },
 }) }));
 vi.mock("convex/react", () => {
   const getServerTime = async () => {
@@ -60,9 +64,11 @@ vi.mock("convex/react", () => {
     return serverTime;
   };
   return {
+    useConvex: () => ({}),
     useQuery: (ref: Parameters<typeof getFunctionName>[0]) => {
       switch (getFunctionName(ref)) {
         case "tasks:getOneTime": return state.detail;
+        case "tasks:getJd": return state.detail;
         case "tasks:getCustomView": return state.view;
         case "tasks:getListPreference": return { sort: { mode: "default" }, customOrder: null, revision: 0 };
         case "tasks:assignableUsers": return { users: [], isTruncated: false };
@@ -70,6 +76,7 @@ vi.mock("convex/react", () => {
       }
     },
     usePaginatedQuery: (ref: Parameters<typeof getFunctionName>[0], args: { paused?: boolean }) => {
+      if (getFunctionName(ref) === "tasks:getTaskEvidence") return { status: "Exhausted", loadMore: vi.fn(), results: state.evidenceResults };
       if (getFunctionName(ref) === "tasks:listAttachments") return { status: "Exhausted", loadMore: vi.fn(), results: [] };
       state.railRows.clear();
       state.selects.clear();
@@ -82,6 +89,7 @@ vi.mock("convex/react", () => {
             dueDate: state.dueDates[_id],
             pausedAt: state.pausedIds.includes(_id) ? 1 : undefined,
             canPause: state.lifecycleAllowed, canResume: state.lifecycleAllowed,
+            evidenceRequired: state.evidenceRequired.includes(_id) || undefined,
             assigneeMembershipIds: [state.otherAssigneeIds.includes(_id) ? "other" : "member"], assignees: [], state: state.taskStates[_id] ?? { status: "Due" },
           })),
       };
@@ -97,7 +105,7 @@ vi.mock("convex/react", () => {
             ? [{ args: { companyId: "company", taskId: state.detail.task._id }, value: state.detail }] : [],
           setQuery: (_query: unknown, _args: unknown, value: unknown) => { state.detail = value as typeof state.detail; },
         } as OptimisticLocalStore;
-        const mutate = async (args: StatusArgs) => { optimistic?.(store, args); if (state.statusWait) await state.statusWait; };
+        const mutate = async (args: StatusArgs) => { state.statusWrites.push(args); optimistic?.(store, args); if (state.statusWait) await state.statusWait; };
         return Object.assign(mutate, { withOptimisticUpdate: (update: typeof optimistic) => { optimistic = update; return mutate; } });
       }
       const mutate = ["tasks:saveCustomView", "tasks:saveListOrder"].includes(getFunctionName(ref))
@@ -137,6 +145,24 @@ vi.mock("./task-rail-scroll", () => ({
   },
 }));
 vi.mock("@/lib/use-is-coarse-pointer", () => ({ useIsCoarsePointer: () => false }));
+// Inspect the rows the selection export hands to the workbook writer.
+vi.mock("@/lib/task-import/workbook", () => ({
+  exportTaskWorkbook: async (_kind: string, _companyId: string, _companyName: string, rows: { evidenceRequired?: boolean }[]) => {
+    state.exported = rows;
+    return { toBlob: async () => new Blob(["workbook"]) };
+  },
+  downloadBlob: () => {},
+}));
+// Render dialog forms inline and only while open, without portal geometry.
+vi.mock("@radix-ui/react-dialog", () => ({
+  Root: ({ open, children }: { open: boolean; children: ReactNode }) => open ? children : null,
+  Portal: ({ children }: { children: ReactNode }) => children,
+  Overlay: () => null,
+  Content: ({ children }: { children: ReactNode }) => React.createElement("div", { role: "dialog" }, children),
+  Title: ({ children }: { children: ReactNode }) => React.createElement("h2", null, children),
+  Description: ({ children }: { children: ReactNode }) => React.createElement("p", null, children),
+  Close: ({ children }: { children: ReactNode }) => children,
+}));
 
 vi.mock("@radix-ui/react-dropdown-menu", () => {
   const pass = ({ children }: { children: ReactNode }) => children;
@@ -174,6 +200,7 @@ afterEach(async () => {
   root = undefined;
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   state.view = { orderedIds: ["A", "B", "C"], revision: 0 };
   state.pending = false;
   state.renderRows = false;
@@ -188,6 +215,10 @@ afterEach(async () => {
   state.statusWait = null;
   state.detail = null;
   state.otherAssigneeIds = [];
+  state.evidenceRequired = [];
+  state.evidenceResults = [];
+  state.exported = [];
+  state.statusWrites = [];
   state.pausedIds = [];
   state.lifecycleAllowed = true;
   state.capabilities = [];
@@ -809,4 +840,96 @@ test("Job Description retains its all-status default and single-select status fi
   expect([...state.railRows.keys()]).toEqual(["C"]);
   await act(async () => state.selects.get("All statuses")!());
   expect(new Set(state.railRows.keys())).toEqual(new Set(["A", "B", "C", "D"]));
+});
+
+function reactProps(node: any) {
+  return node[Object.keys(node).find((key) => key.startsWith("__reactProps$"))!];
+}
+
+async function chooseStatus(taskId: string, label: string) {
+  const row = descendants(container).find((node) => node.getAttribute?.("data-task-id") === taskId);
+  expect(row, `row ${taskId}`).toBeDefined();
+  const trigger = descendants(row).find((node) => node.getAttribute?.("aria-label") === "Change status");
+  expect(trigger, `status control for ${taskId}`).toBeDefined();
+  trigger.getBoundingClientRect = () => ({ top: 0, bottom: 30, left: 0, right: 100, width: 100, height: 30 });
+  await act(async () => trigger.dispatchEvent(new Event("click", { bubbles: true, cancelable: true })));
+  await clickButton(label);
+}
+
+function dialogNode() {
+  return descendants(container).find((node) => node.getAttribute?.("role") === "dialog");
+}
+
+async function renderStatusRows() {
+  vi.stubGlobal("innerWidth", 1024);
+  vi.stubGlobal("innerHeight", 768);
+  vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+  state.renderRows = true;
+  await mount("one", false);
+}
+
+test("an evidence-required task opens the completion dialog and submits text evidence", async () => {
+  state.evidenceRequired = ["A"];
+  state.taskStates = { A: { status: "Pending", rawStatus: "due" } };
+  await renderStatusRows();
+  await chooseStatus("A", "Completed");
+  const dialog = dialogNode();
+  expect(dialog).toBeDefined();
+  // Nothing is marked complete until the dialog is submitted.
+  expect(state.statusWrites).toHaveLength(0);
+  const textarea = descendants(dialog).find((node) => node.tagName === "TEXTAREA" && node.getAttribute?.("aria-label") === "Evidence");
+  expect(textarea).toBeDefined();
+  await act(async () => reactProps(textarea).onChange({ target: { value: "  Signed off  " } }));
+  await clickButton("Complete task");
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  expect(state.statusWrites).toHaveLength(1);
+  expect(state.statusWrites[0]).toMatchObject({ taskId: "A", status: "completed", evidence: { text: "Signed off", files: [] } });
+  expect(dialogNode()).toBeUndefined();
+});
+
+test("a task without evidence completes directly", async () => {
+  state.taskStates = { A: { status: "Pending", rawStatus: "due" } };
+  await renderStatusRows();
+  await chooseStatus("A", "Completed");
+  await act(async () => { await Promise.resolve(); });
+  expect(dialogNode()).toBeUndefined();
+  expect(state.statusWrites).toHaveLength(1);
+  expect(state.statusWrites[0]).toMatchObject({ taskId: "A", status: "completed" });
+  expect(state.statusWrites[0]).not.toHaveProperty("evidence");
+});
+
+test("exporting selected tasks carries the evidence-required flag", async () => {
+  state.evidenceRequired = ["A"];
+  state.capabilities = ["tasks:jd:export"];
+  await mount("jd", false);
+  await act(async () => state.railRows.get("A")!());
+  await clickButton("Export selected task");
+  await vi.waitFor(() => expect(state.exported).toHaveLength(1));
+  expect(state.exported).toHaveLength(1);
+  expect(state.exported[0]).toMatchObject({ reference: "A", evidenceRequired: true });
+});
+
+test("retired evidence from the current cycle is not reported as submitted", async () => {
+  state.detail = {
+    task: {
+      _id: "A",
+      title: "A",
+      createdAt: 1,
+      priority: "low",
+      dueDate: Date.now() + 86_400_000,
+      assigneeMembershipIds: ["member"],
+      evidenceRequired: true,
+      state: { status: "Pending", rawStatus: "due", currentCycleStart: 1000 },
+    },
+    canUpdate: false,
+  };
+  state.evidenceResults = [
+    { _id: "e1", text: "Old schedule proof", files: [], cycleStart: 1000, createdAt: 1, createdBy: null, retiredAt: 2 },
+  ];
+  container = createMockElement();
+  root = createRoot(container);
+  await act(async () => root!.render(React.createElement(TaskDetail, { kind: "jd", id: "A" })));
+  expect(descendants(container).some((node) => node.textContent === "No evidence has been submitted for the current cycle yet.")).toBe(true);
+  expect(descendants(container).some((node) => node.textContent === "Current cycle")).toBe(false);
+  expect(descendants(container).some((node) => node.textContent === "Previous schedule")).toBe(true);
 });

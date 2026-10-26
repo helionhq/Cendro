@@ -336,6 +336,37 @@ describe("JD task cycle behavior", () => {
     expect(finalCount).toEqual({ count: 0, hasMore: false });
   });
 
+  test("JD evidence stays bound to the completed cycle after the task rolls over", async () => {
+    vi.setSystemTime(utc(2026, 6, 25, 12));
+    const { t, companyId, adminMembershipId } = await seedCompany();
+    const admin = t.withIdentity(identity("admin"));
+    const taskId = await admin.mutation(api.tasks.createJd, {
+      companyId,
+      title: "Weekly evidence",
+      recurrence: "weekly",
+      assigneeMembershipIds: [adminMembershipId],
+      evidenceRequired: true,
+    });
+    const firstCycle = await admin.query(api.tasks.getJd, { companyId, taskId });
+    const completedCycleStart = firstCycle.task.state.currentCycleStart;
+    await admin.mutation(api.tasks.completeJd, { companyId, taskId, evidence: { text: "Cycle A proof" } });
+
+    vi.setSystemTime(utc(2026, 6, 29, 12));
+    const current = await admin.query(api.tasks.getJd, { companyId, taskId });
+    expect(current.task.state.rawStatus).toBe("due");
+    expect(current.task.state.currentCycleStart).toBe(utc(2026, 6, 29));
+
+    const history = await admin.query(api.tasks.getTaskEvidence, {
+      companyId,
+      taskType: "jd",
+      taskId,
+      paginationOpts: { numItems: 10, cursor: null },
+    });
+    expect(history.page).toHaveLength(1);
+    expect(history.page[0]).toMatchObject({ text: "Cycle A proof", cycleStart: completedCycleStart });
+    expect(history.page[0].cycleStart).not.toBe(current.task.state.currentCycleStart);
+  });
+
   test("completed previous JD cycle starts the new current cycle as pending", async () => {
     vi.setSystemTime(utc(2026, 6, 25, 12));
     const { t, companyId, adminMembershipId } = await seedCompany();

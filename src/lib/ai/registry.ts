@@ -130,6 +130,7 @@ function taskOut(ctx: CendroAiToolContext, row: any) {
     status: row.status,
     dueAt: row.dueAt ?? null,
     priority: row.priority ?? null,
+    evidenceRequired: row.evidenceRequired === true,
     assignees: (row.assignees ?? []).map((assignee: any) => ({ name: assignee.name, role: assignee.role })),
   };
 }
@@ -226,7 +227,7 @@ export const cendroAiToolDefinitions: CendroAiToolDefinition[] = [
   {
     name: "create_task",
     description: "Create a task after the user explicitly asks for one. kind jd is a recurring task and needs recurrence; kind one_time is a one-off and may take dueDateMs and priority. At least one assignee is required: resolve member refs from list_assignable_users or list_people, or ask the user who owns it.",
-    inputSchema: z.object({ kind: taskKind, title: z.string().min(1).max(160), description: z.string().max(2000).optional(), notes: z.string().max(2000).optional(), recurrence: recurrence.optional(), dueDateMs: z.number().int().positive().optional(), time: z.string().max(20).optional(), quantity: z.number().int().positive().optional(), assigneeRefs: z.array(memberRef).min(1).max(10), priority: priority.optional() }),
+    inputSchema: z.object({ kind: taskKind, title: z.string().min(1).max(160), description: z.string().max(2000).optional(), notes: z.string().max(2000).optional(), recurrence: recurrence.optional(), dueDateMs: z.number().int().positive().optional(), time: z.string().max(20).optional(), quantity: z.number().int().positive().optional(), assigneeRefs: z.array(memberRef).min(1).max(10), priority: priority.optional(), evidenceRequired: z.boolean().optional() }),
     activityLabel: cendroAiActivityLabels.create_task,
     permission: "member",
     risk: "write",
@@ -237,11 +238,11 @@ export const cendroAiToolDefinitions: CendroAiToolDefinition[] = [
         ensurePermission(ctx, "tasks:jd:create");
         if (!input.recurrence) throw new AiToolInputError("Recurring tasks need a recurrence value.");
         if (input.dueDateMs !== undefined) throw new AiToolInputError("Recurring tasks do not take a due date; use recurrence instead.");
-        taskId = await ctx.client.mutation(api.tasks.createJd, { companyId: ctx.companyId, title: input.title, description: input.description, notes: input.notes, time: input.time, quantity: input.quantity, recurrence: input.recurrence, assigneeMembershipIds });
+        taskId = await ctx.client.mutation(api.tasks.createJd, { companyId: ctx.companyId, title: input.title, description: input.description, notes: input.notes, time: input.time, quantity: input.quantity, recurrence: input.recurrence, evidenceRequired: input.evidenceRequired, assigneeMembershipIds });
       } else {
         ensurePermission(ctx, "tasks:one_time:create");
         if (input.recurrence !== undefined) throw new AiToolInputError("One-time tasks do not take a recurrence; use a due date instead.");
-        taskId = await ctx.client.mutation(api.tasks.createOneTime, { companyId: ctx.companyId, title: input.title, description: input.description, notes: input.notes, dueDate: input.dueDateMs, time: input.time, quantity: input.quantity, assigneeMembershipIds, priority: input.priority ?? "medium" });
+        taskId = await ctx.client.mutation(api.tasks.createOneTime, { companyId: ctx.companyId, title: input.title, description: input.description, notes: input.notes, dueDate: input.dueDateMs, time: input.time, quantity: input.quantity, assigneeMembershipIds, priority: input.priority ?? "medium", evidenceRequired: input.evidenceRequired });
       }
       const row = await readBack(ctx.client.query(api.tasks.aiGetDetail, { companyId: ctx.companyId, kind: input.kind, taskId }));
       if (!row) return { ok: true, taskRef: refFor(ctx, "task", `${input.kind}:${taskId}`), message: "Task saved, but it is not visible to you, so its details cannot be confirmed." };
@@ -250,8 +251,8 @@ export const cendroAiToolDefinitions: CendroAiToolDefinition[] = [
   },
   {
     name: "update_task",
-    description: "Update fields on a task: title, description, notes, assignees, schedule fields, priority (one-time only), recurrence (recurring only). Requires a task ref.",
-    inputSchema: z.object({ taskRef, title: z.string().min(1).max(160).optional(), description: z.string().max(2000).optional(), notes: z.string().max(2000).optional(), dueDateMs: z.number().int().positive().optional(), clearDueDate: z.boolean().optional(), time: z.string().max(20).optional(), quantity: z.number().int().positive().optional(), clearQuantity: z.boolean().optional(), recurrence: recurrence.optional(), assigneeRefs: z.array(memberRef).max(10).optional(), priority: priority.optional() }),
+    description: "Update fields on a task: title, description, notes, assignees, schedule fields, priority (one-time only), recurrence (recurring only), and whether completion requires evidence. Requires a task ref.",
+    inputSchema: z.object({ taskRef, title: z.string().min(1).max(160).optional(), description: z.string().max(2000).optional(), notes: z.string().max(2000).optional(), dueDateMs: z.number().int().positive().optional(), clearDueDate: z.boolean().optional(), time: z.string().max(20).optional(), quantity: z.number().int().positive().optional(), clearQuantity: z.boolean().optional(), recurrence: recurrence.optional(), assigneeRefs: z.array(memberRef).max(10).optional(), priority: priority.optional(), evidenceRequired: z.boolean().optional() }),
     activityLabel: cendroAiActivityLabels.update_task,
     permission: "member",
     risk: "write",
@@ -261,10 +262,10 @@ export const cendroAiToolDefinitions: CendroAiToolDefinition[] = [
       if (kind === "jd") {
         if (input.dueDateMs !== undefined || input.clearDueDate) throw new AiToolInputError("Recurring tasks do not have a due date; update recurrence instead.");
         if (input.priority !== undefined) throw new AiToolInputError("Recurring tasks do not have a priority.");
-        await ctx.client.mutation(api.tasks.updateJdFields, { companyId: ctx.companyId, taskId: id as Id<"jdTasks">, title: input.title, description: input.description, notes: input.notes, time: input.time, quantity: input.clearQuantity ? null : input.quantity, recurrence: input.recurrence, assigneeMembershipIds });
+        await ctx.client.mutation(api.tasks.updateJdFields, { companyId: ctx.companyId, taskId: id as Id<"jdTasks">, title: input.title, description: input.description, notes: input.notes, time: input.time, quantity: input.clearQuantity ? null : input.quantity, recurrence: input.recurrence, evidenceRequired: input.evidenceRequired, assigneeMembershipIds });
       } else {
         if (input.recurrence !== undefined) throw new AiToolInputError("One-time tasks do not have a recurrence; update the due date instead.");
-        await ctx.client.mutation(api.tasks.updateOneTimeFields, { companyId: ctx.companyId, taskId: id as Id<"oneTimeTasks">, title: input.title, description: input.description, notes: input.notes, dueDate: input.clearDueDate ? null : input.dueDateMs, time: input.time, quantity: input.clearQuantity ? null : input.quantity, assigneeMembershipIds, priority: input.priority });
+        await ctx.client.mutation(api.tasks.updateOneTimeFields, { companyId: ctx.companyId, taskId: id as Id<"oneTimeTasks">, title: input.title, description: input.description, notes: input.notes, dueDate: input.clearDueDate ? null : input.dueDateMs, time: input.time, quantity: input.clearQuantity ? null : input.quantity, assigneeMembershipIds, priority: input.priority, evidenceRequired: input.evidenceRequired });
       }
       const row = await readBack(ctx.client.query(api.tasks.aiGetDetail, { companyId: ctx.companyId, kind, taskId: id }));
       if (!row) return { ok: true, taskRef: input.taskRef, message: "Changes saved, but the task is no longer visible to you, so its details cannot be confirmed." };
@@ -273,7 +274,7 @@ export const cendroAiToolDefinitions: CendroAiToolDefinition[] = [
   },
   {
     name: "set_task_status",
-    description: "Change a task's status to due, in_progress, or completed. Requires a task ref. A note is only accepted for recurring tasks and records why work completed.",
+    description: "Change a task's status to due, in_progress, or completed. Requires a task ref. A note is only accepted for recurring tasks and records why work completed. Tasks that require evidence cannot be completed here; ask the user to use the task's completion dialog.",
     inputSchema: z.object({ taskRef, status: taskStatus, note: z.string().max(1000).optional() }),
     activityLabel: cendroAiActivityLabels.set_task_status,
     permission: "member",

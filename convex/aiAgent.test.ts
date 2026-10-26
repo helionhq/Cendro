@@ -91,6 +91,26 @@ describe("AI agent Convex boundaries", () => {
     await expect(t.withIdentity(identity("employee2")).mutation(api.tasks.aiSetStatus, { companyId, kind: "one_time", taskId, status: "due" })).rejects.toThrow();
   });
 
+  test("AI cannot complete a task that requires evidence", async () => {
+    const { t, companyId, employeeMembershipId } = await seed();
+    const taskId = await t.withIdentity(identity("admin")).mutation(api.tasks.createOneTime, {
+      companyId,
+      title: "Evidence task",
+      description: "",
+      dueDate: Date.now() + 86_400_000,
+      assigneeMembershipIds: [employeeMembershipId],
+      priority: "medium",
+      evidenceRequired: true,
+    });
+
+    await expect(
+      t.withIdentity(identity("employee")).mutation(api.tasks.aiSetStatus, { companyId, kind: "one_time", taskId, status: "completed" }),
+    ).rejects.toThrow("This task requires evidence to complete. Complete it from the task's completion dialog.");
+
+    const detail = await t.withIdentity(identity("employee")).query(api.tasks.getOneTime, { companyId, taskId });
+    expect(detail.task.status).toBe("due");
+  });
+
   test("AI SOP updates and deletes follow scope permissions", async () => {
     const { t, companyId } = await seed();
     const sopId = await t.withIdentity(identity("admin")).mutation(api.sops.create, { companyId, title: "Company SOP", content: "Body", scopeType: "company", branchIds: [], departmentIds: [], userMembershipIds: [] });

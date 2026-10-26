@@ -17,7 +17,7 @@ const priorityValidator = v.union(v.literal("low"), v.literal("medium"), v.liter
 const statusValidator = v.union(v.literal("due"), v.literal("in_progress"), v.literal("completed"));
 const nullableString = v.union(v.string(), v.null());
 const nullableNumber = v.union(v.number(), v.null());
-const presentFieldValidator = v.union(v.literal("reference"), v.literal("title"), v.literal("description"), v.literal("notes"), v.literal("recurrence"), v.literal("dueDate"), v.literal("priority"), v.literal("time"), v.literal("quantity"), v.literal("assignees"), v.literal("status"), v.literal("isActive"));
+const presentFieldValidator = v.union(v.literal("reference"), v.literal("title"), v.literal("description"), v.literal("notes"), v.literal("recurrence"), v.literal("dueDate"), v.literal("priority"), v.literal("time"), v.literal("quantity"), v.literal("assignees"), v.literal("status"), v.literal("isActive"), v.literal("evidenceRequired"));
 const draftValidator = v.object({
   rowKey: v.string(),
   sourceSheet: v.string(),
@@ -38,6 +38,7 @@ const draftValidator = v.object({
   status: v.union(statusValidator, v.null()),
   // Optional on the wire so clients running the pre-column bundle still validate; missing reads as null everywhere below.
   isActive: v.optional(v.union(v.boolean(), v.null())),
+  evidenceRequired: v.optional(v.union(v.boolean(), v.null())),
   presentFields: v.array(presentFieldValidator),
   warnings: v.array(v.string()),
 });
@@ -87,6 +88,7 @@ type Draft = {
   assigneeEmails: string[];
   status: "due" | "in_progress" | "completed" | null;
   isActive?: boolean | null;
+  evidenceRequired?: boolean | null;
   presentFields: string[];
   warnings: string[];
 };
@@ -258,7 +260,7 @@ async function taskCanUpdate(ctx: Ctx, companyId: Id<"companies">, auth: ImportA
 }
 
 function validateDraftValues(row: Draft, kind: TaskKind) {
-  const errors = row.warnings.filter((warning) => /^(Quantity must|Numeric due dates|Ambiguous due date|Due date must|Invalid (spreadsheet )?date|Invalid due date|Formula-like text|Frequency is not|Priority is not|Is active must|Task code |Code must )/.test(warning));
+  const errors = row.warnings.filter((warning) => /^(Quantity must|Numeric due dates|Ambiguous due date|Due date must|Invalid (spreadsheet )?date|Invalid due date|Formula-like text|Frequency is not|Priority is not|Is active must|Evidence required must|Task code |Code must )/.test(warning));
   if (row.kind !== kind) errors.push("Wrong task kind.");
   if (!row.rowKey.trim() || row.rowKey.length > 200 || !row.sourceSheet.trim() || row.sourceSheet.length > 200 || !Number.isInteger(row.sourceRow) || row.sourceRow < 1 || row.sourceRow > 1_000_000) errors.push("Import row source is invalid.");
   if (row.reference !== null && row.reference.length > 200) errors.push("Reference is too long.");
@@ -268,7 +270,7 @@ function validateDraftValues(row: Draft, kind: TaskKind) {
   if (row.notes !== null && row.notes.length > 20_000) errors.push("Notes is too long.");
   if (row.time !== null && row.time.length > 200) errors.push("Time is too long.");
   if (row.quantity !== null && (!Number.isFinite(row.quantity) || row.quantity <= 0)) errors.push("Quantity must be a positive number.");
-  if (row.presentFields.length > 12 || new Set(row.presentFields).size !== row.presentFields.length) errors.push("Import row contains invalid field markers.");
+  if (row.presentFields.length > 13 || new Set(row.presentFields).size !== row.presentFields.length) errors.push("Import row contains invalid field markers.");
   if (row.reference !== null && !hasField(row, "reference")) errors.push("Reference was not marked as present in the source.");
   if (row.rawAssigneeText.length > 2_000 || row.assigneeEmails.length > 50 || row.assigneeEmails.some((email) => email.length > 320)) errors.push("Assignee data is too large.");
   if (row.warnings.length > 20 || row.warnings.some((warning) => warning.length > 500)) errors.push("Import warnings are too large.");
@@ -278,6 +280,7 @@ function validateDraftValues(row: Draft, kind: TaskKind) {
   if (kind === "one_time" && (row.recurrence !== null || hasField(row, "recurrence"))) errors.push("One-time rows contain a recurrence.");
   if (kind === "one_time" && (row.isActive != null || hasField(row, "isActive"))) errors.push("One-time rows contain an active state.");
   if (kind === "jd" && row.isActive == null && hasField(row, "isActive")) errors.push("Is active must be Yes or No.");
+  if (hasField(row, "evidenceRequired") && row.evidenceRequired == null) errors.push("Evidence required must be Yes or No.");
   if (kind === "jd" && row.recurrence === null && hasField(row, "recurrence")) errors.push("Frequency is required and must be valid.");
   if (kind === "one_time" && row.priority === null && hasField(row, "priority")) errors.push("Priority is required and must be valid.");
   if (kind === "one_time" && row.dueDate !== null && !Number.isFinite(row.dueDate)) errors.push("Due date is invalid.");
@@ -557,6 +560,10 @@ export const commitTaskImportBatch = mutation({
           }
           if (hasField(item.draft, "recurrence") && item.draft.recurrence) nextTask.recurrence = item.draft.recurrence;
           if (item.assigneePatchRequested) nextTask.assigneeMembershipIds = item.assigneeMembershipIds;
+          if (hasField(item.draft, "evidenceRequired")) {
+            if (item.draft.evidenceRequired === true) nextTask.evidenceRequired = true;
+            else delete nextTask.evidenceRequired;
+          }
           if (nextCycleStart !== undefined) {
             // Inactivating alone preserves even an in-cycle completion stamp;
             // a combined frequency + inactive row must not lose it to the reset.
@@ -606,6 +613,10 @@ export const commitTaskImportBatch = mutation({
             else nextTask.quantity = item.draft.quantity;
           }
           if (item.assigneePatchRequested) nextTask.assigneeMembershipIds = item.assigneeMembershipIds;
+          if (hasField(item.draft, "evidenceRequired")) {
+            if (item.draft.evidenceRequired === true) nextTask.evidenceRequired = true;
+            else delete nextTask.evidenceRequired;
+          }
           reconcileOneTimeOverdue(nextTask, now);
           nextTask.updatedAt = now;
           await ctx.db.replace(task._id, nextTask);
@@ -616,10 +627,10 @@ export const commitTaskImportBatch = mutation({
         const reference = item.reference;
         if (args.kind === "jd") {
           const cycle = effectiveCurrentJdCycle(calendar, item.draft.recurrence!, now, company.timeZone);
-          const id = await ctx.db.insert("jdTasks", { companyId: args.companyId, reference, title: nonEmpty(item.draft.title ?? "", "Task title"), description: cleanText(item.draft.description), notes: cleanText(item.draft.notes), time: cleanText(item.draft.time), quantity: item.draft.quantity ?? undefined, recurrence: item.draft.recurrence!, cycleStartedAt: now, status: "due", statusCycleStart: cycle.start, assigneeMembershipIds: item.assigneeMembershipIds, createdByMembershipId: membership._id, createdAt: now, updatedAt: now, pausedAt: item.lifecycleChange === "pause" ? now : undefined });
+          const id = await ctx.db.insert("jdTasks", { companyId: args.companyId, reference, title: nonEmpty(item.draft.title ?? "", "Task title"), description: cleanText(item.draft.description), notes: cleanText(item.draft.notes), time: cleanText(item.draft.time), quantity: item.draft.quantity ?? undefined, recurrence: item.draft.recurrence!, cycleStartedAt: now, status: "due", statusCycleStart: cycle.start, evidenceRequired: item.draft.evidenceRequired === true ? true : undefined, assigneeMembershipIds: item.assigneeMembershipIds, createdByMembershipId: membership._id, createdAt: now, updatedAt: now, pausedAt: item.lifecycleChange === "pause" ? now : undefined });
           await ctx.db.insert("taskActivityLogs", { companyId: args.companyId, taskType: "jd", taskId: id, actorMembershipId: membership._id, event: "created", createdAt: now });
         } else {
-          const id = await ctx.db.insert("oneTimeTasks", { companyId: args.companyId, reference, title: nonEmpty(item.draft.title ?? "", "Task title"), description: cleanText(item.draft.description), notes: cleanText(item.draft.notes), dueDate: item.draft.dueDate ?? undefined, time: cleanText(item.draft.time), quantity: item.draft.quantity ?? undefined, assigneeMembershipIds: item.assigneeMembershipIds, createdByMembershipId: membership._id, priority: item.draft.priority!, status: "due", createdAt: now, updatedAt: now });
+          const id = await ctx.db.insert("oneTimeTasks", { companyId: args.companyId, reference, title: nonEmpty(item.draft.title ?? "", "Task title"), description: cleanText(item.draft.description), notes: cleanText(item.draft.notes), dueDate: item.draft.dueDate ?? undefined, time: cleanText(item.draft.time), quantity: item.draft.quantity ?? undefined, assigneeMembershipIds: item.assigneeMembershipIds, createdByMembershipId: membership._id, priority: item.draft.priority!, status: "due", evidenceRequired: item.draft.evidenceRequired === true ? true : undefined, createdAt: now, updatedAt: now });
           await ctx.db.insert("taskActivityLogs", { companyId: args.companyId, taskType: "one_time", taskId: id, actorMembershipId: membership._id, event: "created", createdAt: now });
         }
         created += 1;
