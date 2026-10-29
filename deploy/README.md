@@ -85,12 +85,13 @@ ssh-keygen -t ed25519 -C "cendro-vps" -f ~/.ssh/cendro_deploy -N ""
 cat ~/.ssh/cendro_deploy.pub
 ```
 
-Add it under GitHub **Settings > Deploy keys** (read-only). Then:
+Add it under GitHub **Settings > Deploy keys** (read-only). The key uses a
+non-default filename, so tell Git to use it explicitly when cloning:
 
 ```sh
 sudo mkdir -p /opt/cendro
 sudo chown ubuntu:ubuntu /opt/cendro
-git clone git@github.com:helionhq/Cendro.git /opt/cendro
+GIT_SSH_COMMAND='ssh -i ~/.ssh/cendro_deploy -o IdentitiesOnly=yes' git clone git@github.com:helionhq/Cendro.git /opt/cendro
 cd /opt/cendro/deploy
 cp .env.example .env
 chmod 600 .env
@@ -125,7 +126,7 @@ After the first GitHub Actions run has pushed an image:
 
 ```sh
 cd /opt/cendro/deploy
-sudo docker compose up -d
+sudo docker compose up -d --wait --wait-timeout 180
 sudo docker compose ps
 curl -f http://127.0.0.1:3000/api/health
 ```
@@ -232,6 +233,12 @@ docker system df
 - **Image pull denied** — GHCR login expired or the PAT lacks `read:packages`.
 - **Timer is not updating** — `systemctl list-timers`, then
   `journalctl -u cendro-update`.
+- **Update failed and the timer stopped** — a new image that never becomes
+  healthy is rolled back to the previous image, and
+  `/run/cendro-update-hold` is created so the timer does not retry it every
+  minute. Inspect `journalctl -u cendro-update`, fix the release, then
+  `sudo rm /run/cendro-update-hold` and `sudo systemctl start
+  cendro-update.service` to resume.
 - **Workflow fails at Convex deploy** — `CONVEX_DEPLOY_KEY` is missing or
   expired. `latest` was not promoted, so the VPS is still on the previous
   release.
