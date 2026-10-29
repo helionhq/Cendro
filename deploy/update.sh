@@ -4,8 +4,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # A failed update leaves this hold in place so the one-minute timer does not
-# retry (and flap) a release that needs human attention. Clear it to resume.
-if [ -e /run/cendro-update-hold ]; then
+# retry (and flap) a release that needs human attention. It lives under
+# /var/lib so it survives a reboot; clear it explicitly to resume.
+HOLD=/var/lib/cendro/update-hold
+if [ -e "$HOLD" ]; then
   exit 0
 fi
 
@@ -23,7 +25,8 @@ if ! docker compose up -d --wait --wait-timeout 180 --remove-orphans web; then
   echo "cendro update failed: the new web image did not become healthy" >&2
   # Create the hold before restoring so a failed restore cannot leave the timer
   # retrying the same bad release every minute.
-  touch /run/cendro-update-hold
+  install -d -m 0755 /var/lib/cendro
+  touch "$HOLD"
 
   if [ -n "$previous_image" ]; then
     echo "rolling back to the previous image ($previous_image)" >&2

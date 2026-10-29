@@ -235,9 +235,10 @@ docker system df
   `journalctl -u cendro-update`.
 - **Update failed and the timer stopped** — a new image that never becomes
   healthy is rolled back to the previous image, and
-  `/run/cendro-update-hold` is created so the timer does not retry it every
-  minute. Inspect `journalctl -u cendro-update`, fix the release, then
-  `sudo rm /run/cendro-update-hold` and `sudo systemctl start
+  `/var/lib/cendro/update-hold` is created. The hold survives reboots, so the
+  timer does not retry the bad release every minute. Inspect
+  `journalctl -u cendro-update`, fix the release, then
+  `sudo rm /var/lib/cendro/update-hold` and `sudo systemctl start
   cendro-update.service` to resume.
 - **Workflow fails at Convex deploy** — `CONVEX_DEPLOY_KEY` is missing or
   expired. `latest` was not promoted, so the VPS is still on the previous
