@@ -1,0 +1,78 @@
+name: Publish web
+
+# Only a merge to main deploys. PR pushes, branch pushes, and manual runs on
+# branches must never touch the production Convex deployment.
+on:
+  push:
+    branches: [main]
+
+# Never cancel a run after Convex has deployed but before `latest` is promoted.
+concurrency:
+  group: publish-web-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/cendro-web
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compute image tag
+        id: vars
+        run: echo "sha_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 1. Build an immutable image only. This has no production effect, so a
+      #    failed build leaves both Convex and the running app untouched.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.vars.outputs.sha_tag }}
+          build-args: |
+            NEXT_PUBLIC_CONVEX_URL=${{ vars.NEXT_PUBLIC_CONVEX_URL }}
+            NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${{ vars.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
+            NEXT_PUBLIC_APP_BUILD=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 2. Deploy backend code only after the image exists. If this fails,
+      #    `latest` is not moved, so the VPS keeps running the old web.
+      - name: Deploy Convex functions
+        run: npx convex deploy
+        env:
+          CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
+
+      # 3. Move the tag the VPS polls. This is the point production changes.
+      - name: Promote latest
+        run: >-
+          docker buildx imagetools create
+          -t ${{ env.IMAGE }}:latest
+          ${{ env.IMAGE }}:${{ steps.vars.outputs.sha_tag }}

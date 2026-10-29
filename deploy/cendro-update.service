@@ -1,0 +1,9 @@
+[Unit]
+Description=Pull the latest Cendro web image
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cendro/deploy/update.sh
