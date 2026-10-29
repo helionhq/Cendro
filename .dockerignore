@@ -1,0 +1,16 @@
+node_modules
+.next
+.git
+.gitignore
+.env
+.env.*
+.convex
+.vercel
+.agents
+.clerk
+.vscode
+.github
+deploy
+*.md
+*.tsbuildinfo
+coverage
