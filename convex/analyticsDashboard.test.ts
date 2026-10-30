@@ -555,6 +555,31 @@ describe("dashboard historical JD cycles", () => {
     expect(dashboard.jd).toMatchObject({ due: 3, done: 1, missed: 2, waiting: 0, completionRate: 33 });
   });
 
+  test("a ledger read cut short does not turn recorded cycles into misses", { timeout: 30_000 }, async () => {
+    const ids = await seedDashboardCompany();
+    const { t, companyId, employeeMembershipId } = ids;
+    const jdTaskId = await t.run(async (ctx) => await ctx.db.insert("jdTasks", jdDoc(ids, { recurrence: "daily", csa: day("2026-09-09"), scs: day("2026-09-09"), createdAt: day("2026-09-09") })));
+    await t.run(async (ctx) => {
+      // Sep 9–11 are all completed, but 500 retired completions from a reset
+      // grid sort ahead of Sep 10 and 11, past what one read returns.
+      for (const date of ["2026-09-09", "2026-09-10", "2026-09-11"]) {
+        await ctx.db.insert("jdTaskCompletions", { companyId, jdTaskId, cycleStart: day(date), cycleEnd: day(date) + dayMs, completedByMembershipId: employeeMembershipId, completedAt: day(date) + 3_600_000 });
+      }
+      for (let i = 0; i < 500; i++) {
+        const cycleStart = day("2026-09-09") + i * 60_000;
+        await ctx.db.insert("jdTaskCompletions", { companyId, jdTaskId, cycleStart, cycleEnd: cycleStart + dayMs, retiredAt: day("2026-09-09"), completedByMembershipId: employeeMembershipId, completedAt: cycleStart + 1 });
+      }
+    });
+    const now = day("2026-09-12") + 15 * 3_600_000;
+    vi.setSystemTime(now);
+    await syncJdReport(t);
+    const dashboard = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now, period: { unit: "month", date: "2026-09-12" } });
+    // The totals already hold every cycle as done; the incomplete read is
+    // flagged rather than reconstructed into misses.
+    expect(dashboard.isTruncated).toBe(true);
+    expect(dashboard.jd).toMatchObject({ due: 503, done: 503, missed: 0, waiting: 0 });
+  });
+
   test("a pending cycle still counts after the missed-cycle job advances the task floor", { timeout: 15_000 }, async () => {
     const { t, companyId, adminMembershipId } = await seedBareCompany();
     const now = Date.now();
@@ -710,7 +735,7 @@ describe("dashboard historical JD cycles", () => {
     // in Karachi. New York's week segment opens Aug 31 04:00 UTC, still
     // August in Karachi, so stale totals would stay in the wrong month.
     const cycleEnd = Date.UTC(2026, 8, 1, 2);
-    await t.run(async (ctx) => {
+    const jdTaskId = await t.run(async (ctx) => {
       await ctx.db.patch(companyId, { timeZone: "America/New_York" });
       const jdTaskId = await ctx.db.insert("jdTasks", {
         companyId,
@@ -726,6 +751,7 @@ describe("dashboard historical JD cycles", () => {
         updatedAt: cycleEnd - 2 * dayMs,
       });
       await ctx.db.insert("jdTaskCompletions", { companyId, jdTaskId, cycleStart: cycleEnd - dayMs, cycleEnd, completedByMembershipId: adminMembershipId, completedAt: cycleEnd - 3_600_000 });
+      return jdTaskId;
     });
     await syncJdReport(t);
     const admin = t.withIdentity(identity("admin"));
@@ -734,6 +760,10 @@ describe("dashboard historical JD cycles", () => {
 
     await admin.mutation(api.companyManagement.updateCompanyTimeZone, { companyId, timeZone: "Asia/Karachi" });
     await refreshJdReport(t);
+    expect([await doneIn("2026-08-15"), await doneIn("2026-09-15")]).toEqual([0, 1]);
+
+    // A refresh queued before the change still carries New York's month key.
+    await t.mutation(internal.jdReport.refreshMonthsLater, { months: [{ jdTaskId, monthStart: currentJdCycle("monthly", cycleEnd - dayMs, "America/New_York").start }] });
     expect([await doneIn("2026-08-15"), await doneIn("2026-09-15")]).toEqual([0, 1]);
   });
 });

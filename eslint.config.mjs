@@ -18,8 +18,8 @@ const eslintConfig = [
     files: ["convex/**/*.ts"],
     rules: {
       "no-restricted-imports": ["error", {
-        paths: [{
-          name: "./_generated/server",
+        patterns: [{
+          group: ["**/_generated/server"],
           importNames: ["mutation", "internalMutation"],
           message: "Import mutation builders from ./functions so table triggers run.",
         }],

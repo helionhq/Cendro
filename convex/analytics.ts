@@ -491,11 +491,25 @@ export const dashboard = query({
       const candidates = elapsed.occurrences.filter((cycle) => cycle.deadline - 1 < now && !(task.status === "completed" && task.statusCycleStart === cycle.start));
       if (candidates.length === 0) return;
       const from = Math.min(...candidates.map((cycle) => cycle.start));
+      // Track this task's reads separately: an absent row only proves a cycle
+      // unrecorded when the whole range loaded. Otherwise its outcome may
+      // already be in the totals, so the reconstruction must not add a miss.
+      const taskPhase: QueryCompleteness = {
+        get remaining() { return completeness.remaining; },
+        set remaining(value) { completeness.remaining = value; },
+        isTruncated: false,
+        truncatedReads: 0,
+      };
       const [completions, missed, pending] = await Promise.all([
-        takeBudgetedRows(completeness, (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", from)).take(limit)),
-        takeBudgetedRows(completeness, (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", from)).take(limit)),
-        takeBudgetedRows(completeness, (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", from)).take(limit)),
+        takeBudgetedRows(taskPhase, (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", from)).take(limit)),
+        takeBudgetedRows(taskPhase, (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", from)).take(limit)),
+        takeBudgetedRows(taskPhase, (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", from)).take(limit)),
       ]);
+      if (taskPhase.isTruncated) {
+        completeness.isTruncated = true;
+        completeness.truncatedReads += taskPhase.truncatedReads;
+        return;
+      }
       const recorded = new Set<number>();
       for (const row of [...completions, ...missed]) if (row.retiredAt === undefined) recorded.add(row.cycleStart);
       for (const request of pending) if (request.cycleStart !== undefined && request.recurrence === task.recurrence) recorded.add(request.cycleStart);

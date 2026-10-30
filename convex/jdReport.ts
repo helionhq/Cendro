@@ -194,9 +194,14 @@ async function refreshTaskMonth(ctx: MutationCtx, jdTaskId: Id<"jdTasks">, month
     ctx.db.get(jdTaskId),
     ctx.db.query("jdReportTaskMonths").withIndex("by_jdTaskId_and_monthStart", (q) => q.eq("jdTaskId", jdTaskId).eq("monthStart", monthStart)).unique(),
   ]);
+  const timeZone = task ? await companyTimeZone(ctx, task.companyId) : null;
+  // A refresh queued before a time-zone change carries the old zone's month
+  // key; the change rebuilds the task under the new keys, so counting it here
+  // would add the same cycles a second time.
+  if (task && currentJdCycle("monthly", monthStart, timeZone).start !== monthStart) return;
   // Paused and deleted tasks drop out of the report, as they do from the task list.
   const next = task && task.pausedAt === undefined
-    ? await taskMonthCounts(ctx, task, await companyTimeZone(ctx, task.companyId), monthStart, now)
+    ? await taskMonthCounts(ctx, task, timeZone, monthStart, now)
     : { counts: [], nextCountableAt: null };
   if (next.nextCountableAt !== null) {
     await ctx.scheduler.runAfter(next.nextCountableAt - now, internal.jdReport.refreshMonthsLater, { months: [{ jdTaskId, monthStart }] });
