@@ -903,7 +903,7 @@ function useDashboardData({
   // The requested selection is served from the live result or the cache for
   // its key; the last successful result is only a placeholder for another
   // selection while the new one loads.
-  const requestedData = liveData ?? cachedData;
+  const requestedData = liveData ?? cachedData ?? null;
   const viewData = requestedData ?? lastData;
 
   const filtersError = withFilters && filtersResult.status === "error" ? filtersResult.error : null;
