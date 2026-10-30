@@ -8,15 +8,23 @@ export const defaultTimeZone = "Etc/GMT-5"; // GMT+5 fallback when the browser/c
 const dayMs = 86_400_000;
 const mondayAnchorDay = 4; // 1970-01-05, a stable Monday anchor for week windows.
 const partFormatters = new Map<string, Intl.DateTimeFormat>();
+// Constructing an Intl.DateTimeFormat costs ~200µs, and every cycle helper
+// resolves its zone, so cycle walks must not re-validate a zone per call.
+const resolvedTimeZones = new Map<string, string>();
 
 export function timeZoneOrDefault(timeZone?: string | null) {
   if (!timeZone) return defaultTimeZone;
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone }).format(0);
-    return timeZone;
-  } catch {
-    return defaultTimeZone;
+  let resolved = resolvedTimeZones.get(timeZone);
+  if (resolved === undefined) {
+    try {
+      formatter(timeZone);
+      resolved = timeZone;
+    } catch {
+      resolved = defaultTimeZone;
+    }
+    resolvedTimeZones.set(timeZone, resolved);
   }
+  return resolved;
 }
 
 function floorDiv(value: number, divisor: number) {
