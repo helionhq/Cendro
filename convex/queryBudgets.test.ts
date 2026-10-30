@@ -1,11 +1,21 @@
 /// <reference types="vite/client" />
 
 import { convexTest } from "convex-test";
-import { describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "./_generated/api";
 import schema from "./schema";
+import { localDateField } from "./taskCycles";
 
 const modules = import.meta.glob("./**/*.ts");
+// Pinned so the dashboard period and seeded createdAt values never straddle a
+// day boundary while the suite runs.
+const pinnedNow = Date.UTC(2026, 8, 16, 12);
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(pinnedNow);
+});
+afterEach(() => { vi.useRealTimers(); });
+const yearPeriod = () => ({ unit: "year" as const, date: localDateField(Date.now()) });
 
 function identity(key: string, email = `${key}@example.com`) {
   return { tokenIdentifier: `clerk|${key}`, subject: key, issuer: "https://clerk.test", email, name: key };
@@ -39,7 +49,7 @@ describe("WP-07: Query budgets and silent incompleteness prevention", () => {
       return { companyId, adminM };
     });
 
-    const completeDash = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now: Date.now(), range: { preset: "this_year" } });
+    const completeDash = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now: Date.now(), period: yearPeriod() });
     expect(completeDash.isTruncated).toBe(false);
 
     await t.run(async (ctx) => {
@@ -57,7 +67,7 @@ describe("WP-07: Query budgets and silent incompleteness prevention", () => {
     });
 
     // 1. Dashboard query MUST report incomplete/truncated state.
-    const dash = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now: Date.now(), range: { preset: "this_year" } });
+    const dash = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now: Date.now(), period: yearPeriod() });
     expect(dash.isTruncated).toBe(true);
 
     // 2. aiSummary query MUST report incomplete/truncated state

@@ -4,44 +4,40 @@ import {
   localDayStart,
   nextJdCycleStart,
   previousJdCycleStart,
-  timeZoneOrDefault,
   type JdRecurrence,
 } from "./taskCycles";
 
-export const dashboardRangeValidator = v.union(
-  v.object({
-    preset: v.union(
-      v.literal("this_week"),
-      v.literal("this_month"),
-      v.literal("last_3_months"),
-      v.literal("this_year"),
-    ),
-  }),
-  v.object({
-    preset: v.literal("custom"),
-    startDate: v.string(),
-    endDate: v.string(),
-  }),
-);
-export type DashboardRangeArg = Infer<typeof dashboardRangeValidator>;
+export const dashboardPeriodValidator = v.object({
+  unit: v.union(v.literal("week"), v.literal("month"), v.literal("quarter"), v.literal("year")),
+  // "YYYY-MM-DD", any company-local day inside the wanted period. Omitted
+  // means the period containing server `now` in the company's time zone, so a
+  // client whose own date has not rolled over still lands on the right month.
+  date: v.optional(v.string()),
+});
+export type DashboardPeriodArg = Infer<typeof dashboardPeriodValidator>;
+export type DashboardUnit = DashboardPeriodArg["unit"];
 
-export type DashboardGrouping = "day" | "week" | "month";
-export type DashboardRange = { start: number; end: number; grouping: DashboardGrouping };
-export type DashboardBucket = { start: number; end: number; label: string };
+export type DashboardBucket = { start: number; end: number }; // end inclusive (next start - 1)
+export type DashboardPeriod = {
+  unit: DashboardUnit;
+  start: number;        // first instant of the selected period (company-local midnight)
+  end: number;          // last instant of the FULL selected period (inclusive), even if in the future
+  isCurrent: boolean;   // the period contains "now"
+  previous: { start: number; end: number }; // the full period immediately before (same unit)
+  next: { start: number } | null;           // start of the following period, or null when the selected period is current
+  buckets: DashboardBucket[];               // ordered oldest → newest
+};
 
-const dayMs = 86_400_000;
 const customDatePattern = /^(\d{4})-(\d{2})-(\d{2})$/;
-const labelFormatters = new Map<string, Intl.DateTimeFormat>();
 
-function labelFormatter(timeZone: string, options: Intl.DateTimeFormatOptions) {
-  const key = `${timeZone}|${JSON.stringify(options)}`;
-  let formatter = labelFormatters.get(key);
-  if (!formatter) {
-    formatter = new Intl.DateTimeFormat("en-US", { ...options, timeZone });
-    labelFormatters.set(key, formatter);
-  }
-  return formatter;
-}
+// Period boundaries reuse the JD recurrence grid so the period a report shows
+// is exactly the cycle the task ledger closes on.
+const unitRecurrence: Record<DashboardUnit, JdRecurrence> = {
+  week: "weekly",
+  month: "monthly",
+  quarter: "quarterly",
+  year: "annually",
+};
 
 function customDayStart(timeZone: string | null | undefined, value: string) {
   const match = customDatePattern.exec(value);
@@ -49,83 +45,60 @@ function customDayStart(timeZone: string | null | undefined, value: string) {
   return localDayStart(timeZone, Number(match[1]), Number(match[2]), Number(match[3]));
 }
 
-// Calendar-day ordinal of a YYYY-MM-DD field. Only called after customDayStart
-// has validated the value, so the pattern is guaranteed to match.
-function dateFieldOrdinal(value: string) {
-  const match = customDatePattern.exec(value)!;
-  return Math.floor(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])) / dayMs);
-}
-
-export function resolveDashboardRange(
-  arg: DashboardRangeArg,
+export function resolveDashboardPeriod(
+  arg: DashboardPeriodArg,
   now: number,
   timeZone: string | null | undefined,
-): DashboardRange {
-  let start: number;
-  let end: number;
-  if (arg.preset === "custom") {
-    const customStart = customDayStart(timeZone, arg.startDate);
-    const endDayStart = customDayStart(timeZone, arg.endDate);
-    if (customStart === null || endDayStart === null) throw new ConvexError("Invalid date range.");
-    if (customStart > endDayStart) throw new ConvexError("Invalid date range.");
-    // The two dates may span at most two years (a leap-inclusive 731 days),
-    // counted in calendar days so a DST shift cannot skew the comparison.
-    if (dateFieldOrdinal(arg.endDate) - dateFieldOrdinal(arg.startDate) > 731) {
-      throw new ConvexError("Date range cannot exceed two years.");
-    }
-    // Custom ranges are also to-date: a selected day after today collapses
-    // onto today so callers cannot read future calendar periods.
-    const todayStart = currentJdCycle("daily", now, timeZone).start;
-    start = Math.min(customStart, todayStart);
-    end = nextJdCycleStart(Math.min(endDayStart, todayStart), "daily", timeZone) - 1;
-  } else {
-    if (arg.preset === "this_week") {
-      start = currentJdCycle("weekly", now, timeZone).start;
-    } else if (arg.preset === "this_month") {
-      start = currentJdCycle("monthly", now, timeZone).start;
-    } else if (arg.preset === "last_3_months") {
-      const current = currentJdCycle("monthly", now, timeZone).start;
-      start = previousJdCycleStart(previousJdCycleStart(current, "monthly", timeZone), "monthly", timeZone);
-    } else {
-      start = currentJdCycle("annually", now, timeZone).start;
-    }
-    // Named presets are to-date: the window ends today, not at the end of the
-    // calendar period.
-    end = currentJdCycle("daily", now, timeZone).end - 1;
-  }
-  const days = Math.round((end - start + 1) / dayMs);
-  const grouping: DashboardGrouping = days <= 31 ? "day" : days <= 140 ? "week" : "month";
-  return { start, end, grouping };
-}
+): DashboardPeriod {
+  const dayStart = arg.date === undefined ? now : customDayStart(timeZone, arg.date);
+  if (dayStart === null) throw new ConvexError("Invalid date.");
 
-export function buildDashboardBuckets(
-  range: DashboardRange,
-  timeZone: string | null | undefined,
-): DashboardBucket[] {
-  const zone = timeZoneOrDefault(timeZone);
-  const unit: JdRecurrence = range.grouping === "day" ? "daily" : range.grouping === "week" ? "weekly" : "monthly";
+  const recurrence = unitRecurrence[arg.unit];
+  const current = currentJdCycle(recurrence, now, timeZone);
+  // A future period collapses onto the current one: client clocks and time
+  // zones can run ahead of the company's, so never report a period that has
+  // not started yet.
+  const start = Math.min(currentJdCycle(recurrence, dayStart, timeZone).start, current.start);
+  const end = nextJdCycleStart(start, recurrence, timeZone) - 1;
+  const isCurrent = start === current.start;
+  const previousStart = previousJdCycleStart(start, recurrence, timeZone);
+
   const buckets: DashboardBucket[] = [];
-  let cursor = range.start;
-  let boundary = nextJdCycleStart(currentJdCycle(unit, range.start, zone).start, unit, zone);
-  while (boundary <= range.end) {
-    buckets.push({ start: cursor, end: boundary - 1, label: "" });
-    cursor = boundary;
-    boundary = nextJdCycleStart(boundary, unit, zone);
-  }
-  buckets.push({ start: cursor, end: range.end, label: "" });
-
-  let formatter: Intl.DateTimeFormat;
-  if (range.grouping === "month") {
-    const year = labelFormatter(zone, { year: "numeric" });
-    const spansYears = year.format(range.start) !== year.format(range.end);
-    formatter = spansYears
-      ? labelFormatter(zone, { month: "short", year: "2-digit" })
-      : labelFormatter(zone, { month: "short" });
+  if (arg.unit === "week") {
+    // The trailing eight weeks, selected week last.
+    const starts = [start];
+    for (let index = 0; index < 7; index += 1) starts.push(previousJdCycleStart(starts[starts.length - 1], recurrence, timeZone));
+    for (const bucketStart of starts.reverse()) buckets.push({ start: bucketStart, end: nextJdCycleStart(bucketStart, recurrence, timeZone) - 1 });
+  } else if (arg.unit === "month") {
+    // Monday-start weeks clipped to the month: the first bucket opens on the
+    // 1st and the last closes on the month's final instant.
+    let cursor = start;
+    let boundary = nextJdCycleStart(currentJdCycle("weekly", start, timeZone).start, "weekly", timeZone);
+    while (boundary - 1 < end) {
+      buckets.push({ start: cursor, end: boundary - 1 });
+      cursor = boundary;
+      boundary = nextJdCycleStart(boundary, "weekly", timeZone);
+    }
+    buckets.push({ start: cursor, end });
   } else {
-    formatter = labelFormatter(zone, { month: "short", day: "numeric" });
+    const months = arg.unit === "quarter" ? 3 : 12;
+    let cursor = start;
+    for (let index = 0; index < months; index += 1) {
+      const boundary = nextJdCycleStart(cursor, "monthly", timeZone);
+      buckets.push({ start: cursor, end: boundary - 1 });
+      cursor = boundary;
+    }
   }
-  for (const bucket of buckets) bucket.label = formatter.format(bucket.start);
-  return buckets;
+
+  return {
+    unit: arg.unit,
+    start,
+    end,
+    isCurrent,
+    previous: { start: previousStart, end: start - 1 },
+    next: isCurrent ? null : { start: nextJdCycleStart(start, recurrence, timeZone) },
+    buckets,
+  };
 }
 
 export function bucketIndexFor(buckets: DashboardBucket[], at: number): number {

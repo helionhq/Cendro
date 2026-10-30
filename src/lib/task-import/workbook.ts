@@ -9,6 +9,7 @@ import {
   type TaskImportDraft,
   type TaskImportKind,
 } from "./schema";
+import { priorityLabels, recurrenceLabels } from "./labels";
 
 export const TASK_IMPORT_SCHEMA_VERSION = 1;
 export const TASK_IMPORT_FORMAT = "cendro-task-export";
@@ -17,24 +18,6 @@ export const TASK_IMPORT_MAX_SHEETS = 20;
 export const TASK_IMPORT_MAX_COLUMNS = 20;
 export const TASK_IMPORT_MAX_FILE_BYTES = 10 * 1024 * 1024;
 export const TASK_IMPORT_MAX_EXPANDED_BYTES = 50 * 1024 * 1024;
-
-export const recurrenceLabels: Record<Frequency, string> = {
-  daily: "Daily",
-  every_other_day: "Alternate days",
-  weekly: "Weekly",
-  semimonthly: "Semi-monthly",
-  monthly: "Monthly",
-  quarterly: "Quarterly",
-  semiannually: "Bi-yearly",
-  annually: "Yearly",
-};
-
-export const priorityLabels: Record<Priority, string> = {
-  low: "Low",
-  medium: "Medium",
-  high: "High",
-  critical: "Critical",
-};
 
 export type WorkbookTaskRow = {
   reference?: string | null;
