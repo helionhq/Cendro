@@ -36,8 +36,8 @@ test("pause preserves history and suppresses discovery, counts and cycles; resum
   expect((await admin.query(api.tasks.exportRows, { companyId, kind: "jd", paginationOpts })).page).toMatchObject([{ title: "Daily check", isActive: false }]);
   expect((await admin.query(api.tasks.aiListVisible, { companyId, kind: "jd", status: "all", limit: 30 })).rows).toEqual([]);
   await expect(f.asUser("employeeA1").mutation(api.tasks.completeJd, { companyId, taskId })).rejects.toThrow("Make this task active");
-  const pausedDashboard = await admin.query(api.analytics.dashboard, { companyId, now: utc(3), range: { preset: "custom", startDate: "2026-06-01", endDate: "2026-06-30" } });
-  expect(pausedDashboard.jd).toMatchObject({ due: 0, overdue: 0 });
+  const pausedDashboard = await admin.query(api.analytics.dashboard, { companyId, now: utc(3), period: { unit: "month", date: "2026-06-03" } });
+  expect(pausedDashboard.jd).toMatchObject({ due: 0, missed: 0 });
   vi.setSystemTime(utc(20)); // Saturday: next working occurrence is Monday June 22.
   await f.t.mutation(internal.tasks.recordMissedJdCyclesBatch, {});
   await f.t.mutation(internal.tasks.catchUpMissedJdCycles, { taskId });
@@ -151,9 +151,10 @@ test("resuming onto a new grid keeps old misses separate from the new current cy
   await admin.mutation(api.tasks.setJdPausedBulk, { companyId, taskIds: [taskId], paused: false });
   await f.t.finishAllScheduledFunctions(() => vi.runAllTimers());
   vi.setSystemTime(utc(30));
-  const dashboard = await admin.query(api.analytics.dashboard, { companyId, now: utc(30), range: { preset: "this_month" } });
-  // Two genuinely missed daily occurrences plus one unexpired monthly cycle.
-  expect(dashboard.jd).toMatchObject({ due: 3, overdue: 2 });
+  const dashboard = await admin.query(api.analytics.dashboard, { companyId, now: utc(30), period: { unit: "month", date: "2026-06-30" } });
+  // Two genuinely missed daily occurrences; the monthly cycle is due after
+  // today, so it is not counted yet.
+  expect(dashboard.jd).toMatchObject({ due: 2, missed: 2 });
   expect(await admin.query(api.tasks.listJdCycleRecords, { companyId, taskId })).toHaveLength(2);
   vi.setSystemTime(Date.UTC(2026, 6, 2, 12));
   await f.t.mutation(internal.tasks.recordMissedJdCyclesBatch, {});
@@ -178,10 +179,10 @@ test("retired completion and missed rows count as one old cycle without completi
   await admin.mutation(api.tasks.updateJdFields, { companyId, taskId, recurrence: "monthly" });
   await f.t.finishAllScheduledFunctions(() => vi.runAllTimers());
   vi.setSystemTime(utc(30));
-  const dashboard = await admin.query(api.analytics.dashboard, { companyId, now: utc(30), range: { preset: "this_month" } });
-  // One completed weekly cycle and one pending monthly cycle, not three items.
-  expect(dashboard.jd).toMatchObject({ due: 2, completed: 1, overdue: 0 });
-  expect(dashboard.trend.reduce((sum, bucket) => sum + bucket.jdDue, 0)).toBe(2);
+  const dashboard = await admin.query(api.analytics.dashboard, { companyId, now: utc(30), period: { unit: "month", date: "2026-06-30" } });
+  // One completed weekly cycle; the new monthly cycle is not due until July.
+  expect(dashboard.jd).toMatchObject({ due: 1, done: 1, missed: 0 });
+  expect(dashboard.buckets.reduce((sum, bucket) => sum + bucket.jd.due, 0)).toBe(1);
   expect((await admin.query(api.tasks.getJd, { companyId, taskId })).task.state.rawStatus).toBe("due");
   expect(await admin.query(api.tasks.listJdCycleRecords, { companyId, taskId })).toMatchObject([{ retiredAt: utc(8) }]);
 });
@@ -206,8 +207,10 @@ test("preserved paused ledgers cannot exhaust the active dashboard report budget
       }
     });
   }
-  const dashboard = await admin.query(api.analytics.dashboard, { companyId, now: utc(1), range: { preset: "this_year" } });
-  expect(dashboard).toMatchObject({ jd: { due: 9, completed: 0, overdue: 0 }, isTruncated: false });
+  // Move past June 1 so each active daily task has one elapsed cycle to report.
+  vi.setSystemTime(utc(2));
+  const dashboard = await admin.query(api.analytics.dashboard, { companyId, now: utc(2), period: { unit: "year", date: "2026-06-02" } });
+  expect(dashboard).toMatchObject({ jd: { due: 9, done: 0, missed: 9 }, isTruncated: false });
 });
 
 test("self-scoped lifecycle grants apply to assigned shared tasks but never to other people's tasks", async () => {
@@ -273,9 +276,11 @@ test("same-cycle resume and recurrence edits while paused never erase completion
   // A new completion can coexist with the preserved old-grid completion at
   // the same start, and analytics must not merge the two schedules.
   vi.setSystemTime(utc(30));
-  const dashboard = await admin.query(api.analytics.dashboard, { companyId, now: utc(30), range: { preset: "custom", startDate: "2026-06-01", endDate: "2026-06-30" } });
-  expect(dashboard.jd).toMatchObject({ completed: 1, due: 2 });
+  const dashboard = await admin.query(api.analytics.dashboard, { companyId, now: utc(30), period: { unit: "month", date: "2026-06-30" } });
+  expect(dashboard.jd).toMatchObject({ done: 1, due: 1 });
   await admin.mutation(api.tasks.completeJd, { companyId, taskId });
   expect((await admin.query(api.tasks.getJd, { companyId, taskId })).task.state.rawStatus).toBe("completed");
   expect(await f.t.run((ctx) => ctx.db.query("jdTaskCompletions").collect())).toHaveLength(2);
+  const completedDashboard = await admin.query(api.analytics.dashboard, { companyId, now: utc(30), period: { unit: "month", date: "2026-06-30" } });
+  expect(completedDashboard.jd).toMatchObject({ done: 2, due: 2 });
 });

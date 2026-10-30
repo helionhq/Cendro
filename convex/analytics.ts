@@ -1,9 +1,9 @@
 import { ConvexError, v } from "convex/values";
 import { query, type QueryCtx } from "./_generated/server";
 import { analyticsScopedMembershipIds, assertAnalyticsViewAccess, buildSopVisibilityContext, requireMembership, sopListScopeAuth, taskHasVisibleAssignee, visibleAssigneeMembershipIds, visibleSop } from "./permissions";
-import { currentJdCycle, localDateField, nextJdCycleStart } from "./taskCycles";
+import { currentJdCycle, jdRecurrences, localDateField, localDayIndexAt, nextJdCycleStart, type JdRecurrence } from "./taskCycles";
 import { jdOccurrencesDueBetween, loadWorkCalendar, maxHolidaySpanDays, occurrenceDeadline } from "./workCalendar";
-import { bucketIndexFor, buildDashboardBuckets, dashboardRangeValidator, resolveDashboardRange } from "./dashboardTime";
+import { bucketIndexFor, dashboardPeriodValidator, resolveDashboardPeriod } from "./dashboardTime";
 import type { Doc, Id } from "./_generated/dataModel";
 import { takeWithOverflow } from "./queryLimits";
 
@@ -79,8 +79,8 @@ function fullName(membership: { firstName?: string; secondName?: string } | null
   return [first === "Unknown" ? "" : first, second].filter(Boolean).join(" ") || first;
 }
 
-function safeRate(part: number, total: number) {
-  return total > 0 ? Math.round((part / total) * 100) : 0;
+function rate(part: number, total: number) {
+  return total > 0 ? Math.round((part / total) * 100) : null;
 }
 
 async function dashboardAccess(
@@ -266,39 +266,43 @@ export const dashboardFilters = query({
   handler: async (ctx, args) => {
     const completeness: QueryCompleteness = { isTruncated: false, truncatedReads: 0, remaining: dashboardReadBudget };
     const scope = await resolveDashboardScope(ctx, args.companyId, completeness);
-    const users = scope.dashboardScope === "self"
-      ? []
-      : Array.from(scope.people.values())
-          .sort((a, b) => a.name.localeCompare(b.name))
-          .map((person) => ({
-            _id: person._id,
-            name: person.name,
-            branchIds: Array.from(scope.memberBranchIds.get(person._id) ?? []),
-            departmentIds: Array.from(scope.memberDepartmentIds.get(person._id) ?? []),
-          }));
     return {
       viewer: { membershipId: scope.membership._id },
       branches: scope.branchOptions.map((branch) => ({ _id: branch._id, name: branch.name })),
       departments: scope.departmentOptions.map((department) => ({ _id: department._id, name: department.name, branchId: department.branchId })),
-      users,
       isTruncated: completeness.isTruncated,
     };
   },
 });
 
-type WorkItem = {
-  kind: "jd" | "task";
+type JdItem = {
+  taskId: Id<"jdTasks">;
+  title: string;
+  reference: string;
+  recurrence: JdRecurrence;
   at: number;
-  completed: boolean;
-  overdue: boolean;
+  status: "done" | "missed" | "waiting";
   assigneeIds: Id<"companyMemberships">[];
 };
+
+type OneTimeItem = {
+  taskId: Id<"oneTimeTasks">;
+  title: string;
+  reference: string;
+  priority: Doc<"oneTimeTasks">["priority"];
+  at: number;
+  dueDate?: number;
+  status: "done" | "overdue" | "waiting" | "not_due";
+  assigneeIds: Id<"companyMemberships">[];
+};
+
+type BucketState = "past" | "current" | "future";
 
 export const dashboard = query({
   args: {
     companyId: v.id("companies"),
     now: v.number(),
-    range: dashboardRangeValidator,
+    period: dashboardPeriodValidator,
     branchId: v.optional(v.id("branches")),
     departmentId: v.optional(v.id("departments")),
     membershipId: v.optional(v.id("companyMemberships")),
@@ -343,12 +347,15 @@ export const dashboard = query({
       effectiveIds.add(id);
     }
 
-    const range = resolveDashboardRange(args.range, now, timeZone);
-    const buckets = buildDashboardBuckets(range, timeZone);
+    const period = resolveDashboardPeriod(args.period, now, timeZone);
+    const todayEnd = currentJdCycle("daily", now, timeZone).end - 1;
+    // The window reaches far enough back for the earliest bucket and the
+    // previous period, and never past the end of today: future work has not
+    // happened yet.
+    const windowStart = Math.min(period.buckets[0].start, period.previous.start);
+    const windowEnd = Math.min(period.end, todayEnd);
     const calendar = await loadWorkCalendar(ctx, args.companyId);
     const jdCompletionLookbackMs = (jdCompletionLookbackDays + maxHolidaySpanDays(calendar)) * 86_400_000;
-
-    const items: WorkItem[] = [];
 
     const [jdTasks, oneTimeTasks] = await Promise.all([
       takeBudgetedRows(
@@ -357,7 +364,7 @@ export const dashboard = query({
       ),
       takeBudgetedRows(
         completeness,
-        (limit) => ctx.db.query("oneTimeTasks").withIndex("by_companyId_and_createdAt", (q) => q.eq("companyId", args.companyId).gte("createdAt", range.start).lte("createdAt", range.end)).take(limit),
+        (limit) => ctx.db.query("oneTimeTasks").withIndex("by_companyId_and_createdAt", (q) => q.eq("companyId", args.companyId).gte("createdAt", windowStart).lte("createdAt", windowEnd)).take(limit),
       ),
     ]);
     // Visibility is a JS-only check, so resolve it before touching the ledger
@@ -384,15 +391,15 @@ export const dashboard = query({
       const [completions, missed, pending] = await Promise.all([
         takeBudgetedRows(
           taskPhase,
-          (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", range.start - jdCompletionLookbackMs).lte("cycleStart", range.end)).order("desc").take(limit),
+          (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", windowStart - jdCompletionLookbackMs).lte("cycleStart", windowEnd)).order("desc").take(limit),
         ),
         takeBudgetedRows(
           taskPhase,
-          (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleEnd", (q) => q.eq("jdTaskId", task._id).gte("cycleEnd", range.start + 1).lte("cycleEnd", range.end + 1)).take(limit),
+          (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleEnd", (q) => q.eq("jdTaskId", task._id).gte("cycleEnd", windowStart + 1).lte("cycleEnd", windowEnd + 1)).take(limit),
         ),
         takeBudgetedRows(
           taskPhase,
-          (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", range.start - jdCompletionLookbackMs).lte("cycleStart", range.end)).take(limit),
+          (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", windowStart - jdCompletionLookbackMs).lte("cycleStart", windowEnd)).take(limit),
         ),
       ]);
       ledgersByTask.set(task._id, { completions, missed, pending, truncated: taskPhase.isTruncated });
@@ -402,7 +409,7 @@ export const dashboard = query({
       const ledger = ledgersByTask.get(task._id)!;
       if (ledger.truncated) {
         completeness.isTruncated = true;
-        return [];
+        return { items: [] as JdItem[], recurrence: task.recurrence, upcomingDeadline: null as number | null };
       }
       const { completions, missed, pending } = ledger;
       // A request from a superseded recurrence is history, not a live hold on
@@ -426,13 +433,13 @@ export const dashboard = query({
         });
       };
 
-      // A cycle that ends inside the range started at most ~366 days before it
+      // A cycle that ends inside the window started at most ~366 days before it
       // (the longest recurrence is annual), so this lookback covers every
-      // completion that could still be due in range. Newer completions record
-      // their own cycleEnd; legacy rows fall back to the current grid.
+      // completion that could still be due in the window. Newer completions
+      // record their own cycleEnd; legacy rows fall back to the current grid.
       // Missed records store their own deadline, so they stay exact across
       // recurrence and timezone changes; match on that deadline directly.
-      const taskItems: WorkItem[] = [];
+      const taskItems: JdItem[] = [];
       for (const completion of completions) {
         // Legacy rows predate cycleEnd. When the stored start no longer sits on
         // the task's grid the recurrence or timezone changed since, so the
@@ -453,172 +460,326 @@ export const dashboard = query({
       // Skipped occurrences (non-working due dates on daily/alternate cycles)
       // never enter the ledger; other recurrences report their shifted
       // deadline, matching what the missed-record writer stores.
-      const elapsed = jdOccurrencesDueBetween(calendar, task.recurrence, task.cycleStartedAt, now, range.start, range.end, 200, timeZone);
+      const elapsed = jdOccurrencesDueBetween(calendar, task.recurrence, task.cycleStartedAt, now, windowStart, windowEnd, 200, timeZone);
       if (elapsed.truncated) completeness.isTruncated = true;
       for (const cycle of elapsed.occurrences) put(cycle.start, cycle.deadline - 1, false, false);
 
       const current = currentJdCycle(task.recurrence, now, timeZone);
       const currentDeadline = occurrenceDeadline(calendar, task.recurrence, current.end, timeZone);
-      if (currentDeadline !== null && current.start >= currentJdCycle(task.recurrence, task.cycleStartedAt, timeZone).start) put(current.start, currentDeadline - 1, false, false);
+      const onCurrentGrid = current.start >= currentJdCycle(task.recurrence, task.cycleStartedAt, timeZone).start;
+      if (currentDeadline !== null && onCurrentGrid) put(current.start, currentDeadline - 1, false, false);
 
       for (const cycle of cycles.values()) {
-        if (cycle.start <= now && cycle.dueAt >= range.start && cycle.dueAt <= range.end) {
-          const completed = cycle.completed || (!cycle.retired && task.status === "completed" && task.statusCycleStart === cycle.start);
-          // A cycle waiting on its confirmer is neither completed nor missed.
-          const overdue = !completed && !pendingStarts.has(cycle.start) && cycle.dueAt < now;
-          taskItems.push({ kind: "jd", at: cycle.dueAt, completed, overdue, assigneeIds: assignees });
-        }
+        if (cycle.start > now || cycle.dueAt < windowStart || cycle.dueAt > windowEnd) continue;
+        const completed = cycle.completed || (!cycle.retired && task.status === "completed" && task.statusCycleStart === cycle.start);
+        const waiting = !completed && pendingStarts.has(cycle.start);
+        // Work counts once it is done, waiting for approval, or past its
+        // deadline, so done + missed + waiting always equals due.
+        if (!completed && !waiting && cycle.dueAt >= now) continue;
+        taskItems.push({
+          taskId: task._id,
+          title: task.title,
+          reference: task.reference,
+          recurrence: task.recurrence,
+          at: cycle.dueAt,
+          status: completed ? "done" : waiting ? "waiting" : "missed",
+          assigneeIds: assignees,
+        });
       }
-      return taskItems;
+
+      // A current period also reports work that is due before it closes, so a
+      // running month can say "3 JDs due on the 31st" instead of a bare zero.
+      let upcomingDeadline: number | null = null;
+      if (period.isCurrent && currentDeadline !== null && onCurrentGrid) {
+        const currentCycle = cycles.get(`${current.start}:current`);
+        const currentCompleted = (currentCycle?.completed ?? false) || (currentCycle?.retired !== true && task.status === "completed" && task.statusCycleStart === current.start);
+        const currentWaiting = !currentCompleted && pendingStarts.has(current.start);
+        const deadline = currentDeadline - 1;
+        if (!currentCompleted && !currentWaiting && now <= deadline && deadline <= period.end) upcomingDeadline = deadline;
+      }
+      return { items: taskItems, recurrence: task.recurrence, upcomingDeadline };
     });
-    for (const group of jdItemGroups) items.push(...group);
+    const jdItems: JdItem[] = [];
+    const upcomingByRecurrence = new Map<JdRecurrence, number[]>();
+    for (const group of jdItemGroups) {
+      jdItems.push(...group.items);
+      if (group.upcomingDeadline !== null) {
+        const deadlines = upcomingByRecurrence.get(group.recurrence) ?? [];
+        deadlines.push(group.upcomingDeadline);
+        upcomingByRecurrence.set(group.recurrence, deadlines);
+      }
+    }
+    const taskItems: OneTimeItem[] = [];
     for (const task of oneTimeTasks) {
       const assignees = visibleAssigneeMembershipIds(task.assigneeMembershipIds, effectiveIds);
       if (!assignees.length) continue;
-      const completed = task.status === "completed";
-      const overdue = !completed && (task.overdueAt !== undefined || (task.status !== "awaiting_confirmation" && task.dueDate !== undefined && task.dueDate < now));
-      items.push({ kind: "task", at: task.createdAt, completed, overdue, assigneeIds: assignees });
+      const done = task.status === "completed";
+      const overdue = !done && (task.overdueAt !== undefined || (task.status !== "awaiting_confirmation" && task.dueDate !== undefined && task.dueDate < now));
+      const waiting = !done && !overdue && task.status === "awaiting_confirmation";
+      taskItems.push({
+        taskId: task._id,
+        title: task.title,
+        reference: task.reference,
+        priority: task.priority,
+        at: task.createdAt,
+        dueDate: task.dueDate,
+        status: done ? "done" : overdue ? "overdue" : waiting ? "waiting" : "not_due",
+        assigneeIds: assignees,
+      });
     }
+
+    const inPeriod = (at: number) => at >= period.start && at <= period.end;
+    const inPrevious = (at: number) => at >= period.previous.start && at <= period.previous.end;
 
     let jdDue = 0;
-    let jdCompleted = 0;
-    let jdOverdue = 0;
-    let tasksAssigned = 0;
-    let tasksCompleted = 0;
-    let tasksOverdue = 0;
-    const trend = buckets.map((bucket) => ({
-      bucketStart: bucket.start,
-      label: bucket.label,
-      jdDue: 0,
-      jdCompleted: 0,
-      tasksAssigned: 0,
-      tasksCompleted: 0,
-    }));
-    for (const item of items) {
-      const bucketIndex = bucketIndexFor(buckets, item.at);
-      const bucket = bucketIndex === -1 ? undefined : trend[bucketIndex];
-      if (item.kind === "jd") {
+    let jdDone = 0;
+    let jdMissed = 0;
+    let jdWaiting = 0;
+    let previousJdDue = 0;
+    let previousJdDone = 0;
+    for (const item of jdItems) {
+      if (inPeriod(item.at)) {
         jdDue += 1;
-        if (item.completed) jdCompleted += 1;
-        if (item.overdue) jdOverdue += 1;
-        if (bucket) {
-          bucket.jdDue += 1;
-          if (item.completed) bucket.jdCompleted += 1;
-        }
-      } else {
+        if (item.status === "done") jdDone += 1;
+        else if (item.status === "missed") jdMissed += 1;
+        else jdWaiting += 1;
+      }
+      if (inPrevious(item.at)) {
+        previousJdDue += 1;
+        if (item.status === "done") previousJdDone += 1;
+      }
+    }
+
+    let tasksAssigned = 0;
+    let tasksDone = 0;
+    let tasksOverdue = 0;
+    let tasksWaiting = 0;
+    let tasksNotDueYet = 0;
+    let previousTasksAssigned = 0;
+    let previousTasksDone = 0;
+    for (const item of taskItems) {
+      if (inPeriod(item.at)) {
         tasksAssigned += 1;
-        if (item.completed) tasksCompleted += 1;
-        if (item.overdue) tasksOverdue += 1;
-        if (bucket) {
-          bucket.tasksAssigned += 1;
-          if (item.completed) bucket.tasksCompleted += 1;
-        }
+        if (item.status === "done") tasksDone += 1;
+        else if (item.status === "overdue") tasksOverdue += 1;
+        else if (item.status === "waiting") tasksWaiting += 1;
+        else tasksNotDueYet += 1;
+      }
+      if (inPrevious(item.at)) {
+        previousTasksAssigned += 1;
+        if (item.status === "done") previousTasksDone += 1;
       }
     }
 
-    const singleMember = scope.scopedIds.size <= 1 || scope.dashboardScope === "self";
-    let level: "company" | "branch" | "department" | "user";
-    let groupKind: "branch" | "department" | null = null;
-    let groupCandidates: (Doc<"branches"> | Doc<"departments">)[] = [];
-    if (args.membershipId || singleMember) {
-      level = "user";
-    } else if (args.departmentId) {
-      level = "department";
-    } else {
-      const branchCandidates = args.branchId ? [] : scope.branchOptions;
-      if (branchCandidates.length >= 2) {
-        level = "company";
-        groupKind = "branch";
-        groupCandidates = branchCandidates;
-      } else {
-        const departmentCandidates = scope.departmentOptions.filter((department) => !args.branchId || department.branchId === args.branchId);
-        if (departmentCandidates.length >= 2) {
-          level = "branch";
-          groupKind = "department";
-          groupCandidates = departmentCandidates;
-        } else {
-          level = "department";
-        }
-      }
+    const bucketRows: Array<{
+      startDate: string;
+      endDate: string;
+      state: BucketState;
+      jd: { due: number; done: number; completionRate: number | null };
+      tasks: { assigned: number; done: number; completionRate: number | null };
+    }> = period.buckets.map((bucket) => ({
+      startDate: localDateField(bucket.start, timeZone),
+      endDate: localDateField(bucket.end, timeZone),
+      state: now < bucket.start ? "future" : now <= bucket.end ? "current" : "past",
+      jd: { due: 0, done: 0, completionRate: null },
+      tasks: { assigned: 0, done: 0, completionRate: null },
+    }));
+    for (const item of jdItems) {
+      const index = bucketIndexFor(period.buckets, item.at);
+      if (index === -1) continue;
+      bucketRows[index].jd.due += 1;
+      if (item.status === "done") bucketRows[index].jd.done += 1;
+    }
+    for (const item of taskItems) {
+      const index = bucketIndexFor(period.buckets, item.at);
+      if (index === -1) continue;
+      bucketRows[index].tasks.assigned += 1;
+      if (item.status === "done") bucketRows[index].tasks.done += 1;
+    }
+    for (const row of bucketRows) {
+      row.jd.completionRate = rate(row.jd.done, row.jd.due);
+      row.tasks.completionRate = rate(row.tasks.done, row.tasks.assigned);
     }
 
-    const employeeTotals = new Map<Id<"companyMemberships">, { id: Id<"companyMemberships">; name: string; jdDue: number; jdCompleted: number; tasksAssigned: number; tasksCompleted: number }>();
-    if (level !== "user") {
-      for (const id of effectiveIds) {
-        const person = scope.people.get(id);
-        if (person) employeeTotals.set(id, { id, name: person.name, jdDue: 0, jdCompleted: 0, tasksAssigned: 0, tasksCompleted: 0 });
+    const viewScope: "team" | "self" = scope.dashboardScope === "self" || args.membershipId ? "self" : "team";
+    const departmentNames = (membershipId: Id<"companyMemberships">) =>
+      [...(scope.memberDepartmentIds.get(membershipId) ?? [])]
+        .map((departmentId) => scope.org.departmentById.get(departmentId)?.name)
+        .filter((name): name is string => Boolean(name))
+        .sort()
+        .join(", ");
+    const branchNames = (membershipId: Id<"companyMemberships">) =>
+      [...(scope.memberBranchIds.get(membershipId) ?? [])]
+        .map((branchId) => scope.org.branchById.get(branchId)?.name)
+        .filter((name): name is string => Boolean(name))
+        .sort()
+        .join(", ");
+
+    const jdCountByRecurrence = new Map<JdRecurrence, number>();
+    for (const { task } of visibleJdTasks) jdCountByRecurrence.set(task.recurrence, (jdCountByRecurrence.get(task.recurrence) ?? 0) + 1);
+    const byFrequency = jdRecurrences.map((recurrence) => {
+      let due = 0;
+      let done = 0;
+      let missed = 0;
+      let waiting = 0;
+      for (const item of jdItems) {
+        if (item.recurrence !== recurrence || !inPeriod(item.at)) continue;
+        due += 1;
+        if (item.status === "done") done += 1;
+        else if (item.status === "missed") missed += 1;
+        else waiting += 1;
       }
-      for (const item of items) {
+      const upcomingDeadlines = upcomingByRecurrence.get(recurrence) ?? [];
+      const upcoming = period.isCurrent && upcomingDeadlines.length > 0
+        ? { count: upcomingDeadlines.length, dueDate: localDateField(Math.min(...upcomingDeadlines), timeZone) }
+        : null;
+      return { recurrence, jdCount: jdCountByRecurrence.get(recurrence) ?? 0, due, done, missed, waiting, completionRate: rate(done, due), upcoming };
+    });
+
+    const jdEmployeeTotals = new Map<Id<"companyMemberships">, { membershipId: Id<"companyMemberships">; name: string; departments: string; due: number; done: number; missed: number; waiting: number }>();
+    if (viewScope === "team") {
+      for (const item of jdItems) {
+        if (!inPeriod(item.at)) continue;
         for (const assigneeId of item.assigneeIds) {
-          const row = employeeTotals.get(assigneeId);
-          if (!row) continue;
-          if (item.kind === "jd") {
-            row.jdDue += 1;
-            if (item.completed) row.jdCompleted += 1;
-          } else {
-            row.tasksAssigned += 1;
-            if (item.completed) row.tasksCompleted += 1;
+          const person = scope.people.get(assigneeId);
+          if (!person) continue;
+          let row = jdEmployeeTotals.get(assigneeId);
+          if (!row) {
+            row = { membershipId: assigneeId, name: person.name, departments: departmentNames(assigneeId), due: 0, done: 0, missed: 0, waiting: 0 };
+            jdEmployeeTotals.set(assigneeId, row);
           }
+          row.due += 1;
+          if (item.status === "done") row.done += 1;
+          else if (item.status === "missed") row.missed += 1;
+          else row.waiting += 1;
         }
       }
     }
-    const employees = Array.from(employeeTotals.values())
-      .map((row) => {
-        const total = row.jdDue + row.tasksAssigned;
-        const completed = row.jdCompleted + row.tasksCompleted;
-        return { ...row, total, completed, completionRate: safeRate(completed, total) };
-      })
-      .filter((row) => row.total > 0)
-      .sort((a, b) => b.completionRate - a.completionRate || b.total - a.total || a.name.localeCompare(b.name))
-      .slice(0, 5);
+    const jdEmployees = [...jdEmployeeTotals.values()]
+      .map((row) => ({ ...row, completionRate: Math.round((row.done / row.due) * 100) }))
+      .sort((a, b) => b.completionRate - a.completionRate || b.due - a.due || a.name.localeCompare(b.name));
 
-    let groups: { kind: "branch" | "department"; rows: { id: string; name: string; total: number; completed: number; completionRate: number }[] } | null = null;
-    if (groupKind) {
-      const memberSets: ReadonlyMap<Id<"companyMemberships">, ReadonlySet<string>> = groupKind === "branch" ? scope.memberBranchIds : scope.memberDepartmentIds;
-      const candidateIds = new Set(groupCandidates.map((candidate) => candidate._id as string));
-      // Single pass over items: each item counts once per group via any of its
-      // assignees, instead of rescanning every item per group.
-      const totals = new Map<string, { total: number; completed: number }>();
-      for (const item of items) {
-        const hit = new Set<string>();
+    const taskEmployeeTotals = new Map<Id<"companyMemberships">, { membershipId: Id<"companyMemberships">; name: string; departments: string; assigned: number; done: number; overdue: number }>();
+    if (viewScope === "team") {
+      for (const item of taskItems) {
+        if (!inPeriod(item.at)) continue;
         for (const assigneeId of item.assigneeIds) {
-          for (const groupId of memberSets.get(assigneeId) ?? []) {
-            if (candidateIds.has(groupId)) hit.add(groupId);
+          const person = scope.people.get(assigneeId);
+          if (!person) continue;
+          let row = taskEmployeeTotals.get(assigneeId);
+          if (!row) {
+            row = { membershipId: assigneeId, name: person.name, departments: departmentNames(assigneeId), assigned: 0, done: 0, overdue: 0 };
+            taskEmployeeTotals.set(assigneeId, row);
           }
-        }
-        for (const groupId of hit) {
-          const row = totals.get(groupId) ?? { total: 0, completed: 0 };
-          row.total += 1;
-          if (item.completed) row.completed += 1;
-          totals.set(groupId, row);
+          row.assigned += 1;
+          if (item.status === "done") row.done += 1;
+          if (item.status === "overdue") row.overdue += 1;
         }
       }
-      const rows = groupCandidates
-        .map((candidate) => {
-          const tally = totals.get(candidate._id) ?? { total: 0, completed: 0 };
-          return { id: candidate._id as string, name: candidate.name, total: tally.total, completed: tally.completed, completionRate: safeRate(tally.completed, tally.total) };
-        })
-        .filter((row) => row.total > 0)
-        .sort((a, b) => b.completionRate - a.completionRate || b.total - a.total || a.name.localeCompare(b.name))
-        .slice(0, 5);
-      groups = { kind: groupKind, rows };
+    }
+    const taskEmployees = [...taskEmployeeTotals.values()]
+      .map((row) => ({ ...row, completionRate: Math.round((row.done / row.assigned) * 100) }))
+      .sort((a, b) => b.completionRate - a.completionRate || b.assigned - a.assigned || a.name.localeCompare(b.name));
+
+    let isTruncated = completeness.isTruncated;
+    const selfJdNotDone = viewScope === "self"
+      ? jdItems
+          .filter((item): item is JdItem & { status: "missed" | "waiting" } => inPeriod(item.at) && item.status !== "done")
+          .sort((a, b) => a.at - b.at || a.title.localeCompare(b.title))
+      : [];
+    const jdNotDone = selfJdNotDone.slice(0, 200).map((item) => ({
+      taskId: item.taskId,
+      reference: item.reference,
+      title: item.title,
+      recurrence: item.recurrence,
+      dueDate: localDateField(item.at, timeZone),
+      status: item.status,
+    }));
+    if (selfJdNotDone.length > 200) isTruncated = true;
+
+    const taskNotDoneRows = taskItems
+      .filter((item): item is OneTimeItem & { status: "overdue" | "waiting" } => inPeriod(item.at) && (item.status === "overdue" || item.status === "waiting"))
+      .map((item) => ({
+        taskId: item.taskId,
+        reference: item.reference,
+        title: item.title,
+        priority: item.priority,
+        status: item.status,
+        dueDate: item.dueDate === undefined ? null : localDateField(item.dueDate, timeZone),
+        daysLate: item.status === "overdue" && item.dueDate !== undefined ? Math.max(0, localDayIndexAt(now, timeZone) - localDayIndexAt(item.dueDate, timeZone)) : null,
+        assignees: item.assigneeIds
+          .map((assigneeId) => scope.people.get(assigneeId)?.name)
+          .filter((name): name is string => name !== undefined)
+          .sort(),
+      }))
+      .sort((a, b) => {
+        if (a.status !== b.status) return a.status === "overdue" ? -1 : 1;
+        if (a.status === "overdue") return (b.daysLate ?? 0) - (a.daysLate ?? 0) || a.title.localeCompare(b.title);
+        return a.title.localeCompare(b.title);
+      });
+    const taskNotDone = taskNotDoneRows.slice(0, 200);
+    if (taskNotDoneRows.length > 200) isTruncated = true;
+
+    const priorityOrder = ["critical", "high", "medium", "low"] as const;
+    const byPriority = priorityOrder.map((priority) => {
+      let assigned = 0;
+      let done = 0;
+      let overdue = 0;
+      let waiting = 0;
+      for (const item of taskItems) {
+        if (item.priority !== priority || !inPeriod(item.at)) continue;
+        assigned += 1;
+        if (item.status === "done") done += 1;
+        else if (item.status === "overdue") overdue += 1;
+        else if (item.status === "waiting") waiting += 1;
+      }
+      return { priority, assigned, done, overdue, waiting, completionRate: rate(done, assigned) };
+    });
+
+    type EmployeeDetail = { membershipId: Id<"companyMemberships">; name: string; departments: string; branches: string };
+    let employee: EmployeeDetail | null = null;
+    if (args.membershipId) {
+      const person = scope.people.get(args.membershipId);
+      if (person) employee = { membershipId: args.membershipId, name: person.name, departments: departmentNames(args.membershipId), branches: branchNames(args.membershipId) };
     }
 
     return {
-      isTruncated: completeness.isTruncated,
-      level,
+      isTruncated,
       today: localDateField(now, timeZone),
-      range: {
-        start: range.start,
-        end: range.end,
-        grouping: range.grouping,
-        startDate: localDateField(range.start, timeZone),
-        endDate: localDateField(range.end, timeZone),
+      scope: viewScope,
+      period: {
+        unit: period.unit,
+        startDate: localDateField(period.start, timeZone),
+        endDate: localDateField(period.end, timeZone),
+        isCurrent: period.isCurrent,
+        previousDate: localDateField(period.previous.start, timeZone),
+        nextDate: period.next ? localDateField(period.next.start, timeZone) : null,
       },
-      jd: { due: jdDue, completed: jdCompleted, overdue: jdOverdue, completionRate: safeRate(jdCompleted, jdDue) },
-      tasks: { assigned: tasksAssigned, completed: tasksCompleted, overdue: tasksOverdue, completionRate: safeRate(tasksCompleted, tasksAssigned) },
-      trend,
-      rankings: { employees, groups },
+      employee,
+      buckets: bucketRows,
+      jd: {
+        due: jdDue,
+        done: jdDone,
+        missed: jdMissed,
+        waiting: jdWaiting,
+        completionRate: rate(jdDone, jdDue),
+        previousCompletionRate: rate(previousJdDone, previousJdDue),
+        byFrequency,
+        employees: jdEmployees,
+        notDone: jdNotDone,
+      },
+      tasks: {
+        assigned: tasksAssigned,
+        done: tasksDone,
+        overdue: tasksOverdue,
+        waiting: tasksWaiting,
+        notDueYet: tasksNotDueYet,
+        completionRate: rate(tasksDone, tasksAssigned),
+        previousCompletionRate: rate(previousTasksDone, previousTasksAssigned),
+        byPriority,
+        notDone: taskNotDone,
+        employees: taskEmployees,
+      },
     };
   },
 });

@@ -554,7 +554,9 @@ describe("task completion confirmation", () => {
     await admin.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId, recurrence: "weekly" });
 
     vi.setSystemTime(utc(6, 6));
-    const dashboard = await admin.query(api.analytics.dashboard, { companyId: f.companyA, now: utc(6, 6), range: { preset: "last_3_months" } });
-    expect(dashboard.jd.overdue).toBe(1);
+    const dashboard = await admin.query(api.analytics.dashboard, { companyId: f.companyA, now: utc(6, 6), period: { unit: "month", date: "2026-07-06" } });
+    // The daily request no longer holds the weekly grid, so its elapsed cycle
+    // is missed.
+    expect(dashboard.jd).toMatchObject({ due: 1, done: 0, missed: 1 });
   });
 });

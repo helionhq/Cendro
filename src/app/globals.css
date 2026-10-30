@@ -59,12 +59,6 @@
   --assistant-orb-hover: #fbfbfb;
   --assistant-orb-border: rgba(31, 32, 32, 0.14);
   --assistant-orb-shadow: 0 3px 10px rgba(30, 28, 24, 0.10), 0 1px 2px rgba(30, 28, 24, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.9);
-  /* TanStack Charts tooltip tokens (read by @tanstack/charts) */
-  --ts-chart-tooltip-background: rgba(255, 255, 255, 0.95);
-  --ts-chart-tooltip-color: #1f2020;
-  --ts-chart-tooltip-border: 1px solid #e3e5e6;
-  --ts-chart-tooltip-border-radius: 0.75rem;
-  --ts-chart-tooltip-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.05);
 }
 
 [data-theme="dark"] {
@@ -122,12 +116,6 @@
   --assistant-orb-hover: #e1e1e1;
   --assistant-orb-border: rgba(9, 9, 11, 0.35);
   --assistant-orb-shadow: 0 10px 28px rgba(0, 0, 0, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.85);
-  /* TanStack Charts tooltip tokens (read by @tanstack/charts) */
-  --ts-chart-tooltip-background: rgba(43, 45, 48, 0.95);
-  --ts-chart-tooltip-color: #efefec;
-  --ts-chart-tooltip-border: 1px solid #39393c;
-  --ts-chart-tooltip-border-radius: 0.75rem;
-  --ts-chart-tooltip-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
 }
 
 * { box-sizing: border-box; }
@@ -146,11 +134,6 @@ button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; }
 ::selection { background: color-mix(in srgb, var(--primary) 22%, transparent); }
-
-/* TanStack Charts svg takes keyboard focus for point navigation; the mouse-click
-   ring is noise, keyboard users keep the themed ring. */
-.dashboard-chart svg:focus { outline: none; }
-.dashboard-chart svg:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
 .scrollbar-hidden {
   scrollbar-width: none;
