@@ -407,7 +407,10 @@ describe("JD tasks on a work calendar", () => {
 
     vi.setSystemTime(utc(2026, 1, 7, 12));
     await t.mutation(internal.tasks.recordMissedJdCyclesBatch, {});
-    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    // Run the immediate catch-ups at Wednesday noon; fast-forwarding to later
+    // timers (the report recounts Monday's early completion once Monday
+    // starts) would move "now" past the day under test.
+    await t.finishAllScheduledFunctions(() => vi.advanceTimersByTime(0));
     // Fri and Sat missed, Sun skipped, Mon completed via the off-day click,
     // Tue elapsed untouched — a genuine miss.
     expect(await missedCycleStarts(t, taskId)).toEqual([utc(2026, 1, 2), utc(2026, 1, 3), utc(2026, 1, 6)]);

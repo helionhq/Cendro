@@ -1,11 +1,12 @@
 import { ConvexError, v } from "convex/values";
 import { query, type QueryCtx } from "./_generated/server";
 import { analyticsScopedMembershipIds, assertAnalyticsViewAccess, buildSopVisibilityContext, requireMembership, sopListScopeAuth, taskHasVisibleAssignee, visibleAssigneeMembershipIds, visibleSop } from "./permissions";
-import { currentJdCycle, jdRecurrences, localDateField, localDayIndexAt, nextJdCycleStart, type JdRecurrence } from "./taskCycles";
+import { currentJdCycle, jdRecurrences, localDateField, localDayIndexAt, type JdRecurrence } from "./taskCycles";
 import { jdOccurrencesDueBetween, effectiveCurrentJdCycle, loadWorkCalendar, maxHolidaySpanDays, occurrenceDeadline } from "./workCalendar";
-import { bucketIndexFor, dashboardPeriodValidator, resolveDashboardPeriod } from "./dashboardTime";
+import { bucketIndexFor, dashboardPeriodValidator, resolveDashboardPeriod, type DashboardPeriod } from "./dashboardTime";
 import type { Doc, Id } from "./_generated/dataModel";
 import { takeWithOverflow } from "./queryLimits";
+import { jdLedgerOutcomes, jdOutcomeCountableAt, type JdOutcome } from "./jdReport";
 
 type DashboardScope = "company" | "managed" | "self";
 
@@ -18,17 +19,23 @@ type Person = {
 };
 
 const dashboardTakeLimit = 500;
+// The dashboard reads every active JD task and every one-time task created in
+// the window. These are the report's explicit ceilings; past them it flags
+// itself incomplete.
+export const dashboardTaskLimit = 4_000;
+// Pre-counted JD totals: one row per due month and assignee set. A year view
+// reads 24 months, so this covers ~400 distinct assignee sets.
+const dashboardJdTotalsLimit = 10_000;
+// Lists show the newest unfinished work; the card totals stay exact.
+const dashboardListLimit = 200;
 
 // Convex bounds a transaction to ~32k document reads; a shared budget keeps a
-// workspace with many tasks and cycle records degrading to a truncated report
-// instead of a failed query.
+// workspace past the ceilings degrading to a truncated report instead of a
+// failed query.
 const dashboardReadBudget = 24_000;
 
 // A cycle's deadline trails its start by at most one recurrence length plus
 // the longest contiguous holiday shift a deadline could have moved through.
-// Reading only that far back covers every completion that could still be due
-// in a window, while keeping a daily ledger inside one bounded read instead of
-// scanning the annual worst case for every task.
 const maxJdCycleDays: Record<JdRecurrence, number> = {
   daily: 1,
   every_other_day: 2,
@@ -63,13 +70,14 @@ async function mapInWaves<T, R>(items: readonly T[], fn: (item: T) => Promise<R>
 async function takeBudgetedRows<T>(
   completeness: QueryCompleteness,
   take: (limit: number) => Promise<T[]>,
+  maxRows = dashboardTakeLimit,
 ) {
   if (completeness.remaining <= 0) {
     completeness.isTruncated = true;
     completeness.truncatedReads++;
     return [];
   }
-  const limit = Math.min(dashboardTakeLimit, completeness.remaining);
+  const limit = Math.min(maxRows, completeness.remaining);
   completeness.remaining -= limit + 1;
   const result = await takeWithOverflow(take, limit);
   completeness.remaining += limit + 1 - (result.isTruncated ? limit + 1 : result.rows.length);
@@ -307,7 +315,76 @@ type OneTimeItem = {
   assigneeIds: Id<"companyMemberships">[];
 };
 
+// Outcomes counted together at one instant: a totals segment or one live cycle.
+type JdCount = { at: number; recurrence: JdRecurrence; assigneeIds: Id<"companyMemberships">[]; done: number; missed: number; waiting: number };
+const jdCountDue = (count: JdCount) => count.done + count.missed + count.waiting;
+
 type BucketState = "past" | "current" | "future";
+
+/**
+ * The newest unfinished cycles due in the period, for a person view. Missed
+ * records are read one bucket at a time, newest first, so a long period stops
+ * reading once the list is full instead of scanning its whole ledger. Each
+ * bucket's records merge with the completions and requests at the same cycle
+ * starts, so the list agrees with the counted outcomes.
+ */
+async function loadJdNotDone(
+  ctx: QueryCtx,
+  tasks: { task: Doc<"jdTasks"> }[],
+  period: DashboardPeriod,
+  now: number,
+  timeZone: string | null,
+  holidaySpanDays: number,
+  unrecorded: JdItem[],
+  completeness: QueryCompleteness,
+) {
+  const items = new Map<string, JdItem>();
+  const add = (task: Doc<"jdTasks">, outcome: JdOutcome) => {
+    if (outcome.status === "done" || outcome.dueAt < period.start || outcome.dueAt > period.end || jdOutcomeCountableAt(outcome) > now) return;
+    items.set(`${task._id}:${outcome.start}:${outcome.retired}`, { taskId: task._id, title: task.title, reference: task.reference, recurrence: task.recurrence, at: outcome.dueAt, status: outcome.status, assigneeIds: [] });
+  };
+  const completionsStartingBetween = (task: Doc<"jdTasks">, from: number, to: number) => takeBudgetedRows(
+    completeness,
+    (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", from).lte("cycleStart", to)).take(limit),
+  );
+
+  // A cycle that started up to one recurrence plus a holiday shift before the
+  // period can still be due inside it.
+  const pendingByTask = new Map(await mapInWaves(tasks, async ({ task }) => {
+    const from = period.start - (maxJdCycleDays[task.recurrence] + holidaySpanDays + 1) * 86_400_000;
+    return [task._id, await takeBudgetedRows(
+      completeness,
+      (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", from).lte("cycleStart", period.end)).take(limit),
+    )] as const;
+  }));
+  const mergedRequests = new Set<Id<"taskConfirmationRequests">>();
+  for (const bucket of period.buckets.filter((bucket) => bucket.start >= period.start).reverse()) {
+    await mapInWaves(tasks, async ({ task }) => {
+      const missed = await takeBudgetedRows(
+        completeness,
+        (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleEnd", (q) => q.eq("jdTaskId", task._id).gte("cycleEnd", bucket.start + 1).lte("cycleEnd", bucket.end + 1)).take(limit),
+      );
+      if (missed.length === 0) return;
+      const from = Math.min(...missed.map((row) => row.cycleStart));
+      const to = Math.max(...missed.map((row) => row.cycleStart));
+      const pending = (pendingByTask.get(task._id) ?? []).filter((request) => request.cycleStart !== undefined && request.cycleStart >= from && request.cycleStart <= to);
+      for (const request of pending) mergedRequests.add(request._id);
+      for (const outcome of jdLedgerOutcomes(task, timeZone, { completions: await completionsStartingBetween(task, from, to), missed, pending })) add(task, outcome);
+    });
+    // Every bucket left is older than every item listed so far.
+    if (items.size >= dashboardListLimit) break;
+  }
+  // Requests without a missed record in the buckets read: work still waiting.
+  await mapInWaves(tasks, async ({ task }) => {
+    const pending = (pendingByTask.get(task._id) ?? []).filter((request) => request.cycleStart !== undefined && !mergedRequests.has(request._id));
+    if (pending.length === 0) return;
+    const starts = pending.map((request) => request.cycleStart!);
+    const completions = await completionsStartingBetween(task, Math.min(...starts), Math.max(...starts));
+    for (const outcome of jdLedgerOutcomes(task, timeZone, { completions, missed: [], pending })) add(task, outcome);
+  });
+  const rows = [...items.values(), ...unrecorded.filter((item) => item.at >= period.start && item.at <= period.end)];
+  return rows.sort((a, b) => b.at - a.at || a.title.localeCompare(b.title)).slice(0, dashboardListLimit);
+}
 
 export const dashboard = query({
   args: {
@@ -362,210 +439,88 @@ export const dashboard = query({
     const todayEnd = currentJdCycle("daily", now, timeZone).end - 1;
     // The reads reach far enough back for the earliest bucket and the previous
     // period, and never past the end of today: a stored row only exists for
-    // work that has happened. The item filter below uses the full period bound
-    // for done and waiting work, which can carry a deadline later this period.
+    // work that has happened. Counted totals use the full period bound for
+    // done and waiting work, which can carry a deadline later this period.
     const windowStart = Math.min(period.buckets[0].start, period.previous.start);
     const windowEnd = Math.min(period.end, todayEnd);
     const calendar = await loadWorkCalendar(ctx, args.companyId);
-    const holidaySpanDays = maxHolidaySpanDays(calendar);
 
-    const [jdTasks, oneTimeTasks] = await Promise.all([
+    const [jdTasks, oneTimeTasks, jdTotals] = await Promise.all([
       takeBudgetedRows(
         completeness,
         (limit) => ctx.db.query("jdTasks").withIndex("by_companyId_and_pausedAt", (q) => q.eq("companyId", args.companyId).eq("pausedAt", undefined)).take(limit),
+        dashboardTaskLimit,
       ),
       takeBudgetedRows(
         completeness,
         (limit) => ctx.db.query("oneTimeTasks").withIndex("by_companyId_and_createdAt", (q) => q.eq("companyId", args.companyId).gte("createdAt", windowStart).lte("createdAt", windowEnd)).take(limit),
+        dashboardTaskLimit,
+      ),
+      // Recorded JD outcomes arrive pre-counted (see jdReport.ts), so the read
+      // stays a few rows per month however long the ledger grows.
+      takeBudgetedRows(
+        completeness,
+        (limit) => ctx.db.query("jdReportTotals").withIndex("by_companyId_and_monthStart_and_assigneeKey", (q) => q.eq("companyId", args.companyId).gte("monthStart", currentJdCycle("monthly", windowStart, timeZone).start).lte("monthStart", period.end)).take(limit),
+        dashboardJdTotalsLimit,
       ),
     ]);
-    // Visibility is a JS-only check, so resolve it before touching the ledger
-    // tables. The ledger fan-out below then only reads rows for tasks the
-    // viewer can actually see.
     const visibleJdTasks = jdTasks
-      .filter((task) => task.pausedAt === undefined)
       .map((task) => ({ task, assignees: visibleAssigneeMembershipIds(task.assigneeMembershipIds, effectiveIds) }))
       .filter((entry) => entry.assignees.length > 0);
 
-    // Read only active, visible task ledgers. Company-wide scans also include
-    // preserved paused history, which must not consume the active report budget.
-    type TaskLedger = { completions: Doc<"jdTaskCompletions">[]; missed: Doc<"jdTaskCycleRecords">[]; pending: Doc<"taskConfirmationRequests">[]; truncated: boolean };
-    const ledgersByTask = new Map<Id<"jdTasks">, TaskLedger>();
-    await mapInWaves(visibleJdTasks, async ({ task }) => {
-      // Reserve before yielding and keep each task's completeness separate:
-      // incomplete history must never silently misreport completed work.
-      const taskPhase: QueryCompleteness = {
-        get remaining() { return completeness.remaining; },
-        set remaining(value) { completeness.remaining = value; },
-        isTruncated: false,
-        truncatedReads: 0,
-      };
-      // A cycle's deadline trails its start by at most this task's own
-      // recurrence length plus the holiday shift, so that is the only
-      // backstop these reads need.
-      const cycleLookbackMs = (maxJdCycleDays[task.recurrence] + holidaySpanDays + 1) * 86_400_000;
-      // Read the previous and current periods as separate bounded ranges: one
-      // annual span fits the per-read cap even for a daily ledger, while the
-      // union covers every cycle due in either period. The ranges are disjoint
-      // by cycleStart, so no row is counted twice.
-      const previousFrom = windowStart - cycleLookbackMs;
-      const currentFrom = period.start - cycleLookbackMs;
-      const [previousCompletions, previousMissed, previousPending] = await Promise.all([
-        takeBudgetedRows(
-          taskPhase,
-          (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", previousFrom).lte("cycleStart", currentFrom - 1)).order("desc").take(limit),
-        ),
-        takeBudgetedRows(
-          taskPhase,
-          (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleEnd", (q) => q.eq("jdTaskId", task._id).gte("cycleEnd", windowStart + 1).lte("cycleEnd", period.start)).order("desc").take(limit),
-        ),
-        takeBudgetedRows(
-          taskPhase,
-          (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", previousFrom).lte("cycleStart", currentFrom - 1)).order("desc").take(limit),
-        ),
+    // Totals rows are keyed by the task's whole assignee set, so a shared task
+    // counts once for the team and once for each visible assignee.
+    const jdCounts: JdCount[] = [];
+    for (const row of jdTotals) {
+      const assigneeIds = visibleAssigneeMembershipIds(row.assigneeMembershipIds, effectiveIds);
+      if (assigneeIds.length === 0) continue;
+      for (const count of row.counts) {
+        if (count.segmentStart < windowStart || count.segmentStart > period.end) continue;
+        jdCounts.push({ at: count.segmentStart, recurrence: count.recurrence, assigneeIds, done: count.done, missed: count.missed, waiting: count.waiting });
+      }
+    }
+
+    // An elapsed cycle nobody recorded yet is missed, but the hourly
+    // missed-cycle job has not written it into the ledger (or the totals).
+    // Reconstruct those from each task's cycle floor, skipping any cycle that
+    // already has a row; the completion stamp's cycle is counted in the totals.
+    const unrecordedJdItems: JdItem[] = [];
+    await mapInWaves(visibleJdTasks, async ({ task, assignees }) => {
+      const elapsed = jdOccurrencesDueBetween(calendar, task.recurrence, task.cycleStartedAt, now, windowStart, windowEnd, 200, timeZone);
+      if (elapsed.truncated) completeness.isTruncated = true;
+      const candidates = elapsed.occurrences.filter((cycle) => cycle.deadline - 1 < now && !(task.status === "completed" && task.statusCycleStart === cycle.start));
+      if (candidates.length === 0) return;
+      const from = Math.min(...candidates.map((cycle) => cycle.start));
+      const [completions, missed, pending] = await Promise.all([
+        takeBudgetedRows(completeness, (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", from)).take(limit)),
+        takeBudgetedRows(completeness, (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", from)).take(limit)),
+        takeBudgetedRows(completeness, (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", from)).take(limit)),
       ]);
-      const [currentCompletions, currentMissed, currentPending] = await Promise.all([
-        takeBudgetedRows(
-          taskPhase,
-          (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", currentFrom).lte("cycleStart", windowEnd)).order("desc").take(limit),
-        ),
-        takeBudgetedRows(
-          taskPhase,
-          (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleEnd", (q) => q.eq("jdTaskId", task._id).gte("cycleEnd", period.start + 1).lte("cycleEnd", windowEnd + 1)).order("desc").take(limit),
-        ),
-        takeBudgetedRows(
-          taskPhase,
-          (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", currentFrom).lte("cycleStart", windowEnd)).order("desc").take(limit),
-        ),
-      ]);
-      ledgersByTask.set(task._id, {
-        completions: [...previousCompletions, ...currentCompletions],
-        missed: [...previousMissed, ...currentMissed],
-        pending: [...previousPending, ...currentPending],
-        truncated: taskPhase.isTruncated,
-      });
+      const recorded = new Set<number>();
+      for (const row of [...completions, ...missed]) if (row.retiredAt === undefined) recorded.add(row.cycleStart);
+      for (const request of pending) if (request.cycleStart !== undefined && request.recurrence === task.recurrence) recorded.add(request.cycleStart);
+      for (const cycle of candidates) {
+        if (recorded.has(cycle.start)) continue;
+        unrecordedJdItems.push({ taskId: task._id, title: task.title, reference: task.reference, recurrence: task.recurrence, at: cycle.deadline - 1, status: "missed", assigneeIds: assignees });
+      }
     });
+    for (const item of unrecordedJdItems) jdCounts.push({ at: item.at, recurrence: item.recurrence, assigneeIds: item.assigneeIds, done: 0, missed: 1, waiting: 0 });
 
-    const jdItemGroups = visibleJdTasks.map(({ task, assignees }) => {
-      const ledger = ledgersByTask.get(task._id)!;
-      // Stored rows are individually complete, so a truncated read still
-      // reports what it loaded. Reconstruction needs the whole range instead:
-      // it cannot tell an unrecorded cycle from one whose completion row fell
-      // outside the read, so it must not be allowed to fabricate misses.
-      if (ledger.truncated) completeness.isTruncated = true;
-      const { completions, missed, pending } = ledger;
-
-      const cycles = new Map<string, { start: number; retired: boolean; dueAt: number; completed: boolean; stored: boolean }>();
-      // Group rows by grid lifetime as well as start: retired work must not
-      // complete a reset grid, but its completion and miss still count once.
-      // Completed rows own their stored deadlines; reconstruction or a stale
-      // missed record must not rewrite completed history.
-      const put = (start: number, dueAt: number, completed: boolean, stored: boolean, retiredAt?: number) => {
-        const key = `${start}:${retiredAt ?? "current"}`;
-        const existing = cycles.get(key);
-        cycles.set(key, {
-          start,
-          retired: retiredAt !== undefined,
-          dueAt: existing && ((existing.stored && !stored) || (existing.completed && !completed)) ? existing.dueAt : dueAt,
-          completed: (existing?.completed ?? false) || completed,
-          stored: (existing?.stored ?? false) || stored,
-        });
-      };
-
-      // Legacy rows predate cycleEnd. When the stored start no longer sits on
-      // the task's grid the recurrence or timezone changed since, so the
-      // recorded instant is the only trustworthy point inside that cycle.
-      const cycleEndAt = (storedEnd: number | undefined, start: number, fallbackAt: number) =>
-        storedEnd ?? (
-          currentJdCycle(task.recurrence, start, timeZone).start === start
-            ? nextJdCycleStart(start, task.recurrence, timeZone)
-            : fallbackAt + 1
-        );
-
-      // A request from a superseded recurrence is history, not a live hold on
-      // the current grid's cycle. A live request owns its cycle's dates: the
-      // missed-cycle writer advances the task floor past a pending cycle
-      // without recording it, so the cycle must come from the request row.
-      const pendingStarts = new Set<number>();
-      for (const request of pending) {
-        if (request.cycleStart === undefined || request.recurrence !== task.recurrence) continue;
-        pendingStarts.add(request.cycleStart);
-        put(request.cycleStart, cycleEndAt(request.cycleEnd, request.cycleStart, request.submittedAt) - 1, false, true);
-      }
-
-      // Newer completions record their own cycleEnd; legacy rows fall back to
-      // the current grid. Missed records store their own deadline, so they stay
-      // exact across recurrence and timezone changes; match on it directly.
-      for (const completion of completions) {
-        put(completion.cycleStart, cycleEndAt(completion.cycleEnd, completion.cycleStart, completion.completedAt) - 1, true, true, completion.retiredAt);
-      }
-      for (const record of missed) {
-        put(record.cycleStart, record.cycleEnd - 1, false, true, record.retiredAt);
-      }
-
-      // Skipped occurrences (non-working due dates on daily/alternate cycles)
-      // never enter the ledger; other recurrences report their shifted
-      // deadline, matching what the missed-record writer stores.
-      if (!ledger.truncated) {
-        const elapsed = jdOccurrencesDueBetween(calendar, task.recurrence, task.cycleStartedAt, now, windowStart, windowEnd, 200, timeZone);
-        if (elapsed.truncated) completeness.isTruncated = true;
-        for (const cycle of elapsed.occurrences) put(cycle.start, cycle.deadline - 1, false, false);
-      }
-
-      const taskItems: JdItem[] = [];
-      const current = currentJdCycle(task.recurrence, now, timeZone);
-      const currentDeadline = occurrenceDeadline(calendar, task.recurrence, current.end, timeZone);
-      const onCurrentGrid = current.start >= currentJdCycle(task.recurrence, task.cycleStartedAt, timeZone).start;
-      if (currentDeadline !== null && onCurrentGrid) put(current.start, currentDeadline - 1, false, false);
-
-      for (const cycle of cycles.values()) {
-        // Completed and waiting work counts wherever its deadline falls in the
-        // selected period; unfinished work still ahead of now does not.
-        if (cycle.start > now || cycle.dueAt < windowStart || cycle.dueAt > period.end) continue;
-        const completed = cycle.completed || (!cycle.retired && task.status === "completed" && task.statusCycleStart === cycle.start);
-        const waiting = !completed && pendingStarts.has(cycle.start);
-        // Work counts once it is done, waiting for approval, or past its
-        // deadline, so done + missed + waiting always equals due.
-        if (!completed && !waiting && cycle.dueAt >= now) continue;
-        taskItems.push({
-          taskId: task._id,
-          title: task.title,
-          reference: task.reference,
-          recurrence: task.recurrence,
-          at: cycle.dueAt,
-          status: completed ? "done" : waiting ? "waiting" : "missed",
-          assigneeIds: assignees,
-        });
-      }
-
-      // A current period also reports work that is due before it closes, so a
-      // running month can say "3 JDs due on the 31st" instead of a bare zero.
-      // The open cycle carries a still-pending shifted deadline: on Monday
-      // morning the default calendar's weekly deadline belongs to last week's
-      // grid cycle, not the raw cycle that started that day.
-      let upcomingDeadline: number | null = null;
-      if (period.isCurrent) {
+    // A current period also reports work that is due before it closes, so a
+    // running month can say "3 JDs due on the 31st" instead of a bare zero.
+    // The open cycle carries a still-pending shifted deadline: on Monday
+    // morning the default calendar's weekly deadline belongs to last week's
+    // grid cycle, not the raw cycle that started that day. Completing or
+    // submitting a cycle stamps it on the task.
+    const upcomingByRecurrence = new Map<JdRecurrence, number[]>();
+    if (period.isCurrent) {
+      for (const { task } of visibleJdTasks) {
         const open = effectiveCurrentJdCycle(calendar, task.recurrence, now, timeZone);
         const openDeadline = occurrenceDeadline(calendar, task.recurrence, open.end, timeZone);
-        const onOpenGrid = open.start >= currentJdCycle(task.recurrence, task.cycleStartedAt, timeZone).start;
-        if (openDeadline !== null && onOpenGrid) {
-          const openCycle = cycles.get(`${open.start}:current`);
-          const openCompleted = (openCycle?.completed ?? false) || (openCycle?.retired !== true && task.status === "completed" && task.statusCycleStart === open.start);
-          const openWaiting = !openCompleted && pendingStarts.has(open.start);
-          const deadline = openDeadline - 1;
-          if (!openCompleted && !openWaiting && now <= deadline && deadline <= period.end) upcomingDeadline = deadline;
-        }
-      }
-      return { items: taskItems, recurrence: task.recurrence, upcomingDeadline };
-    });
-    const jdItems: JdItem[] = [];
-    const upcomingByRecurrence = new Map<JdRecurrence, number[]>();
-    for (const group of jdItemGroups) {
-      jdItems.push(...group.items);
-      if (group.upcomingDeadline !== null) {
-        const deadlines = upcomingByRecurrence.get(group.recurrence) ?? [];
-        deadlines.push(group.upcomingDeadline);
-        upcomingByRecurrence.set(group.recurrence, deadlines);
+        if (openDeadline === null || open.start < currentJdCycle(task.recurrence, task.cycleStartedAt, timeZone).start) continue;
+        if (task.statusCycleStart === open.start && (task.status === "completed" || task.status === "awaiting_confirmation")) continue;
+        const deadline = openDeadline - 1;
+        if (now <= deadline && deadline <= period.end) upcomingByRecurrence.set(task.recurrence, [...(upcomingByRecurrence.get(task.recurrence) ?? []), deadline]);
       }
     }
     const taskItems: OneTimeItem[] = [];
@@ -590,24 +545,23 @@ export const dashboard = query({
     const inPeriod = (at: number) => at >= period.start && at <= period.end;
     const inPrevious = (at: number) => at >= period.previous.start && at <= period.previous.end;
 
-    let jdDue = 0;
     let jdDone = 0;
     let jdMissed = 0;
     let jdWaiting = 0;
     let previousJdDue = 0;
     let previousJdDone = 0;
-    for (const item of jdItems) {
-      if (inPeriod(item.at)) {
-        jdDue += 1;
-        if (item.status === "done") jdDone += 1;
-        else if (item.status === "missed") jdMissed += 1;
-        else jdWaiting += 1;
+    for (const count of jdCounts) {
+      if (inPeriod(count.at)) {
+        jdDone += count.done;
+        jdMissed += count.missed;
+        jdWaiting += count.waiting;
       }
-      if (inPrevious(item.at)) {
-        previousJdDue += 1;
-        if (item.status === "done") previousJdDone += 1;
+      if (inPrevious(count.at)) {
+        previousJdDue += jdCountDue(count);
+        previousJdDone += count.done;
       }
     }
+    const jdDue = jdDone + jdMissed + jdWaiting;
 
     let tasksAssigned = 0;
     let tasksDone = 0;
@@ -643,11 +597,11 @@ export const dashboard = query({
       jd: { due: 0, done: 0, completionRate: null },
       tasks: { assigned: 0, done: 0, completionRate: null },
     }));
-    for (const item of jdItems) {
-      const index = bucketIndexFor(period.buckets, item.at);
+    for (const count of jdCounts) {
+      const index = bucketIndexFor(period.buckets, count.at);
       if (index === -1) continue;
-      bucketRows[index].jd.due += 1;
-      if (item.status === "done") bucketRows[index].jd.done += 1;
+      bucketRows[index].jd.due += jdCountDue(count);
+      bucketRows[index].jd.done += count.done;
     }
     for (const item of taskItems) {
       const index = bucketIndexFor(period.buckets, item.at);
@@ -681,12 +635,12 @@ export const dashboard = query({
       let done = 0;
       let missed = 0;
       let waiting = 0;
-      for (const item of jdItems) {
-        if (item.recurrence !== recurrence || !inPeriod(item.at)) continue;
-        due += 1;
-        if (item.status === "done") done += 1;
-        else if (item.status === "missed") missed += 1;
-        else waiting += 1;
+      for (const count of jdCounts) {
+        if (count.recurrence !== recurrence || !inPeriod(count.at)) continue;
+        due += jdCountDue(count);
+        done += count.done;
+        missed += count.missed;
+        waiting += count.waiting;
       }
       const upcomingDeadlines = upcomingByRecurrence.get(recurrence) ?? [];
       const upcoming = period.isCurrent && upcomingDeadlines.length > 0
@@ -697,9 +651,9 @@ export const dashboard = query({
 
     const jdEmployeeTotals = new Map<Id<"companyMemberships">, { membershipId: Id<"companyMemberships">; name: string; departments: string; due: number; done: number; missed: number; waiting: number }>();
     if (viewScope === "team") {
-      for (const item of jdItems) {
-        if (!inPeriod(item.at)) continue;
-        for (const assigneeId of item.assigneeIds) {
+      for (const count of jdCounts) {
+        if (!inPeriod(count.at)) continue;
+        for (const assigneeId of count.assigneeIds) {
           const person = scope.people.get(assigneeId);
           if (!person) continue;
           let row = jdEmployeeTotals.get(assigneeId);
@@ -707,10 +661,10 @@ export const dashboard = query({
             row = { membershipId: assigneeId, name: person.name, departments: departmentNames(assigneeId), due: 0, done: 0, missed: 0, waiting: 0 };
             jdEmployeeTotals.set(assigneeId, row);
           }
-          row.due += 1;
-          if (item.status === "done") row.done += 1;
-          else if (item.status === "missed") row.missed += 1;
-          else row.waiting += 1;
+          row.due += jdCountDue(count);
+          row.done += count.done;
+          row.missed += count.missed;
+          row.waiting += count.waiting;
         }
       }
     }
@@ -740,21 +694,17 @@ export const dashboard = query({
       .map((row) => ({ ...row, completionRate: Math.round((row.done / row.assigned) * 100) }))
       .sort((a, b) => b.completionRate - a.completionRate || b.assigned - a.assigned || a.name.localeCompare(b.name));
 
-    let isTruncated = completeness.isTruncated;
     const selfJdNotDone = viewScope === "self"
-      ? jdItems
-          .filter((item): item is JdItem & { status: "missed" | "waiting" } => inPeriod(item.at) && item.status !== "done")
-          .sort((a, b) => a.at - b.at || a.title.localeCompare(b.title))
+      ? await loadJdNotDone(ctx, visibleJdTasks, period, now, timeZone, maxHolidaySpanDays(calendar), unrecordedJdItems, completeness)
       : [];
-    const jdNotDone = selfJdNotDone.slice(0, 200).map((item) => ({
+    const jdNotDone = selfJdNotDone.map((item) => ({
       taskId: item.taskId,
       reference: item.reference,
       title: item.title,
       recurrence: item.recurrence,
       dueDate: localDateField(item.at, timeZone),
-      status: item.status,
+      status: item.status as "missed" | "waiting",
     }));
-    if (selfJdNotDone.length > 200) isTruncated = true;
 
     const taskNotDoneRows = taskItems
       .filter((item): item is OneTimeItem & { status: "overdue" | "waiting" } => inPeriod(item.at) && (item.status === "overdue" || item.status === "waiting"))
@@ -776,8 +726,7 @@ export const dashboard = query({
         if (a.status === "overdue") return (b.daysLate ?? 0) - (a.daysLate ?? 0) || a.title.localeCompare(b.title);
         return a.title.localeCompare(b.title);
       });
-    const taskNotDone = taskNotDoneRows.slice(0, 200);
-    if (taskNotDoneRows.length > 200) isTruncated = true;
+    const taskNotDone = taskNotDoneRows.slice(0, dashboardListLimit);
 
     const priorityOrder = ["critical", "high", "medium", "low"] as const;
     const byPriority = priorityOrder.map((priority) => {
@@ -803,7 +752,7 @@ export const dashboard = query({
     }
 
     return {
-      isTruncated,
+      isTruncated: completeness.isTruncated,
       today: localDateField(now, timeZone),
       scope: viewScope,
       period: {

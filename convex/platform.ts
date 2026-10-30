@@ -1,6 +1,7 @@
 import { paginationOptsValidator } from "convex/server";
 import { ConvexError, v } from "convex/values";
-import { action, internalMutation, mutation, query } from "./_generated/server";
+import { action, query } from "./_generated/server";
+import { internalMutation, mutation } from "./functions";
 import { internal } from "./_generated/api";
 import { assertPlatformAdmin, ensureDefaultRoles, isPlatformAdminSubject } from "./permissions";
 import { nonEmpty, normalizeEmail } from "./validation";

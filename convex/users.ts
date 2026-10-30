@@ -1,4 +1,5 @@
-import { mutation, query } from "./_generated/server";
+import { query } from "./_generated/server";
+import { mutation } from "./functions";
 import { ConvexError, v } from "convex/values";
 import { currentUser, nameFields, namesForExistingUser, namesFromIdentity } from "./permissions";
 import { normalizeEmail } from "./validation";

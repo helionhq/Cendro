@@ -77,6 +77,11 @@ function Card({ title, caption, children }: { title: string; caption?: string; c
   );
 }
 
+// Lists show the newest work up to a cap; the counts above them stay exact.
+function shownOf(shown: number, total: number) {
+  return shown < total ? `Showing ${numberFormat.format(shown)} of ${numberFormat.format(total)}` : undefined;
+}
+
 function EmptyRows({ children }: { children: React.ReactNode }) {
   return <p className="py-6 text-center text-[12.5px] text-[var(--ink-faint)]">{children}</p>;
 }
@@ -443,10 +448,10 @@ function EmployeesCard({
   );
 }
 
-function JdNotDoneCard({ rows }: { rows: JdNotDone[] }) {
+function JdNotDoneCard({ rows, total }: { rows: JdNotDone[]; total: number }) {
   const grid = "grid grid-cols-[72px_minmax(0,1fr)_120px] items-center gap-2 @lg:grid-cols-[92px_minmax(0,1fr)_110px_132px]";
   return (
-    <Card title="JDs not done">
+    <Card title="JDs not done" caption={shownOf(rows.length, total)}>
       {rows.length === 0 ? (
         <EmptyRows>Nothing was missed in this period.</EmptyRows>
       ) : (
@@ -515,11 +520,11 @@ function ByPriorityCard({ rows }: { rows: PriorityRow[] }) {
   );
 }
 
-function OverdueTasksCard({ rows }: { rows: TaskNotDone[] }) {
+function OverdueTasksCard({ rows, total }: { rows: TaskNotDone[]; total: number }) {
   const overdue = rows.filter((row) => row.status === "overdue");
   const grid = "grid grid-cols-[minmax(0,1fr)_56px_72px] items-center gap-2 @lg:grid-cols-[minmax(0,1fr)_120px_96px_70px_84px]";
   return (
-    <Card title="Overdue tasks">
+    <Card title="Overdue tasks" caption={shownOf(overdue.length, total)}>
       {overdue.length === 0 ? (
         <EmptyRows>No overdue tasks.</EmptyRows>
       ) : (
@@ -557,10 +562,10 @@ function OverdueTasksCard({ rows }: { rows: TaskNotDone[] }) {
   );
 }
 
-function TasksNotDoneCard({ rows }: { rows: TaskNotDone[] }) {
+function TasksNotDoneCard({ rows, total }: { rows: TaskNotDone[]; total: number }) {
   const grid = "grid grid-cols-[minmax(0,1fr)_48px_124px] items-center gap-2 @xl:grid-cols-[minmax(0,1fr)_96px_72px_80px_140px]";
   return (
-    <Card title="Tasks not done">
+    <Card title="Tasks not done" caption={shownOf(rows.length, total)}>
       {rows.length === 0 ? (
         <EmptyRows>Nothing is overdue or waiting in this period.</EmptyRows>
       ) : (
@@ -768,7 +773,7 @@ function DashboardView(props: DashboardViewProps) {
             </div>
             <ByFrequencyCard rows={data.jd.byFrequency} showJdCounts={props.mode === "employee"} period={data.period} />
             {personView ? (
-              <JdNotDoneCard rows={data.jd.notDone} />
+              <JdNotDoneCard rows={data.jd.notDone} total={data.jd.missed + data.jd.waiting} />
             ) : (
               <EmployeesCard
                 rows={data.jd.employees.map((row) => ({ ...row, total: row.due, problems: row.missed }))}
@@ -786,10 +791,10 @@ function DashboardView(props: DashboardViewProps) {
             </div>
             <ByPriorityCard rows={data.tasks.byPriority} />
             {personView ? (
-              <TasksNotDoneCard rows={data.tasks.notDone} />
+              <TasksNotDoneCard rows={data.tasks.notDone} total={data.tasks.overdue + data.tasks.waiting} />
             ) : (
               <>
-                <OverdueTasksCard rows={data.tasks.notDone} />
+                <OverdueTasksCard rows={data.tasks.notDone} total={data.tasks.overdue} />
                 <EmployeesCard
                   rows={data.tasks.employees.map((row) => ({ ...row, total: row.assigned, problems: row.overdue }))}
                   doneLabel="Tasks done"
