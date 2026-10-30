@@ -414,4 +414,19 @@ describe("fixed JD calendar cycle boundaries", () => {
   test("missing company/browser time zone falls back to GMT+5", () => {
     expect(currentJdCycle("daily", utc(2026, 6, 27))).toEqual({ start: utc(2026, 6, 26, 19), end: utc(2026, 6, 27, 19) });
   });
+
+  test("walking cycles resolves each time zone once, so long walks stay inside the query time limit", () => {
+    const constructed = vi.spyOn(Intl, "DateTimeFormat");
+    try {
+      for (const zone of ["Asia/Karachi", "Not/AZone"]) {
+        let start = currentJdCycle("daily", utc(2026, 6, 27), zone).start;
+        for (let index = 0; index < 100; index++) start = previousJdCycleStart(start, "daily", zone);
+        expect(start).toBe(utc(2026, 3, 18, 19));
+      }
+      // Karachi, the failed attempt for the invalid zone, and its GMT+5 fallback.
+      expect(constructed.mock.calls.length).toBeLessThanOrEqual(3);
+    } finally {
+      constructed.mockRestore();
+    }
+  });
 });
