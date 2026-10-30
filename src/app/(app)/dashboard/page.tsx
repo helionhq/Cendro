@@ -1,10 +1,10 @@
-import { DashboardPage } from "@/components/app/dashboard-pages";
-import { parseDashboardSearchParams } from "@/components/app/dashboard-format";
+import { Suspense } from "react";
+import { DashboardPage, DashboardSkeleton } from "@/components/app/dashboard-pages";
 
-export default async function Dashboard({
-  searchParams,
-}: {
-  searchParams: Promise<Record<string, string | string[] | undefined>>;
-}) {
-  return <DashboardPage initial={parseDashboardSearchParams(await searchParams)} />;
+export default function Dashboard() {
+  return (
+    <Suspense fallback={<DashboardSkeleton />}>
+      <DashboardPage />
+    </Suspense>
+  );
 }

@@ -67,6 +67,11 @@ export function DashboardBarChart({
   // column so a 12-bar year fits a 360px phone without horizontal scrolling.
   const maxBarWidth = count <= 5 ? 60 : count <= 8 ? 44 : 34;
   const valueSize = count > 8 ? "text-[13px]" : "text-[14px]";
+  // A value label ("100%" at this font size) needs about 38px to clear its
+  // neighbour. Below these plot widths the labels are hidden; the bars, axis
+  // and tooltips still carry the values.
+  const valueVisibility =
+    count > 8 ? "hidden @min-[520px]:block" : count > 6 ? "hidden @min-[360px]:block" : count > 5 ? "hidden @min-[268px]:block" : "block";
   const hasCurrent = buckets.some((bucket) => bucket.state === "current");
   const caption = mode === "jd" ? "JD completion by period" : "Task completion by period";
 
@@ -90,7 +95,7 @@ export function DashboardBarChart({
             ))}
           </div>
         </div>
-        <div className="min-w-0 flex-1">
+        <div className="@container min-w-0 flex-1">
           <div className="pt-5">
             <div className="relative h-[206px]">
               <div className="absolute inset-x-0 top-0 border-t border-dashed border-[var(--hairline-strong)]" aria-hidden="true" />
@@ -136,6 +141,7 @@ export function DashboardBarChart({
                             className={cn(
                               "absolute bottom-full left-1/2 mb-1 -translate-x-1/2 whitespace-nowrap tabular-nums leading-none",
                               valueSize,
+                              valueVisibility,
                               dimmed ? "font-medium text-[var(--ink-muted)]" : "font-semibold text-[var(--ink)]",
                             )}
                             aria-hidden="true"

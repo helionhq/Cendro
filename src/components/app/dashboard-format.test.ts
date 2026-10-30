@@ -3,11 +3,13 @@ import {
   chartBucketLabel,
   comparison,
   dashboardQueryString,
+  frequencySubline,
   heroCaption,
   noneDueNote,
   parseDashboardSearchParams,
   periodStepperLabel,
   previousPeriodLabel,
+  recurrenceSubline,
 } from "./dashboard-format";
 
 test("week period labels cross a month and a year without time-zone drift", () => {
@@ -90,6 +92,11 @@ test("the none-due note joins labels and reads naturally for a week", () => {
     "Quarterly, Bi-yearly and Yearly JDs: none were due in October.",
   );
   expect(noneDueNote(["Daily", "Weekly"], "this week")).toBe("Daily and Weekly JDs: none were due this week.");
+});
+
+test("alternate-day JDs describe the calendar grid, not working days", () => {
+  expect(recurrenceSubline("every_other_day")).toBe("Every other calendar day, excluding non-working due dates");
+  expect(frequencySubline("every_other_day", 2)).toBe("2 JDs · every other calendar day, excluding non-working due dates");
 });
 
 test("search-param parsing ignores invalid values and the URL omits defaults", () => {

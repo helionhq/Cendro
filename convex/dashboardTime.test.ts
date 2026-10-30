@@ -83,6 +83,19 @@ describe("resolveDashboardPeriod", () => {
     });
   });
 
+  test("omitting the date resolves the period containing now in the company time zone", () => {
+    // Oct 1 01:00 in GMT+5, while a browser still on September 30 would have
+    // filled in September. The server picks the company's month instead.
+    const now = Date.UTC(2026, 8, 30, 20);
+    const period = resolveDashboardPeriod({ unit: "month" }, now, "Etc/GMT-5");
+    expect(period).toMatchObject({
+      start: Date.UTC(2026, 8, 30, 19),
+      end: Date.UTC(2026, 9, 31, 19) - 1,
+      isCurrent: true,
+      previous: { start: Date.UTC(2026, 7, 31, 19), end: Date.UTC(2026, 8, 30, 19) - 1 },
+    });
+  });
+
   test("rejects dates that are not real calendar days", () => {
     expect(() => resolveDashboardPeriod({ unit: "month", date: "2026-02-30" }, Date.UTC(2026, 8, 12, 10), timeZone)).toThrow("Invalid date.");
     expect(() => resolveDashboardPeriod({ unit: "month", date: "2026-9-1" }, Date.UTC(2026, 8, 12, 10), timeZone)).toThrow("Invalid date.");

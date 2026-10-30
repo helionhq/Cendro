@@ -221,7 +221,7 @@ export function chartBucketLabel(
 
 const recurrenceSublineLabels: Record<Frequency, string> = {
   daily: "Every working day",
-  every_other_day: "Every second working day",
+  every_other_day: "Every other calendar day, excluding non-working due dates",
   weekly: "Once a week",
   semimonthly: "Twice a month",
   monthly: "Once a month",
@@ -255,11 +255,6 @@ export function daysLateLabel(days: number) {
   return `${days} day${days === 1 ? "" : "s"}`;
 }
 
-export function localTodayField() {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-}
-
 function stringParam(value: string | string[] | undefined) {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
@@ -285,17 +280,13 @@ export function parseDashboardSearchParams(
   };
 }
 
-export function parseEmployeeSearchParams(
-  searchParams: Record<string, string | string[] | undefined>,
-): DashboardQueryState {
-  const { tab, unit, date } = parseDashboardSearchParams(searchParams);
-  return { tab, unit, date };
-}
+export type DashboardLinkState = DashboardQueryState & {
+  branch?: string | null;
+  department?: string | null;
+};
 
 /** Canonical query string: only non-default values are written. */
-export function dashboardQueryString(
-  state: DashboardQueryState & { branch?: string | null; department?: string | null },
-) {
+export function dashboardQueryString(state: DashboardLinkState) {
   const params = new URLSearchParams();
   if (state.tab !== "jd") params.set("tab", state.tab);
   if (state.unit !== "month") params.set("unit", state.unit);
@@ -305,12 +296,12 @@ export function dashboardQueryString(
   return params.toString();
 }
 
-export function dashboardHref(state: DashboardQueryState) {
+export function dashboardHref(state: DashboardLinkState) {
   const query = dashboardQueryString(state);
   return `/dashboard${query ? `?${query}` : ""}`;
 }
 
-export function employeeDashboardHref(membershipId: string, state: DashboardQueryState) {
+export function employeeDashboardHref(membershipId: string, state: DashboardLinkState) {
   const query = dashboardQueryString(state);
   return `/dashboard/employees/${encodeURIComponent(membershipId)}${query ? `?${query}` : ""}`;
 }

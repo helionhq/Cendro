@@ -1,19 +1,12 @@
 import type { Id } from "../../../../../../convex/_generated/dataModel";
-import { EmployeeDashboardPage } from "@/components/app/dashboard-pages";
-import { parseEmployeeSearchParams } from "@/components/app/dashboard-format";
+import { Suspense } from "react";
+import { DashboardSkeleton, EmployeeDashboardPage } from "@/components/app/dashboard-pages";
 
-export default async function EmployeeDashboard({
-  params,
-  searchParams,
-}: {
-  params: Promise<{ membershipId: string }>;
-  searchParams: Promise<Record<string, string | string[] | undefined>>;
-}) {
+export default async function EmployeeDashboard({ params }: { params: Promise<{ membershipId: string }> }) {
   const { membershipId } = await params;
   return (
-    <EmployeeDashboardPage
-      membershipId={membershipId as Id<"companyMemberships">}
-      initial={parseEmployeeSearchParams(await searchParams)}
-    />
+    <Suspense fallback={<DashboardSkeleton />}>
+      <EmployeeDashboardPage membershipId={membershipId as Id<"companyMemberships">} />
+    </Suspense>
   );
 }

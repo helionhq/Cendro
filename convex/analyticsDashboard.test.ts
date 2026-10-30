@@ -2,7 +2,7 @@
 
 import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
 import { defaultRoleCapabilities } from "../src/lib/permissions";
@@ -528,6 +528,106 @@ describe("dashboard historical JD cycles", () => {
     // Sep 9–11 elapsed; Sep 9 is a single completed cycle; today is not counted.
     expect(dashboard.jd).toMatchObject({ due: 3, done: 1, missed: 2, waiting: 0, completionRate: 33 });
   });
+
+  test("a pending cycle still counts after the missed-cycle job advances the task floor", { timeout: 15_000 }, async () => {
+    const { t, companyId, adminMembershipId } = await seedBareCompany();
+    const now = Date.now();
+    const today = currentJdCycle("daily", now, undefined);
+    const yesterday = currentJdCycle("daily", now - dayMs, undefined);
+    const jdTaskId = await t.run(async (ctx) => {
+      const id = await ctx.db.insert("jdTasks", {
+        companyId,
+        reference: "JD-PENDING",
+        title: "Waiting daily",
+        recurrence: "daily",
+        cycleStartedAt: yesterday.start,
+        status: "awaiting_confirmation",
+        statusCycleStart: yesterday.start,
+        assigneeMembershipIds: [adminMembershipId],
+        createdByMembershipId: adminMembershipId,
+        createdAt: yesterday.start,
+        updatedAt: yesterday.start,
+      });
+      await ctx.db.insert("taskConfirmationRequests", {
+        companyId,
+        taskType: "jd",
+        taskId: id,
+        cycleStart: yesterday.start,
+        cycleEnd: yesterday.end,
+        recurrence: "daily",
+        confirmerMembershipId: adminMembershipId,
+        submittedByMembershipId: adminMembershipId,
+        submittedAt: yesterday.start + 3_600_000,
+      });
+      return id;
+    });
+    // The writer skips a missed record for the pending cycle but still moves
+    // the task floor past it.
+    await t.mutation(internal.tasks.catchUpMissedJdCycles, { taskId: jdTaskId });
+    const floor = await t.run(async (ctx) => (await ctx.db.get(jdTaskId))!.cycleStartedAt);
+    expect(floor).toBe(today.start);
+
+    const dashboard = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now, period: monthPeriod(now) });
+    expect(dashboard.jd).toMatchObject({ due: 1, done: 0, missed: 0, waiting: 1, completionRate: 0 });
+    expect(dashboard.jd.employees).toMatchObject([{ membershipId: adminMembershipId, due: 1, waiting: 1 }]);
+  });
+
+  test("the upcoming note uses the shifted deadline still open today", { timeout: 15_000 }, async () => {
+    const { t, companyId, adminMembershipId } = await seedBareCompany();
+    await t.run(async (ctx) => {
+      const calendar = await ctx.db.query("companyCalendars").withIndex("by_company", (q) => q.eq("companyId", companyId)).unique();
+      await ctx.db.patch(calendar!._id, { workingDays: [1, 2, 3, 4, 5, 6] });
+      await ctx.db.insert("jdTasks", {
+        companyId,
+        reference: "JD-WEEKLY",
+        title: "Weekly check",
+        recurrence: "weekly",
+        cycleStartedAt: day("2026-08-31"),
+        status: "due",
+        statusCycleStart: day("2026-09-14"),
+        assigneeMembershipIds: [adminMembershipId],
+        createdByMembershipId: adminMembershipId,
+        createdAt: day("2026-08-31"),
+        updatedAt: day("2026-08-31"),
+      });
+    });
+    // Monday morning: last week's Sunday deadline moved to the end of today.
+    const now = day("2026-09-14") + 10 * 3_600_000;
+    vi.setSystemTime(now);
+    const dashboard = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now, period: { unit: "week", date: "2026-09-14" } });
+    const weekly = dashboard.jd.byFrequency.find((row) => row.recurrence === "weekly");
+    expect(weekly?.upcoming).toEqual({ count: 1, dueDate: "2026-09-14" });
+  });
+
+  test("a year report keeps a daily task whose ledger exceeds one read", { timeout: 30_000 }, async () => {
+    const { t, companyId, adminMembershipId } = await seedBareCompany();
+    const firstDay = day("2025-01-01");
+    const stopDay = day("2026-09-16");
+    await t.run(async (ctx) => {
+      const jdTaskId = await ctx.db.insert("jdTasks", {
+        companyId,
+        reference: "JD-DAILY-YEAR",
+        title: "Daily year",
+        recurrence: "daily",
+        cycleStartedAt: firstDay,
+        status: "due",
+        statusCycleStart: stopDay,
+        assigneeMembershipIds: [adminMembershipId],
+        createdByMembershipId: adminMembershipId,
+        createdAt: firstDay,
+        updatedAt: firstDay,
+      });
+      for (let start = firstDay; start < stopDay; start += dayMs) {
+        await ctx.db.insert("jdTaskCompletions", { companyId, jdTaskId, cycleStart: start, cycleEnd: start + dayMs, completedByMembershipId: adminMembershipId, completedAt: start + 3_600_000 });
+      }
+    });
+    const now = Date.now();
+    const dashboard = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now, period: yearPeriod(now) });
+    // Jan 1 – Sep 15 are due in the current year and every one is completed;
+    // the previous year is complete too. One read per period keeps the daily
+    // ledger inside the cap instead of flagging the task truncated and empty.
+    expect(dashboard.jd).toMatchObject({ due: 258, done: 258, missed: 0, completionRate: 100, previousCompletionRate: 100 });
+  });
 });
 
 describe("dashboard period breakdowns", () => {
@@ -607,6 +707,39 @@ describe("dashboard period breakdowns", () => {
     const daily = dashboard.jd.byFrequency.find((row) => row.recurrence === "daily");
     // Yesterday's daily cycle is past its deadline; today's is still upcoming.
     expect(daily).toMatchObject({ jdCount: 1, due: 1, missed: 1, upcoming: { count: 1, dueDate: dateField(now) } });
+  });
+
+  test("a monthly JD completed early counts at its deadline inside the period", { timeout: 15_000 }, async () => {
+    const { t, companyId, adminMembershipId } = await seedBareCompany();
+    const now = Date.now();
+    const month = currentJdCycle("monthly", now, undefined);
+    await t.run(async (ctx) => {
+      const jdTaskId = await ctx.db.insert("jdTasks", {
+        companyId,
+        reference: "JD-0250",
+        title: "Monthly close",
+        recurrence: "monthly",
+        cycleStartedAt: month.start,
+        status: "due",
+        statusCycleStart: month.start,
+        assigneeMembershipIds: [adminMembershipId],
+        createdByMembershipId: adminMembershipId,
+        createdAt: month.start,
+        updatedAt: now,
+      });
+      await ctx.db.insert("jdTaskCompletions", { companyId, jdTaskId, cycleStart: month.start, cycleEnd: month.end, completedByMembershipId: adminMembershipId, completedAt: now });
+    });
+
+    const dashboard = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now, period: monthPeriod(now) });
+    // The deadline is later this month than "today", but finishing it early
+    // still counts it as done inside the selected period.
+    expect(dashboard.jd).toMatchObject({ due: 1, done: 1, missed: 0, waiting: 0, completionRate: 100 });
+    expect(dashboard.jd.byFrequency.find((row) => row.recurrence === "monthly")?.upcoming).toBeNull();
+    const bucketTotals = dashboard.buckets.reduce(
+      (sum, bucket) => ({ due: sum.due + bucket.jd.due, done: sum.done + bucket.jd.done }),
+      { due: 0, done: 0 },
+    );
+    expect(bucketTotals).toEqual({ due: 1, done: 1 });
   });
 
   test("previousCompletionRate compares the month before the selected one", { timeout: 15_000 }, async () => {

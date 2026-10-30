@@ -2,7 +2,7 @@ import { ConvexError, v } from "convex/values";
 import { query, type QueryCtx } from "./_generated/server";
 import { analyticsScopedMembershipIds, assertAnalyticsViewAccess, buildSopVisibilityContext, requireMembership, sopListScopeAuth, taskHasVisibleAssignee, visibleAssigneeMembershipIds, visibleSop } from "./permissions";
 import { currentJdCycle, jdRecurrences, localDateField, localDayIndexAt, nextJdCycleStart, type JdRecurrence } from "./taskCycles";
-import { jdOccurrencesDueBetween, loadWorkCalendar, maxHolidaySpanDays, occurrenceDeadline } from "./workCalendar";
+import { jdOccurrencesDueBetween, effectiveCurrentJdCycle, loadWorkCalendar, maxHolidaySpanDays, occurrenceDeadline } from "./workCalendar";
 import { bucketIndexFor, dashboardPeriodValidator, resolveDashboardPeriod } from "./dashboardTime";
 import type { Doc, Id } from "./_generated/dataModel";
 import { takeWithOverflow } from "./queryLimits";
@@ -24,10 +24,21 @@ const dashboardTakeLimit = 500;
 // instead of a failed query.
 const dashboardReadBudget = 24_000;
 
-// Any JD cycle whose deadline lands inside a dashboard range started at most
-// ~366 days earlier (the longest recurrence is annual), plus slack, plus the
-// longest contiguous holiday span a deadline could have shifted through.
-const jdCompletionLookbackDays = 368 + 7;
+// A cycle's deadline trails its start by at most one recurrence length plus
+// the longest contiguous holiday shift a deadline could have moved through.
+// Reading only that far back covers every completion that could still be due
+// in a window, while keeping a daily ledger inside one bounded read instead of
+// scanning the annual worst case for every task.
+const maxJdCycleDays: Record<JdRecurrence, number> = {
+  daily: 1,
+  every_other_day: 2,
+  weekly: 7,
+  semimonthly: 16,
+  monthly: 31,
+  quarterly: 92,
+  semiannually: 184,
+  annually: 366,
+};
 
 type QueryCompleteness = { isTruncated: boolean; truncatedReads: number; remaining: number };
 
@@ -349,13 +360,14 @@ export const dashboard = query({
 
     const period = resolveDashboardPeriod(args.period, now, timeZone);
     const todayEnd = currentJdCycle("daily", now, timeZone).end - 1;
-    // The window reaches far enough back for the earliest bucket and the
-    // previous period, and never past the end of today: future work has not
-    // happened yet.
+    // The reads reach far enough back for the earliest bucket and the previous
+    // period, and never past the end of today: a stored row only exists for
+    // work that has happened. The item filter below uses the full period bound
+    // for done and waiting work, which can carry a deadline later this period.
     const windowStart = Math.min(period.buckets[0].start, period.previous.start);
     const windowEnd = Math.min(period.end, todayEnd);
     const calendar = await loadWorkCalendar(ctx, args.companyId);
-    const jdCompletionLookbackMs = (jdCompletionLookbackDays + maxHolidaySpanDays(calendar)) * 86_400_000;
+    const holidaySpanDays = maxHolidaySpanDays(calendar);
 
     const [jdTasks, oneTimeTasks] = await Promise.all([
       takeBudgetedRows(
@@ -388,33 +400,60 @@ export const dashboard = query({
         isTruncated: false,
         truncatedReads: 0,
       };
-      const [completions, missed, pending] = await Promise.all([
+      // A cycle's deadline trails its start by at most this task's own
+      // recurrence length plus the holiday shift, so that is the only
+      // backstop these reads need.
+      const cycleLookbackMs = (maxJdCycleDays[task.recurrence] + holidaySpanDays + 1) * 86_400_000;
+      // Read the previous and current periods as separate bounded ranges: one
+      // annual span fits the per-read cap even for a daily ledger, while the
+      // union covers every cycle due in either period. The ranges are disjoint
+      // by cycleStart, so no row is counted twice.
+      const previousFrom = windowStart - cycleLookbackMs;
+      const currentFrom = period.start - cycleLookbackMs;
+      const [previousCompletions, previousMissed, previousPending] = await Promise.all([
         takeBudgetedRows(
           taskPhase,
-          (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", windowStart - jdCompletionLookbackMs).lte("cycleStart", windowEnd)).order("desc").take(limit),
+          (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", previousFrom).lte("cycleStart", currentFrom - 1)).order("desc").take(limit),
         ),
         takeBudgetedRows(
           taskPhase,
-          (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleEnd", (q) => q.eq("jdTaskId", task._id).gte("cycleEnd", windowStart + 1).lte("cycleEnd", windowEnd + 1)).take(limit),
+          (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleEnd", (q) => q.eq("jdTaskId", task._id).gte("cycleEnd", windowStart + 1).lte("cycleEnd", period.start)).order("desc").take(limit),
         ),
         takeBudgetedRows(
           taskPhase,
-          (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", windowStart - jdCompletionLookbackMs).lte("cycleStart", windowEnd)).take(limit),
+          (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", previousFrom).lte("cycleStart", currentFrom - 1)).order("desc").take(limit),
         ),
       ]);
-      ledgersByTask.set(task._id, { completions, missed, pending, truncated: taskPhase.isTruncated });
+      const [currentCompletions, currentMissed, currentPending] = await Promise.all([
+        takeBudgetedRows(
+          taskPhase,
+          (limit) => ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", task._id).gte("cycleStart", currentFrom).lte("cycleStart", windowEnd)).order("desc").take(limit),
+        ),
+        takeBudgetedRows(
+          taskPhase,
+          (limit) => ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleEnd", (q) => q.eq("jdTaskId", task._id).gte("cycleEnd", period.start + 1).lte("cycleEnd", windowEnd + 1)).order("desc").take(limit),
+        ),
+        takeBudgetedRows(
+          taskPhase,
+          (limit) => ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", task._id).gte("cycleStart", currentFrom).lte("cycleStart", windowEnd)).order("desc").take(limit),
+        ),
+      ]);
+      ledgersByTask.set(task._id, {
+        completions: [...previousCompletions, ...currentCompletions],
+        missed: [...previousMissed, ...currentMissed],
+        pending: [...previousPending, ...currentPending],
+        truncated: taskPhase.isTruncated,
+      });
     });
 
     const jdItemGroups = visibleJdTasks.map(({ task, assignees }) => {
       const ledger = ledgersByTask.get(task._id)!;
-      if (ledger.truncated) {
-        completeness.isTruncated = true;
-        return { items: [] as JdItem[], recurrence: task.recurrence, upcomingDeadline: null as number | null };
-      }
+      // Stored rows are individually complete, so a truncated read still
+      // reports what it loaded. Reconstruction needs the whole range instead:
+      // it cannot tell an unrecorded cycle from one whose completion row fell
+      // outside the read, so it must not be allowed to fabricate misses.
+      if (ledger.truncated) completeness.isTruncated = true;
       const { completions, missed, pending } = ledger;
-      // A request from a superseded recurrence is history, not a live hold on
-      // the current grid's cycle.
-      const pendingStarts = new Set(pending.flatMap((request) => request.cycleStart === undefined || request.recurrence !== task.recurrence ? [] : [request.cycleStart]));
 
       const cycles = new Map<string, { start: number; retired: boolean; dueAt: number; completed: boolean; stored: boolean }>();
       // Group rows by grid lifetime as well as start: retired work must not
@@ -433,26 +472,33 @@ export const dashboard = query({
         });
       };
 
-      // A cycle that ends inside the window started at most ~366 days before it
-      // (the longest recurrence is annual), so this lookback covers every
-      // completion that could still be due in the window. Newer completions
-      // record their own cycleEnd; legacy rows fall back to the current grid.
-      // Missed records store their own deadline, so they stay exact across
-      // recurrence and timezone changes; match on that deadline directly.
-      const taskItems: JdItem[] = [];
-      for (const completion of completions) {
-        // Legacy rows predate cycleEnd. When the stored start no longer sits on
-        // the task's grid the recurrence or timezone changed since, so the
-        // reconstructed deadline is unreliable and the recorded completion
-        // time is the only trustworthy instant inside that cycle.
-        const end = completion.cycleEnd ?? (
-          currentJdCycle(task.recurrence, completion.cycleStart, timeZone).start === completion.cycleStart
-            ? nextJdCycleStart(completion.cycleStart, task.recurrence, timeZone)
-            : completion.completedAt + 1
+      // Legacy rows predate cycleEnd. When the stored start no longer sits on
+      // the task's grid the recurrence or timezone changed since, so the
+      // recorded instant is the only trustworthy point inside that cycle.
+      const cycleEndAt = (storedEnd: number | undefined, start: number, fallbackAt: number) =>
+        storedEnd ?? (
+          currentJdCycle(task.recurrence, start, timeZone).start === start
+            ? nextJdCycleStart(start, task.recurrence, timeZone)
+            : fallbackAt + 1
         );
-        put(completion.cycleStart, end - 1, true, true, completion.retiredAt);
+
+      // A request from a superseded recurrence is history, not a live hold on
+      // the current grid's cycle. A live request owns its cycle's dates: the
+      // missed-cycle writer advances the task floor past a pending cycle
+      // without recording it, so the cycle must come from the request row.
+      const pendingStarts = new Set<number>();
+      for (const request of pending) {
+        if (request.cycleStart === undefined || request.recurrence !== task.recurrence) continue;
+        pendingStarts.add(request.cycleStart);
+        put(request.cycleStart, cycleEndAt(request.cycleEnd, request.cycleStart, request.submittedAt) - 1, false, true);
       }
 
+      // Newer completions record their own cycleEnd; legacy rows fall back to
+      // the current grid. Missed records store their own deadline, so they stay
+      // exact across recurrence and timezone changes; match on it directly.
+      for (const completion of completions) {
+        put(completion.cycleStart, cycleEndAt(completion.cycleEnd, completion.cycleStart, completion.completedAt) - 1, true, true, completion.retiredAt);
+      }
       for (const record of missed) {
         put(record.cycleStart, record.cycleEnd - 1, false, true, record.retiredAt);
       }
@@ -460,17 +506,22 @@ export const dashboard = query({
       // Skipped occurrences (non-working due dates on daily/alternate cycles)
       // never enter the ledger; other recurrences report their shifted
       // deadline, matching what the missed-record writer stores.
-      const elapsed = jdOccurrencesDueBetween(calendar, task.recurrence, task.cycleStartedAt, now, windowStart, windowEnd, 200, timeZone);
-      if (elapsed.truncated) completeness.isTruncated = true;
-      for (const cycle of elapsed.occurrences) put(cycle.start, cycle.deadline - 1, false, false);
+      if (!ledger.truncated) {
+        const elapsed = jdOccurrencesDueBetween(calendar, task.recurrence, task.cycleStartedAt, now, windowStart, windowEnd, 200, timeZone);
+        if (elapsed.truncated) completeness.isTruncated = true;
+        for (const cycle of elapsed.occurrences) put(cycle.start, cycle.deadline - 1, false, false);
+      }
 
+      const taskItems: JdItem[] = [];
       const current = currentJdCycle(task.recurrence, now, timeZone);
       const currentDeadline = occurrenceDeadline(calendar, task.recurrence, current.end, timeZone);
       const onCurrentGrid = current.start >= currentJdCycle(task.recurrence, task.cycleStartedAt, timeZone).start;
       if (currentDeadline !== null && onCurrentGrid) put(current.start, currentDeadline - 1, false, false);
 
       for (const cycle of cycles.values()) {
-        if (cycle.start > now || cycle.dueAt < windowStart || cycle.dueAt > windowEnd) continue;
+        // Completed and waiting work counts wherever its deadline falls in the
+        // selected period; unfinished work still ahead of now does not.
+        if (cycle.start > now || cycle.dueAt < windowStart || cycle.dueAt > period.end) continue;
         const completed = cycle.completed || (!cycle.retired && task.status === "completed" && task.statusCycleStart === cycle.start);
         const waiting = !completed && pendingStarts.has(cycle.start);
         // Work counts once it is done, waiting for approval, or past its
@@ -489,13 +540,21 @@ export const dashboard = query({
 
       // A current period also reports work that is due before it closes, so a
       // running month can say "3 JDs due on the 31st" instead of a bare zero.
+      // The open cycle carries a still-pending shifted deadline: on Monday
+      // morning the default calendar's weekly deadline belongs to last week's
+      // grid cycle, not the raw cycle that started that day.
       let upcomingDeadline: number | null = null;
-      if (period.isCurrent && currentDeadline !== null && onCurrentGrid) {
-        const currentCycle = cycles.get(`${current.start}:current`);
-        const currentCompleted = (currentCycle?.completed ?? false) || (currentCycle?.retired !== true && task.status === "completed" && task.statusCycleStart === current.start);
-        const currentWaiting = !currentCompleted && pendingStarts.has(current.start);
-        const deadline = currentDeadline - 1;
-        if (!currentCompleted && !currentWaiting && now <= deadline && deadline <= period.end) upcomingDeadline = deadline;
+      if (period.isCurrent) {
+        const open = effectiveCurrentJdCycle(calendar, task.recurrence, now, timeZone);
+        const openDeadline = occurrenceDeadline(calendar, task.recurrence, open.end, timeZone);
+        const onOpenGrid = open.start >= currentJdCycle(task.recurrence, task.cycleStartedAt, timeZone).start;
+        if (openDeadline !== null && onOpenGrid) {
+          const openCycle = cycles.get(`${open.start}:current`);
+          const openCompleted = (openCycle?.completed ?? false) || (openCycle?.retired !== true && task.status === "completed" && task.statusCycleStart === open.start);
+          const openWaiting = !openCompleted && pendingStarts.has(open.start);
+          const deadline = openDeadline - 1;
+          if (!openCompleted && !openWaiting && now <= deadline && deadline <= period.end) upcomingDeadline = deadline;
+        }
       }
       return { items: taskItems, recurrence: task.recurrence, upcomingDeadline };
     });

@@ -9,7 +9,10 @@ import {
 
 export const dashboardPeriodValidator = v.object({
   unit: v.union(v.literal("week"), v.literal("month"), v.literal("quarter"), v.literal("year")),
-  date: v.string(), // "YYYY-MM-DD", any company-local day inside the wanted period
+  // "YYYY-MM-DD", any company-local day inside the wanted period. Omitted
+  // means the period containing server `now` in the company's time zone, so a
+  // client whose own date has not rolled over still lands on the right month.
+  date: v.optional(v.string()),
 });
 export type DashboardPeriodArg = Infer<typeof dashboardPeriodValidator>;
 export type DashboardUnit = DashboardPeriodArg["unit"];
@@ -47,7 +50,7 @@ export function resolveDashboardPeriod(
   now: number,
   timeZone: string | null | undefined,
 ): DashboardPeriod {
-  const dayStart = customDayStart(timeZone, arg.date);
+  const dayStart = arg.date === undefined ? now : customDayStart(timeZone, arg.date);
   if (dayStart === null) throw new ConvexError("Invalid date.");
 
   const recurrence = unitRecurrence[arg.unit];

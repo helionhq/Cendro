@@ -5,8 +5,8 @@ import { useQuery_experimental } from "convex/react";
 import type { FunctionReturnType } from "convex/server";
 import { ArrowDown, ArrowUp, ChevronLeft, ChevronRight } from "lucide-react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { usePathname, useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../../convex/_generated/api";
 import type { Id } from "../../../convex/_generated/dataModel";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -24,8 +24,8 @@ import {
   employeeDashboardHref,
   frequencySubline,
   heroCaption,
-  localTodayField,
   noneDueNote,
+  parseDashboardSearchParams,
   periodDisplayName,
   periodStepperLabel,
   previousPeriodLabel,
@@ -71,7 +71,8 @@ function Card({ title, caption, children }: { title: string; caption?: string; c
         <span className="text-[13.5px] font-semibold text-[var(--ink)]">{title}</span>
         {caption && <span className="text-right text-[12.5px] text-[var(--ink-muted)]">{caption}</span>}
       </div>
-      <Inset className="px-3.5 py-1.5">{children}</Inset>
+      {/* Tables switch on their own width: the 246px sidebar can leave a 768px viewport too narrow for the wide columns. */}
+      <Inset className="@container px-3.5 py-1.5">{children}</Inset>
     </Frame>
   );
 }
@@ -94,7 +95,7 @@ function MiniBar({ value, className }: { value: number; className?: string }) {
 function CompletionCell({ value }: { value: number }) {
   return (
     <div className="flex items-center gap-2">
-      <MiniBar value={value} className="w-[52px] flex-none sm:w-[170px]" />
+      <MiniBar value={value} className="w-[52px] flex-none @xl:w-[170px]" />
       <span className="w-9 text-right text-[13px] font-semibold tabular-nums text-[var(--ink)]">{value}%</span>
     </div>
   );
@@ -156,19 +157,17 @@ function errorMessage(error: unknown) {
   return "Could not load the dashboard.";
 }
 
-function minDateField(a: string, b: string) {
-  return a < b ? a : b;
-}
-
 function PeriodControl({
   unit,
   period,
+  steppingDisabled,
   onUnitChange,
   onPrevious,
   onNext,
 }: {
   unit: DashboardUnit;
   period: Period;
+  steppingDisabled: boolean;
   onUnitChange: (unit: DashboardUnit) => void;
   onPrevious: () => void;
   onNext: () => void;
@@ -187,7 +186,7 @@ function PeriodControl({
         </TabsList>
       </Tabs>
       <div className="inline-flex h-8 items-center rounded-md border border-[var(--hairline)] bg-[var(--surface)]">
-        <button type="button" aria-label="Previous period" onClick={onPrevious} className={cn(stepButtonClass, "rounded-l-md")}>
+        <button type="button" aria-label="Previous period" onClick={onPrevious} disabled={steppingDisabled} className={cn(stepButtonClass, "rounded-l-md")}>
           <ChevronLeft className="h-3.5 w-3.5" />
         </button>
         <span className="min-w-[148px] whitespace-nowrap px-2 text-center text-[13px] font-medium tabular-nums text-[var(--ink)]">
@@ -197,7 +196,7 @@ function PeriodControl({
           type="button"
           aria-label="Next period"
           onClick={onNext}
-          disabled={period.nextDate === null}
+          disabled={steppingDisabled || period.nextDate === null}
           className={cn(stepButtonClass, "rounded-r-md")}
         >
           <ChevronRight className="h-3.5 w-3.5" />
@@ -308,7 +307,7 @@ function ByFrequencyCard({ rows, showJdCounts, period }: { rows: FrequencyRow[];
   const otherLabels = rows
     .filter((row) => row.due === 0 && row.upcoming === null && row.jdCount > 0)
     .map((row) => recurrenceLabels[row.recurrence]);
-  const grid = "grid grid-cols-[minmax(0,1fr)_56px_112px] items-center gap-2 sm:grid-cols-[minmax(0,1fr)_64px_52px_110px_220px]";
+  const grid = "grid grid-cols-[minmax(0,1fr)_56px_112px] items-center gap-2 @xl:grid-cols-[minmax(0,1fr)_64px_52px_110px_220px]";
   return (
     <Card title="By frequency">
       {shown.length === 0 && otherLabels.length === 0 ? (
@@ -320,8 +319,8 @@ function ByFrequencyCard({ rows, showJdCounts, period }: { rows: FrequencyRow[];
               <div className={cn(grid, "border-b border-[var(--hairline)] pb-2", tableHeadClass)}>
                 <div>Frequency</div>
                 <div className="text-right">Done</div>
-                <div className="hidden text-right sm:block">Missed</div>
-                <div className="hidden text-right sm:block">Waiting for approval</div>
+                <div className="hidden text-right @xl:block">Missed</div>
+                <div className="hidden text-right @xl:block">Waiting for approval</div>
                 <div>Completion</div>
               </div>
               {shown.map((row) => (
@@ -339,13 +338,13 @@ function ByFrequencyCard({ rows, showJdCounts, period }: { rows: FrequencyRow[];
                   </div>
                   <div
                     className={cn(
-                      "hidden text-right tabular-nums sm:block",
+                      "hidden text-right tabular-nums @xl:block",
                       row.due === 0 ? "text-[var(--ink-faint)]" : row.missed > 0 ? "text-[var(--badge-red-fg)]" : "text-[var(--ink-faint)]",
                     )}
                   >
                     {row.due > 0 ? numberFormat.format(row.missed) : "—"}
                   </div>
-                  <div className={cn("hidden text-right tabular-nums sm:block", row.due > 0 ? "text-[var(--ink-secondary)]" : "text-[var(--ink-faint)]")}>
+                  <div className={cn("hidden text-right tabular-nums @xl:block", row.due > 0 ? "text-[var(--ink-secondary)]" : "text-[var(--ink-faint)]")}>
                     {row.due > 0 ? numberFormat.format(row.waiting) : "—"}
                   </div>
                   <div className="min-w-0">
@@ -395,7 +394,7 @@ function EmployeesCard({
   emptyText: string;
   state: DashboardQueryState;
 }) {
-  const grid = "grid grid-cols-[18px_minmax(0,1fr)_56px_92px_12px] items-center gap-2 sm:grid-cols-[18px_minmax(0,1fr)_76px_52px_190px_12px]";
+  const grid = "grid grid-cols-[18px_minmax(0,1fr)_56px_92px_12px] items-center gap-2 @lg:grid-cols-[18px_minmax(0,1fr)_76px_52px_190px_12px]";
   return (
     <Card title="Employees">
       {rows.length === 0 ? (
@@ -406,7 +405,7 @@ function EmployeesCard({
             <div>#</div>
             <div>Employee</div>
             <div className="text-right">{doneLabel}</div>
-            <div className="hidden text-right sm:block">{problemLabel}</div>
+            <div className="hidden text-right @lg:block">{problemLabel}</div>
             <div>Completion</div>
             <div />
           </div>
@@ -428,11 +427,11 @@ function EmployeesCard({
               <span className="text-right text-[var(--ink-secondary)]">
                 {numberFormat.format(row.done)} of {numberFormat.format(row.total)}
               </span>
-              <span className={cn("hidden text-right sm:block", row.problems > 0 ? "text-[var(--badge-red-fg)]" : "text-[var(--ink-faint)]")}>
+              <span className={cn("hidden text-right @lg:block", row.problems > 0 ? "text-[var(--badge-red-fg)]" : "text-[var(--ink-faint)]")}>
                 {numberFormat.format(row.problems)}
               </span>
               <span className="flex items-center gap-2">
-                <MiniBar value={row.completionRate} className="w-12 flex-none sm:w-[140px]" />
+                <MiniBar value={row.completionRate} className="w-12 flex-none @lg:w-[140px]" />
                 <span className="w-9 text-right font-semibold text-[var(--ink)]">{row.completionRate}%</span>
               </span>
               <ChevronRight className="h-3.5 w-3.5 text-[var(--ink-faint)]" aria-hidden="true" />
@@ -445,7 +444,7 @@ function EmployeesCard({
 }
 
 function JdNotDoneCard({ rows }: { rows: JdNotDone[] }) {
-  const grid = "grid grid-cols-[72px_minmax(0,1fr)_120px] items-center gap-2 sm:grid-cols-[92px_minmax(0,1fr)_110px_132px]";
+  const grid = "grid grid-cols-[72px_minmax(0,1fr)_120px] items-center gap-2 @lg:grid-cols-[92px_minmax(0,1fr)_110px_132px]";
   return (
     <Card title="JDs not done">
       {rows.length === 0 ? (
@@ -455,7 +454,7 @@ function JdNotDoneCard({ rows }: { rows: JdNotDone[] }) {
           <div className={cn(grid, "border-b border-[var(--hairline)] pb-2", tableHeadClass)}>
             <div>Due</div>
             <div>Job description</div>
-            <div className="hidden sm:block">Frequency</div>
+            <div className="hidden @lg:block">Frequency</div>
             <div>Status</div>
           </div>
           {rows.map((row) => (
@@ -465,7 +464,7 @@ function JdNotDoneCard({ rows }: { rows: JdNotDone[] }) {
                 <div className="truncate text-[var(--ink)]">{row.title}</div>
                 <div className="truncate text-[11.5px] text-[var(--ink-faint)]">{row.reference}</div>
               </div>
-              <div className="hidden truncate text-[12.5px] text-[var(--ink-secondary)] sm:block">{recurrenceLabels[row.recurrence]}</div>
+              <div className="hidden truncate text-[12.5px] text-[var(--ink-secondary)] @lg:block">{recurrenceLabels[row.recurrence]}</div>
               <div>
                 <StatusPill status={row.status} />
               </div>
@@ -479,7 +478,7 @@ function JdNotDoneCard({ rows }: { rows: JdNotDone[] }) {
 
 function ByPriorityCard({ rows }: { rows: PriorityRow[] }) {
   const assigned = rows.filter((row) => row.assigned > 0);
-  const grid = "grid grid-cols-[minmax(0,1fr)_48px_44px_104px] items-center gap-2 sm:grid-cols-[minmax(0,1fr)_64px_62px_110px_220px]";
+  const grid = "grid grid-cols-[minmax(0,1fr)_48px_44px_104px] items-center gap-2 @xl:grid-cols-[minmax(0,1fr)_64px_62px_110px_220px]";
   return (
     <Card title="By priority">
       {assigned.length === 0 ? (
@@ -490,7 +489,7 @@ function ByPriorityCard({ rows }: { rows: PriorityRow[] }) {
             <div>Priority</div>
             <div className="text-right">Done</div>
             <div className="text-right">Overdue</div>
-            <div className="hidden text-right sm:block">Waiting for approval</div>
+            <div className="hidden text-right @xl:block">Waiting for approval</div>
             <div>Completion</div>
           </div>
           {assigned.map((row) => (
@@ -504,7 +503,7 @@ function ByPriorityCard({ rows }: { rows: PriorityRow[] }) {
               <div className={cn("text-right tabular-nums", row.overdue > 0 ? "text-[var(--badge-red-fg)]" : "text-[var(--ink-faint)]")}>
                 {numberFormat.format(row.overdue)}
               </div>
-              <div className="hidden text-right tabular-nums text-[var(--ink-secondary)] sm:block">{numberFormat.format(row.waiting)}</div>
+              <div className="hidden text-right tabular-nums text-[var(--ink-secondary)] @xl:block">{numberFormat.format(row.waiting)}</div>
               <div className="min-w-0">
                 <CompletionCell value={row.completionRate ?? 0} />
               </div>
@@ -518,7 +517,7 @@ function ByPriorityCard({ rows }: { rows: PriorityRow[] }) {
 
 function OverdueTasksCard({ rows }: { rows: TaskNotDone[] }) {
   const overdue = rows.filter((row) => row.status === "overdue");
-  const grid = "grid grid-cols-[minmax(0,1fr)_56px_72px] items-center gap-2 sm:grid-cols-[minmax(0,1fr)_120px_96px_70px_84px]";
+  const grid = "grid grid-cols-[minmax(0,1fr)_56px_72px] items-center gap-2 @lg:grid-cols-[minmax(0,1fr)_120px_96px_70px_84px]";
   return (
     <Card title="Overdue tasks">
       {overdue.length === 0 ? (
@@ -527,8 +526,8 @@ function OverdueTasksCard({ rows }: { rows: TaskNotDone[] }) {
         <>
           <div className={cn(grid, "border-b border-[var(--hairline)] pb-2", tableHeadClass)}>
             <div>Task</div>
-            <div className="hidden sm:block">Assigned to</div>
-            <div className="hidden sm:block">Was due</div>
+            <div className="hidden @lg:block">Assigned to</div>
+            <div className="hidden @lg:block">Was due</div>
             <div className="text-right">Late by</div>
             <div>Priority</div>
           </div>
@@ -538,10 +537,10 @@ function OverdueTasksCard({ rows }: { rows: TaskNotDone[] }) {
                 <div className="truncate text-[var(--ink)]">{row.title}</div>
                 <div className="truncate text-[11.5px] text-[var(--ink-faint)]">{row.reference}</div>
               </div>
-              <div className="hidden truncate text-[12.5px] text-[var(--ink-secondary)] sm:block">
+              <div className="hidden truncate text-[12.5px] text-[var(--ink-secondary)] @lg:block">
                 {row.assignees.length > 0 ? row.assignees.join(", ") : "—"}
               </div>
-              <div className="hidden whitespace-nowrap text-[12.5px] text-[var(--ink-secondary)] sm:block">
+              <div className="hidden whitespace-nowrap text-[12.5px] text-[var(--ink-secondary)] @lg:block">
                 {row.dueDate ? weekdayDayMonth(row.dueDate) : "—"}
               </div>
               <div className="text-right text-[12.5px] text-[var(--badge-red-fg)]">
@@ -559,7 +558,7 @@ function OverdueTasksCard({ rows }: { rows: TaskNotDone[] }) {
 }
 
 function TasksNotDoneCard({ rows }: { rows: TaskNotDone[] }) {
-  const grid = "grid grid-cols-[minmax(0,1fr)_48px_124px] items-center gap-2 sm:grid-cols-[minmax(0,1fr)_96px_72px_80px_140px]";
+  const grid = "grid grid-cols-[minmax(0,1fr)_48px_124px] items-center gap-2 @xl:grid-cols-[minmax(0,1fr)_96px_72px_80px_140px]";
   return (
     <Card title="Tasks not done">
       {rows.length === 0 ? (
@@ -568,9 +567,9 @@ function TasksNotDoneCard({ rows }: { rows: TaskNotDone[] }) {
         <>
           <div className={cn(grid, "border-b border-[var(--hairline)] pb-2", tableHeadClass)}>
             <div>Task</div>
-            <div className="hidden sm:block">Was due</div>
+            <div className="hidden @xl:block">Was due</div>
             <div className="text-right">Late by</div>
-            <div className="hidden sm:block">Priority</div>
+            <div className="hidden @xl:block">Priority</div>
             <div>Status</div>
           </div>
           {rows.map((row) => (
@@ -578,17 +577,17 @@ function TasksNotDoneCard({ rows }: { rows: TaskNotDone[] }) {
               <div className="min-w-0">
                 <div className="truncate text-[var(--ink)]">{row.title}</div>
                 <div className="truncate text-[11.5px] text-[var(--ink-faint)]">{row.reference}</div>
-                <div className="mt-1 sm:hidden">
+                <div className="mt-1 @xl:hidden">
                   <PriorityPill priority={row.priority} />
                 </div>
               </div>
-              <div className="hidden whitespace-nowrap text-[12.5px] text-[var(--ink-secondary)] sm:block">
+              <div className="hidden whitespace-nowrap text-[12.5px] text-[var(--ink-secondary)] @xl:block">
                 {row.dueDate ? weekdayDayMonth(row.dueDate) : "—"}
               </div>
               <div className={cn("text-right text-[12.5px]", row.status === "overdue" ? "text-[var(--badge-red-fg)]" : "text-[var(--ink-faint)]")}>
                 {row.daysLate === null ? "—" : daysLateLabel(row.daysLate)}
               </div>
-              <div className="hidden sm:block">
+              <div className="hidden @xl:block">
                 <PriorityPill priority={row.priority} />
               </div>
               <div>
@@ -608,7 +607,7 @@ function EmployeeHeader({
   actions,
 }: {
   data: DashboardData;
-  state: DashboardQueryState;
+  state: DashboardSearchState;
   actions: React.ReactNode;
 }) {
   const name = data.employee?.name ?? "Employee";
@@ -647,6 +646,7 @@ const tabTriggerClass =
 type ViewBase = {
   data: DashboardData;
   pending: boolean;
+  steppingDisabled: boolean;
   tab: DashboardTab;
   unit: DashboardUnit;
   date: string | null;
@@ -666,12 +666,15 @@ type DashboardViewProps = ViewBase &
         onBranchChange: (branchId: Id<"branches"> | null) => void;
         onDepartmentChange: (departmentId: Id<"departments"> | null) => void;
       }
-    | { mode: "employee" }
+    | { mode: "employee"; returnBranch: string | null; returnDepartment: string | null }
   );
 
 function DashboardView(props: DashboardViewProps) {
-  const { data, pending, tab, unit, date, onTabChange, onUnitChange, onPrevious, onNext } = props;
-  const state: DashboardQueryState = { tab, unit, date };
+  const { data, pending, steppingDisabled, tab, unit, date, onTabChange, onUnitChange, onPrevious, onNext } = props;
+  const linkState: DashboardSearchState =
+    props.mode === "dashboard"
+      ? { tab, unit, date, branch: props.branchId, department: props.departmentId }
+      : { tab, unit, date, branch: props.returnBranch, department: props.returnDepartment };
   const filters = props.mode === "dashboard" ? props.filters : null;
   const filterOptions = props.mode === "dashboard" && data.scope === "team" ? filters : null;
   const personView = props.mode === "employee" || data.scope === "self";
@@ -684,13 +687,20 @@ function DashboardView(props: DashboardViewProps) {
   const truncated = data.isTruncated || (props.mode === "dashboard" && Boolean(props.filters?.isTruncated));
 
   const periodControl = (
-    <PeriodControl unit={unit} period={data.period} onUnitChange={onUnitChange} onPrevious={onPrevious} onNext={onNext} />
+    <PeriodControl
+      unit={unit}
+      period={data.period}
+      steppingDisabled={steppingDisabled}
+      onUnitChange={onUnitChange}
+      onPrevious={onPrevious}
+      onNext={onNext}
+    />
   );
 
   return (
-    <div className="app-page">
+    <div className="app-page @container">
       {props.mode === "employee" ? (
-        <EmployeeHeader data={data} state={state} actions={periodControl} />
+        <EmployeeHeader data={data} state={linkState} actions={periodControl} />
       ) : (
         <PageHeader
           title="Dashboard"
@@ -752,7 +762,7 @@ function DashboardView(props: DashboardViewProps) {
             </p>
           )}
           <TabsContent value="jd" className="mt-5 space-y-4 outline-none">
-            <div className="grid gap-4 md:grid-cols-[330px_minmax(0,1fr)]">
+            <div className="grid gap-4 @3xl:grid-cols-[330px_minmax(0,1fr)]">
               <HeroCard mode="jd" data={data} />
               <ChartCard mode="jd" data={data} />
             </div>
@@ -765,12 +775,12 @@ function DashboardView(props: DashboardViewProps) {
                 doneLabel="JDs done"
                 problemLabel="Missed"
                 emptyText="No JDs were due for anyone in this period."
-                state={state}
+                state={linkState}
               />
             )}
           </TabsContent>
           <TabsContent value="tasks" className="mt-5 space-y-4 outline-none">
-            <div className="grid gap-4 md:grid-cols-[330px_minmax(0,1fr)]">
+            <div className="grid gap-4 @3xl:grid-cols-[330px_minmax(0,1fr)]">
               <HeroCard mode="tasks" data={data} />
               <ChartCard mode="tasks" data={data} />
             </div>
@@ -785,7 +795,7 @@ function DashboardView(props: DashboardViewProps) {
                   doneLabel="Tasks done"
                   problemLabel="Overdue"
                   emptyText="No tasks were assigned to anyone in this period."
-                  state={state}
+                  state={linkState}
                 />
               </>
             )}
@@ -796,13 +806,13 @@ function DashboardView(props: DashboardViewProps) {
   );
 }
 
-function DashboardSkeleton() {
+export function DashboardSkeleton() {
   const block = "animate-pulse rounded-xl bg-[var(--surface-muted)]";
   return (
-    <div className="app-page">
+    <div className="app-page @container">
       <div className={cn(block, "mb-5 h-8 w-44")} />
       <div className={cn(block, "mb-5 h-9 w-full max-w-md")} />
-      <div className="grid gap-4 md:grid-cols-[330px_minmax(0,1fr)]">
+      <div className="grid gap-4 @3xl:grid-cols-[330px_minmax(0,1fr)]">
         <div className={cn(block, "h-[300px]")} />
         <div className={cn(block, "h-[300px]")} />
       </div>
@@ -816,7 +826,7 @@ type DashboardQueryOptions = {
   companyId: Id<"companies"> | null;
   now: number;
   unit: DashboardUnit;
-  date: string;
+  date: string | null;
   branchId: string | null;
   departmentId: string | null;
   membershipId?: Id<"companyMemberships">;
@@ -860,14 +870,14 @@ function useDashboardData({
       ? (departmentId as Id<"departments">)
       : undefined;
 
-  const cacheKey = `${companyId ?? ""}|${unit}|${date}|${validBranchId ?? ""}|${validDepartmentId ?? ""}|${membershipId ?? ""}`;
+  const cacheKey = `${companyId ?? ""}|${unit}|${date ?? ""}|${validBranchId ?? ""}|${validDepartmentId ?? ""}|${membershipId ?? ""}`;
   const result = useQuery_experimental({
     query: api.analytics.dashboard,
     args: companyId
       ? {
           companyId,
           now,
-          period: { unit, date },
+          period: date ? { unit, date } : { unit },
           branchId: validBranchId,
           departmentId: validDepartmentId,
           membershipId,
@@ -890,7 +900,11 @@ function useDashboardData({
   const viewFilters = filtersData ?? (cachedFilters?.companyId === companyId ? cachedFilters.filters : null);
   const cachedData = dataCache.get(cacheKey);
   const lastData = last?.companyId === companyId && last.membershipId === (membershipId ?? null) ? last.data : null;
-  const viewData = liveData ?? cachedData ?? lastData;
+  // The requested selection is served from the live result or the cache for
+  // its key; the last successful result is only a placeholder for another
+  // selection while the new one loads.
+  const requestedData = liveData ?? cachedData;
+  const viewData = requestedData ?? lastData;
 
   const filtersError = withFilters && filtersResult.status === "error" ? filtersResult.error : null;
   const queryError = filtersError ?? (result.status === "error" ? result.error : null);
@@ -902,36 +916,63 @@ function useDashboardData({
     departmentId: validDepartmentId ?? null,
     data: viewData,
     pending,
+    stale: requestedData === null,
     error: queryError,
   };
 }
 
-function useUrlState(pathname: string, state: DashboardQueryState & { branch?: string | null; department?: string | null }) {
-  const { tab, unit, date, branch, department } = state;
-  useEffect(() => {
-    const query = dashboardQueryString({ tab, unit, date, branch, department });
-    window.history.replaceState(null, "", `${pathname}${query ? `?${query}` : ""}`);
-  }, [pathname, tab, unit, date, branch, department]);
+/**
+ * The URL is the single source of truth for the dashboard selection, so a
+ * same-page navigation (for example the sidebar's Dashboard link) updates the
+ * report even when this component stays mounted.
+ */
+function useDashboardState() {
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const state = useMemo(
+    () => parseDashboardSearchParams(Object.fromEntries(searchParams.entries())),
+    [searchParams],
+  );
+  const navigate = useCallback(
+    (patch: Partial<DashboardSearchState>) => {
+      const query = dashboardQueryString({ ...state, ...patch });
+      window.history.replaceState(null, "", `${pathname}${query ? `?${query}` : ""}`);
+    },
+    [pathname, state],
+  );
+  return { state, navigate };
 }
 
-function usePeriodState(initial: DashboardQueryState) {
-  const [tab, setTab] = useState<DashboardTab>(initial.tab);
-  const [unit, setUnit] = useState<DashboardUnit>(initial.unit);
-  const [date, setDate] = useState<string | null>(initial.date);
-  const [clientToday] = useState(localTodayField);
-  // Navigation steps from the loaded period: the server owns period
-  // boundaries, so the client never computes week or month edges itself.
-  const navigation = (data: DashboardData) => ({
-    onUnitChange: (next: DashboardUnit) => {
-      setDate(minDateField(data.period.endDate, data.today));
-      setUnit(next);
+/**
+ * A period step reads the neighbouring period from the loaded report, so only
+ * one step may be in flight. The buttons' disabled state updates after the
+ * router transition commits, so a synchronous lock also ignores a click that
+ * lands in that gap. The lock releases once the requested selection changes.
+ */
+function usePeriodStep(
+  navigate: (patch: Partial<DashboardSearchState>) => void,
+  selection: Pick<DashboardSearchState, "unit" | "date">,
+) {
+  const waiting = useRef(false);
+  const { unit, date } = selection;
+  useEffect(() => {
+    waiting.current = false;
+  }, [unit, date]);
+  return useCallback(
+    (nextDate: string | null) => {
+      if (!nextDate || waiting.current) return;
+      waiting.current = true;
+      navigate({ date: nextDate });
     },
-    onPrevious: () => setDate(data.period.previousDate),
-    onNext: () => {
-      if (data.period.nextDate) setDate(data.period.nextDate);
-    },
-  });
-  return { tab, setTab, unit, date, selectedDate: date ?? clientToday, navigation };
+    [navigate],
+  );
+}
+
+// A selected period hands its most recent day to the new unit; an omitted
+// date stays omitted so the server keeps resolving the live current period.
+function unitChangeDate(data: DashboardData, date: string | null) {
+  if (date === null) return null;
+  return data.period.endDate < data.today ? data.period.endDate : data.today;
 }
 
 function blockedScreen(active: ReturnType<typeof useCompany>["active"], error: unknown) {
@@ -953,107 +994,106 @@ function blockedScreen(active: ReturnType<typeof useCompany>["active"], error: u
   return null;
 }
 
-export function DashboardPage({ initial }: { initial: DashboardSearchState }) {
+export function DashboardPage() {
   const { activeCompanyId, active } = useCompany();
   const now = useRoundedNow();
-  const pathname = usePathname();
-  const { tab, setTab, unit, date, selectedDate, navigation } = usePeriodState(initial);
-  const [branchId, setBranchId] = useState<string | null>(initial.branch);
-  const [departmentId, setDepartmentId] = useState<string | null>(initial.department);
+  const { state, navigate } = useDashboardState();
+  const { tab, unit, date, branch, department } = state;
   const previousCompany = useRef<Id<"companies"> | null>(activeCompanyId);
 
   useEffect(() => {
     const previous = previousCompany.current;
     previousCompany.current = activeCompanyId;
-    if (previous !== null && activeCompanyId !== null && previous !== activeCompanyId) {
-      setBranchId(null);
-      setDepartmentId(null);
+    if (previous !== null && activeCompanyId !== null && previous !== activeCompanyId && (branch || department)) {
+      navigate({ branch: null, department: null });
     }
-  }, [activeCompanyId]);
-
-  useUrlState(pathname, { tab, unit, date, branch: branchId, department: departmentId });
+  }, [activeCompanyId, branch, department, navigate]);
 
   const query = useDashboardData({
     companyId: activeCompanyId,
     now,
     unit,
-    date: selectedDate,
-    branchId,
-    departmentId,
+    date,
+    branchId: branch,
+    departmentId: department,
     withFilters: true,
   });
+  const step = usePeriodStep(navigate, state);
 
   const blocked = blockedScreen(active, query.error);
   if (blocked) return blocked;
-  if (!query.data || (query.data.scope === "team" && !query.filters)) return <DashboardSkeleton />;
+  const data = query.data;
+  if (!data || (data.scope === "team" && !query.filters)) return <DashboardSkeleton />;
 
   function handleBranchChange(next: Id<"branches"> | null) {
-    setBranchId(next);
-    if (next && query.filters) {
-      if (departmentId && !query.filters.departments.some((department) => department._id === departmentId && department.branchId === next)) {
-        setDepartmentId(null);
-      }
-    }
+    const keepDepartment =
+      next === null ||
+      department === null ||
+      !query.filters ||
+      query.filters.departments.some((option) => option._id === department && option.branchId === next);
+    navigate({ branch: next, department: keepDepartment ? department : null });
   }
 
   return (
     <DashboardView
       mode="dashboard"
-      data={query.data}
+      data={data}
       pending={query.pending}
+      steppingDisabled={query.stale}
       filters={query.filters}
       tab={tab}
       unit={unit}
       date={date}
       branchId={query.branchId}
       departmentId={query.departmentId}
-      onTabChange={setTab}
-      {...navigation(query.data)}
+      onTabChange={(tab) => navigate({ tab })}
+      onUnitChange={(unit) => navigate({ unit, date: unitChangeDate(data, date) })}
+      onPrevious={() => step(data.period.previousDate)}
+      onNext={() => step(data.period.nextDate)}
       onBranchChange={handleBranchChange}
-      onDepartmentChange={setDepartmentId}
+      onDepartmentChange={(departmentId) => navigate({ department: departmentId })}
     />
   );
 }
 
-export function EmployeeDashboardPage({
-  membershipId,
-  initial,
-}: {
-  membershipId: Id<"companyMemberships">;
-  initial: DashboardQueryState;
-}) {
+export function EmployeeDashboardPage({ membershipId }: { membershipId: Id<"companyMemberships"> }) {
   const { activeCompanyId, active } = useCompany();
   const now = useRoundedNow();
-  const pathname = usePathname();
-  const { tab, setTab, unit, date, selectedDate, navigation } = usePeriodState(initial);
-
-  useUrlState(pathname, { tab, unit, date });
+  const { state, navigate } = useDashboardState();
+  const { tab, unit, date, branch, department } = state;
 
   const query = useDashboardData({
     companyId: activeCompanyId,
     now,
     unit,
-    date: selectedDate,
+    date,
     branchId: null,
     departmentId: null,
     membershipId,
     withFilters: false,
   });
+  const step = usePeriodStep(navigate, state);
 
   const blocked = blockedScreen(active, query.error);
   if (blocked) return blocked;
-  if (!query.data) return <DashboardSkeleton />;
+  const data = query.data;
+  if (!data) return <DashboardSkeleton />;
 
   return (
     <DashboardView
       mode="employee"
-      data={query.data}
+      data={data}
       pending={query.pending}
+      steppingDisabled={query.stale}
       tab={tab}
       unit={unit}
       date={date}
-      onTabChange={setTab}
-      {...navigation(query.data)}
+      returnBranch={branch}
+      returnDepartment={department}
+      onTabChange={(tab) => navigate({ tab })}
+      onUnitChange={(unit) => navigate({ unit, date: unitChangeDate(data, date) })}
+      onPrevious={() => step(data.period.previousDate)}
+      onNext={() => step(data.period.nextDate)}
     />
   );
 }
