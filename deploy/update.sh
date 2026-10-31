@@ -21,6 +21,18 @@ previous_image="$(docker inspect --format '{{.Image}}' cendro-web 2>/dev/null ||
 
 docker compose pull --quiet web
 
+# Browsers connect directly to the Convex URL baked into the image, and Caddy
+# relays the backup route to NEXT_PUBLIC_CONVEX_URL in .env. A mismatch would
+# send sessions to another backend. Images built before the label skip this.
+baked_convex="$(docker image inspect --format '{{index .Config.Labels "im.cendro.convex-url"}}' "$(docker compose config --images web)")"
+relay_convex="$(sed -n 's/^NEXT_PUBLIC_CONVEX_URL=//p' .env)"
+if [ -n "$baked_convex" ] && [ "$baked_convex" != "$relay_convex" ]; then
+  echo "cendro update refused: image Convex URL $baked_convex differs from .env $relay_convex" >&2
+  install -d -m 0755 /var/lib/cendro
+  touch "$HOLD"
+  exit 1
+fi
+
 if ! docker compose up -d --wait --wait-timeout 180 --remove-orphans web; then
   echo "cendro update failed: the new web image did not become healthy" >&2
   # Create the hold before restoring so a failed restore cannot leave the timer

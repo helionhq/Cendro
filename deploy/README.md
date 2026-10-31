@@ -255,7 +255,8 @@ docker system df
   `journalctl -u cendro-update`.
 - **Update failed and the timer stopped** — a new image that never becomes
   healthy is rolled back to the previous image, and
-  `/var/lib/cendro/update-hold` is created. The hold survives reboots, so the
+  `/var/lib/cendro/update-hold` is created. An image whose baked Convex URL
+  differs from `.env` is refused with the same hold, before it starts. The hold survives reboots, so the
   timer does not retry the bad release every minute. Inspect
   `journalctl -u cendro-update`, fix the release, then
   `sudo rm /var/lib/cendro/update-hold` and `sudo systemctl start

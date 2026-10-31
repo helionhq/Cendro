@@ -29,6 +29,11 @@ RUN npm run build
 FROM node:24-bookworm-slim AS runner
 WORKDIR /app
 
+# deploy/update.sh refuses an image whose baked Convex URL differs from the
+# Caddy relay's upstream in deploy/.env.
+ARG NEXT_PUBLIC_CONVEX_URL
+LABEL im.cendro.convex-url=$NEXT_PUBLIC_CONVEX_URL
+
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     PORT=3000 \
