@@ -81,4 +81,14 @@ export function registerJdReportTriggers(triggers: Triggers<DataModel>) {
   triggers.register("companies", async (ctx, change) => {
     if (change.oldDoc && change.newDoc && change.oldDoc.timeZone !== change.newDoc.timeZone) pending(ctx).companies.add(change.id);
   });
+  // Calendar edits move the deadline of a legacy completion stamp, so the
+  // company's whole report is rebuilt.
+  triggers.register("companyCalendars", async (ctx, change) => {
+    const row = change.newDoc ?? change.oldDoc;
+    if (row) pending(ctx).companies.add(row.companyId);
+  });
+  triggers.register("companyHolidays", async (ctx, change) => {
+    const row = change.newDoc ?? change.oldDoc;
+    if (row) pending(ctx).companies.add(row.companyId);
+  });
 }

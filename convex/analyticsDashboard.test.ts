@@ -7,7 +7,7 @@ import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
 import { defaultRoleCapabilities } from "../src/lib/permissions";
 import { currentJdCycle, defaultTimeZone, previousJdCycleStart } from "./taskCycles";
-import { rebuildJdTaskReport } from "./jdReport";
+import { rebuildJdTaskReportPage } from "./jdReport";
 
 const modules = import.meta.glob("./**/*.ts");
 const dayMs = 86_400_000;
@@ -43,9 +43,15 @@ function identity(key: string, email = `${key}@example.com`) {
 // Seeding through t.run skips the mutation triggers that keep the JD report
 // totals current, so rebuild them from the ledger as the backfill does.
 async function syncJdReport(t: TestConvex<typeof schema>) {
-  await t.run(async (ctx) => {
-    for (const task of await ctx.db.query("jdTasks").collect()) await rebuildJdTaskReport(ctx, task._id);
-  });
+  const jdTaskIds = await t.run(async (ctx) => (await ctx.db.query("jdTasks").collect()).map((task) => task._id));
+  for (const jdTaskId of jdTaskIds) {
+    let cursor: number | undefined;
+    for (;;) {
+      const next: number | null = await t.run((ctx) => rebuildJdTaskReportPage(ctx, jdTaskId, cursor));
+      if (next === null) break;
+      cursor = next;
+    }
+  }
 }
 
 // Report work too large for the writing transaction, such as a company-wide
@@ -765,6 +771,80 @@ describe("dashboard historical JD cycles", () => {
     // A refresh queued before the change still carries New York's month key.
     await t.mutation(internal.jdReport.refreshMonthsLater, { months: [{ jdTaskId, monthStart: currentJdCycle("monthly", cycleEnd - dayMs, "America/New_York").start }] });
     expect([await doneIn("2026-08-15"), await doneIn("2026-09-15")]).toEqual([0, 1]);
+  });
+
+  test("a holiday edit moves a legacy completion stamp to its new month", { timeout: 15_000 }, async () => {
+    const { t, companyId, adminMembershipId } = await seedBareCompany();
+    // Monday Aug 24 → Monday Aug 31, completed by its stamp only. Its Sunday
+    // Aug 30 deadline starts in August; a Sunday–Monday closure moves it past
+    // the month boundary into September.
+    const now = Date.UTC(2026, 8, 2, 12);
+    vi.setSystemTime(now);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(companyId, { timeZone: "UTC" });
+      await ctx.db.insert("jdTasks", {
+        companyId,
+        reference: "JD-STAMP",
+        title: "Legacy stamp",
+        recurrence: "weekly",
+        cycleStartedAt: Date.UTC(2026, 7, 24),
+        status: "completed",
+        statusCycleStart: Date.UTC(2026, 7, 24),
+        assigneeMembershipIds: [adminMembershipId],
+        createdByMembershipId: adminMembershipId,
+        createdAt: Date.UTC(2026, 7, 24),
+        updatedAt: Date.UTC(2026, 7, 24),
+      });
+    });
+    await syncJdReport(t);
+    const admin = t.withIdentity(identity("admin"));
+    const doneIn = async (date: string) => (await admin.query(api.analytics.dashboard, { companyId, now, period: { unit: "month", date } })).jd.done;
+    expect([await doneIn("2026-08-15"), await doneIn("2026-09-15")]).toEqual([1, 0]);
+
+    await admin.mutation(api.workCalendar.addHoliday, { companyId, name: "Closure", startDate: "2026-08-30", endDate: "2026-08-31" });
+    await refreshJdReport(t);
+    expect([await doneIn("2026-08-15"), await doneIn("2026-09-15")]).toEqual([0, 1]);
+  });
+
+  test("a rebuild spanning several month pages keeps every stored total", { timeout: 30_000 }, async () => {
+    const { t, companyId, adminMembershipId } = await seedBareCompany();
+    await t.run(async (ctx) => {
+      await ctx.db.patch(companyId, { timeZone: "UTC" });
+      const jdTaskId = await ctx.db.insert("jdTasks", {
+        companyId,
+        reference: "JD-LONG",
+        title: "Long history",
+        recurrence: "monthly",
+        cycleStartedAt: Date.UTC(2025, 7, 1),
+        status: "due",
+        statusCycleStart: Date.UTC(2026, 7, 1),
+        assigneeMembershipIds: [adminMembershipId],
+        createdByMembershipId: adminMembershipId,
+        createdAt: Date.UTC(2025, 7, 1),
+        updatedAt: Date.UTC(2025, 7, 1),
+      });
+      // Thirteen months take three rebuild pages; every cycle is completed.
+      for (let month = 0; month < 13; month++) {
+        const start = Date.UTC(2025, 7 + month, 1);
+        await ctx.db.insert("jdTaskCompletions", { companyId, jdTaskId, cycleStart: start, cycleEnd: Date.UTC(2025, 8 + month, 1), completedByMembershipId: adminMembershipId, completedAt: start + 3_600_000 });
+      }
+    });
+
+    await t.mutation(internal.jdReport.rebuildCompany, { companyId });
+    await t.finishAllScheduledFunctions(() => vi.advanceTimersByTime(0));
+
+    const admin = t.withIdentity(identity("admin"));
+    const now = Date.now();
+    const current = await admin.query(api.analytics.dashboard, { companyId, now, period: yearPeriod(now) });
+    // Aug–Dec 2025 is the previous year; Jan–Aug 2026 is this year.
+    expect(current.jd).toMatchObject({ due: 8, done: 8, missed: 0, completionRate: 100, previousCompletionRate: 100 });
+    expect((await admin.query(api.analytics.dashboard, { companyId, now, period: yearPeriod(Date.UTC(2025, 8, 16, 12)) })).jd).toMatchObject({ due: 5, done: 5, completionRate: 100 });
+
+    // Rebuilding again lands on the same merge after removing what the first
+    // run stored.
+    await t.mutation(internal.jdReport.rebuildCompany, { companyId });
+    await t.finishAllScheduledFunctions(() => vi.advanceTimersByTime(0));
+    expect((await admin.query(api.analytics.dashboard, { companyId, now, period: yearPeriod(now) })).jd).toMatchObject({ due: 8, done: 8, missed: 0, completionRate: 100, previousCompletionRate: 100 });
   });
 });
 

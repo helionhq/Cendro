@@ -14,9 +14,9 @@ import { loadWorkCalendar, occurrenceDeadline } from "./workCalendar";
  * task's assignee set. Refreshes recompute one task's cycles starting in one
  * month straight from the ledger and swap the old contribution for the new,
  * so the totals always equal a fresh merge no matter which write changed
- * what. jdReportTriggers.ts notes every write to the ledger, the task, or the
- * company time zone, and functions.ts applies them before the writing
- * mutation commits.
+ * what. jdReportTriggers.ts notes every write to the ledger, the task, the
+ * company time zone, or its work calendar, and functions.ts applies them
+ * before the writing mutation commits.
  *
  * The one input the totals do not cover is time: an elapsed cycle nobody
  * recorded yet. The hourly missed-cycle job records those, and until it runs
@@ -37,6 +37,11 @@ type JdReportMonthCount = Doc<"jdReportTaskMonths">["counts"][number];
 // rather than storing a partial count.
 const ledgerMonthLimit = 2_000;
 const rebuildPageSize = 4;
+// A rebuild refreshes this many months per transaction. A company page covers
+// rebuildPageSize tasks, so even when every one continues that is about the
+// inline month-refresh budget below; each month costs a few dozen ledger
+// reads, and the first page also removes the task's stored contributions.
+const rebuildMonthsPerPage = 6;
 
 /**
  * Merges one task's stored ledger rows into one outcome per cycle. Callers
@@ -219,20 +224,32 @@ async function refreshTaskMonth(ctx: MutationCtx, jdTaskId: Id<"jdTasks">, month
   }
 }
 
-/**
- * Recomputes every month of one task's report. Existing contributions are
- * removed first rather than refreshed: after a time-zone change their month
- * keys no longer match the ledger's month boundaries.
- */
-export async function rebuildJdTaskReport(ctx: MutationCtx, jdTaskId: Id<"jdTasks">) {
+async function removeTaskContributions(ctx: MutationCtx, jdTaskId: Id<"jdTasks">) {
   const previous = await ctx.db.query("jdReportTaskMonths").withIndex("by_jdTaskId_and_monthStart", (q) => q.eq("jdTaskId", jdTaskId)).take(ledgerMonthLimit);
   for (const contribution of previous) {
     await addToTotals(ctx, contribution.companyId, contribution.assigneeMembershipIds, contribution.counts, -1);
     await ctx.db.delete(contribution._id);
   }
+}
+
+/**
+ * Rebuilds one bounded page of a task's report, returning the next month to
+ * refresh or null when its history is done. The first page also removes the
+ * task's existing contributions first rather than refreshing them: after a
+ * time-zone change their month keys no longer match the ledger's month
+ * boundaries, and refreshTaskMonth skips misaligned keys instead of replacing
+ * stale rows.
+ */
+export async function rebuildJdTaskReportPage(ctx: MutationCtx, jdTaskId: Id<"jdTasks">, cursor?: number): Promise<number | null> {
+  if (cursor === undefined) await removeTaskContributions(ctx, jdTaskId);
   const task = await ctx.db.get(jdTaskId);
-  if (!task || task.pausedAt !== undefined) return;
+  // Paused and deleted tasks keep no contribution. A rebuild queued by the
+  // pause or delete trigger removes it on its own first page.
+  if (!task || task.pausedAt !== undefined) return null;
   const timeZone = await companyTimeZone(ctx, task.companyId);
+  // Recompute the range each page so the cursor stays one month; ledger rows
+  // written mid-rebuild are refreshed by their own triggers and can only
+  // extend it.
   const ends = await Promise.all((["asc", "desc"] as const).flatMap((order) => [
     ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", jdTaskId)).order(order).first(),
     ctx.db.query("jdTaskCycleRecords").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", jdTaskId)).order(order).first(),
@@ -240,16 +257,19 @@ export async function rebuildJdTaskReport(ctx: MutationCtx, jdTaskId: Id<"jdTask
   ]));
   const starts = ends.flatMap((row) => (row?.cycleStart === undefined ? [] : [row.cycleStart]));
   if (task.status === "completed" && task.statusCycleStart !== undefined) starts.push(task.statusCycleStart);
-  if (starts.length === 0) return;
+  if (starts.length === 0) return null;
   const last = Math.max(...starts);
-  for (let monthStart = currentJdCycle("monthly", Math.min(...starts), timeZone).start; monthStart <= last; monthStart = nextJdCycleStart(monthStart, "monthly", timeZone)) {
+  let monthStart = cursor ?? currentJdCycle("monthly", Math.min(...starts), timeZone).start;
+  for (let refreshed = 0; refreshed < rebuildMonthsPerPage && monthStart <= last; refreshed++) {
     await refreshTaskMonth(ctx, jdTaskId, monthStart);
+    monthStart = nextJdCycleStart(monthStart, "monthly", timeZone);
   }
+  return monthStart <= last ? monthStart : null;
 }
 
 // One transaction's share of report work; the rest continues in a single
-// follow-up job. A month costs a few dozen ledger reads, a task rebuild that
-// for every month of its history.
+// follow-up job. A month costs a few dozen ledger reads; a task rebuild costs
+// one bounded page of them.
 const inlineMonthRefreshes = 25;
 const inlineTaskRebuilds = 4;
 const monthsValidator = v.array(v.object({ jdTaskId: v.id("jdTasks"), monthStart: v.number() }));
@@ -259,9 +279,27 @@ async function refreshMonths(ctx: MutationCtx, months: { jdTaskId: Id<"jdTasks">
   if (months.length > inlineMonthRefreshes) await ctx.scheduler.runAfter(0, internal.jdReport.refreshMonthsLater, { months: months.slice(inlineMonthRefreshes) });
 }
 
-async function rebuildTasks(ctx: MutationCtx, jdTaskIds: Id<"jdTasks">[]) {
-  for (const jdTaskId of jdTaskIds.slice(0, inlineTaskRebuilds)) await rebuildJdTaskReport(ctx, jdTaskId);
-  if (jdTaskIds.length > inlineTaskRebuilds) await ctx.scheduler.runAfter(0, internal.jdReport.rebuildTasksLater, { jdTaskIds: jdTaskIds.slice(inlineTaskRebuilds) });
+/**
+ * Rebuilds one page of each task in turn, stopping at the first task whose
+ * history outlasts its page. The continuation resumes that task with the same
+ * queue, so one job keeps writing the totals rows rather than fanning out.
+ */
+async function rebuildTaskQueue(ctx: MutationCtx, jdTaskIds: Id<"jdTasks">[], cursor?: number): Promise<{ remaining: Id<"jdTasks">[]; monthStart?: number }> {
+  let remaining = jdTaskIds;
+  let next = cursor;
+  for (let rebuilt = 0; rebuilt < inlineTaskRebuilds && remaining.length > 0; rebuilt++) {
+    const monthStart = await rebuildJdTaskReportPage(ctx, remaining[0], next);
+    if (monthStart !== null) return { remaining, monthStart };
+    remaining = remaining.slice(1);
+    next = undefined;
+  }
+  return { remaining };
+}
+
+async function rebuildTasks(ctx: MutationCtx, jdTaskIds: Id<"jdTasks">[], cursor?: number) {
+  const { remaining, monthStart } = await rebuildTaskQueue(ctx, jdTaskIds, cursor);
+  if (remaining.length === 0) return;
+  await ctx.scheduler.runAfter(0, internal.jdReport.rebuildTasksLater, { jdTaskIds: remaining, ...(monthStart === undefined ? {} : { monthStart }) });
 }
 
 /**
@@ -290,20 +328,39 @@ export const refreshMonthsLater = internalMutation({
 });
 
 export const rebuildTasksLater = internalMutation({
-  args: { jdTaskIds: v.array(v.id("jdTasks")) },
+  args: { jdTaskIds: v.array(v.id("jdTasks")), monthStart: v.optional(v.number()) },
   handler: async (ctx, args) => {
-    await rebuildTasks(ctx, args.jdTaskIds);
+    await rebuildTasks(ctx, args.jdTaskIds, args.monthStart);
     return null;
   },
 });
 
-/** Rebuilds every JD task of a company a page per transaction. Idempotent; safe to rerun. */
+/**
+ * Rebuilds every JD task of a company a page of tasks per transaction, with
+ * each task's months paged too. A carried task finishes before the next
+ * company page starts, so the job stays sequential. Idempotent; safe to rerun.
+ */
 export const rebuildCompany = internalMutation({
-  args: { companyId: v.id("companies"), cursor: v.optional(v.union(v.string(), v.null())) },
+  args: { companyId: v.id("companies"), cursor: v.optional(v.union(v.string(), v.null())), jdTaskIds: v.optional(v.array(v.id("jdTasks"))), monthStart: v.optional(v.number()) },
   handler: async (ctx, args) => {
+    if (args.jdTaskIds?.length) {
+      const { remaining, monthStart } = await rebuildTaskQueue(ctx, args.jdTaskIds, args.monthStart);
+      if (remaining.length > 0) {
+        await ctx.scheduler.runAfter(0, internal.jdReport.rebuildCompany, { companyId: args.companyId, cursor: args.cursor ?? null, jdTaskIds: remaining, ...(monthStart === undefined ? {} : { monthStart }) });
+      } else {
+        // The carried tasks are done; fetch the next company page in a fresh
+        // transaction rather than extending this one.
+        await ctx.scheduler.runAfter(0, internal.jdReport.rebuildCompany, { companyId: args.companyId, cursor: args.cursor ?? null });
+      }
+      return null;
+    }
     const page = await ctx.db.query("jdTasks").withIndex("by_company", (q) => q.eq("companyId", args.companyId)).paginate({ numItems: rebuildPageSize, cursor: args.cursor ?? null });
-    for (const task of page.page) await rebuildJdTaskReport(ctx, task._id);
-    if (!page.isDone) await ctx.scheduler.runAfter(0, internal.jdReport.rebuildCompany, { companyId: args.companyId, cursor: page.continueCursor });
+    const { remaining, monthStart } = await rebuildTaskQueue(ctx, page.page.map((task) => task._id));
+    if (remaining.length > 0) {
+      await ctx.scheduler.runAfter(0, internal.jdReport.rebuildCompany, { companyId: args.companyId, cursor: page.continueCursor, jdTaskIds: remaining, ...(monthStart === undefined ? {} : { monthStart }) });
+    } else if (!page.isDone) {
+      await ctx.scheduler.runAfter(0, internal.jdReport.rebuildCompany, { companyId: args.companyId, cursor: page.continueCursor });
+    }
     return null;
   },
 });
