@@ -783,6 +783,10 @@ describe("dashboard historical JD cycles", () => {
     await admin.mutation(api.workCalendar.addHoliday, { companyId, name: "Closure", startDate: "2026-08-30", endDate: "2026-08-31" });
     const reportJobs = await t.run(async (ctx) => (await ctx.db.system.query("_scheduled_functions").collect()).filter((job) => job.name.includes("jdReport")));
     expect(reportJobs).toEqual([]);
+    // Nothing to rebuild: a fresh rebuild under the new calendar lands on the
+    // same month.
+    await t.mutation(internal.jdReport.rebuildCompany, { companyId });
+    await t.finishAllScheduledFunctions(() => vi.advanceTimersByTime(0));
     expect([await doneIn("2026-08-15"), await doneIn("2026-09-15")]).toEqual([1, 0]);
   });
 
