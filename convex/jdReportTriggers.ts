@@ -66,29 +66,14 @@ export function registerJdReportTriggers(triggers: Triggers<DataModel>) {
     const { oldDoc, newDoc } = change;
     // A new task has no ledger yet.
     if (!oldDoc) return;
-    // Pausing, recurrence, and assignees reshape the whole history.
+    // Pausing, recurrence, and assignees reshape the whole history. Status
+    // changes reach the report through the ledger rows they write.
     if (!newDoc || oldDoc.pausedAt !== newDoc.pausedAt || oldDoc.recurrence !== newDoc.recurrence || oldDoc.assigneeMembershipIds.join() !== newDoc.assigneeMembershipIds.join()) {
       pending(ctx).tasks.add(change.id);
-      return;
-    }
-    // The completion stamp and the cycle floor decide the stamped cycle.
-    if (oldDoc.status === newDoc.status && oldDoc.statusCycleStart === newDoc.statusCycleStart && oldDoc.cycleStartedAt === newDoc.cycleStartedAt) return;
-    for (const task of [oldDoc, newDoc]) {
-      if (task.statusCycleStart !== undefined) await noteCycle(ctx, task.companyId, change.id, task.statusCycleStart);
     }
   });
   // Months and week segments are company-local.
   triggers.register("companies", async (ctx, change) => {
     if (change.oldDoc && change.newDoc && change.oldDoc.timeZone !== change.newDoc.timeZone) pending(ctx).companies.add(change.id);
-  });
-  // Calendar edits move the deadline of a legacy completion stamp, so the
-  // company's whole report is rebuilt.
-  triggers.register("companyCalendars", async (ctx, change) => {
-    const row = change.newDoc ?? change.oldDoc;
-    if (row) pending(ctx).companies.add(row.companyId);
-  });
-  triggers.register("companyHolidays", async (ctx, change) => {
-    const row = change.newDoc ?? change.oldDoc;
-    if (row) pending(ctx).companies.add(row.companyId);
   });
 }

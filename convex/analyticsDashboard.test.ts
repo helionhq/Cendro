@@ -525,26 +525,6 @@ describe("dashboard historical JD cycles", () => {
     expect(dashboard.jd).toMatchObject({ due: 1, done: 0, missed: 1, waiting: 0, completionRate: 0 });
   });
 
-  test("a task marked completed before the completion ledger counts its stamped cycle", { timeout: 15_000 }, async () => {
-    const ids = await seedDashboardCompany();
-    const { t, companyId } = ids;
-    // Legacy task: marked completed in the Sep 9 daily cycle, but no completion
-    // row exists and the cron recorded that cycle as missed anyway.
-    const jdTaskId = await t.run(async (ctx) => await ctx.db.insert("jdTasks", jdDoc(ids, { recurrence: "daily", csa: day("2026-09-12"), scs: day("2026-09-09"), status: "completed", createdAt: day("2026-09-08") })));
-    await t.run(async (ctx) => {
-      for (const d of [8, 9, 10, 11]) {
-        const iso = `2026-09-${String(d).padStart(2, "0")}`;
-        await ctx.db.insert("jdTaskCycleRecords", { companyId, jdTaskId, cycleStart: day(iso), cycleEnd: day(iso) + dayMs, status: "missed", recordedAt: day("2026-09-12") });
-      }
-    });
-    const now = day("2026-09-12") + 15 * 3_600_000;
-    vi.setSystemTime(now);
-    await syncJdReport(t);
-    const dashboard = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now, period: { unit: "month", date: "2026-09-12" } });
-    // Sep 8–11 elapsed; Sep 9 is completed by its stamp; today's cycle is not counted.
-    expect(dashboard.jd).toMatchObject({ due: 4, done: 1, missed: 3, waiting: 0, completionRate: 25 });
-  });
-
   test("a completion and a missed record for the same cycle count once as completed", { timeout: 15_000 }, async () => {
     const ids = await seedDashboardCompany();
     const { t, companyId, employeeMembershipId } = ids;
@@ -773,37 +753,41 @@ describe("dashboard historical JD cycles", () => {
     expect([await doneIn("2026-08-15"), await doneIn("2026-09-15")]).toEqual([0, 1]);
   });
 
-  test("a holiday edit moves a legacy completion stamp to its new month", { timeout: 15_000 }, async () => {
+  test("a holiday edit leaves recorded deadlines alone and rebuilds no history", { timeout: 15_000 }, async () => {
     const { t, companyId, adminMembershipId } = await seedBareCompany();
-    // Monday Aug 24 → Monday Aug 31, completed by its stamp only. Its Sunday
-    // Aug 30 deadline starts in August; a Sunday–Monday closure moves it past
-    // the month boundary into September.
+    // A weekly cycle completed with its Aug 30 deadline stored on the row. A
+    // closure added over that deadline afterwards cannot move recorded work.
     const now = Date.UTC(2026, 8, 2, 12);
     vi.setSystemTime(now);
     await t.run(async (ctx) => {
       await ctx.db.patch(companyId, { timeZone: "UTC" });
-      await ctx.db.insert("jdTasks", {
+      const jdTaskId = await ctx.db.insert("jdTasks", {
         companyId,
-        reference: "JD-STAMP",
-        title: "Legacy stamp",
+        reference: "JD-WEEK",
+        title: "Weekly",
         recurrence: "weekly",
-        cycleStartedAt: Date.UTC(2026, 7, 24),
-        status: "completed",
-        statusCycleStart: Date.UTC(2026, 7, 24),
+        cycleStartedAt: Date.UTC(2026, 7, 31),
+        status: "due",
+        statusCycleStart: Date.UTC(2026, 7, 31),
         assigneeMembershipIds: [adminMembershipId],
         createdByMembershipId: adminMembershipId,
         createdAt: Date.UTC(2026, 7, 24),
         updatedAt: Date.UTC(2026, 7, 24),
       });
+      await ctx.db.insert("jdTaskCompletions", { companyId, jdTaskId, cycleStart: Date.UTC(2026, 7, 24), cycleEnd: Date.UTC(2026, 7, 31), completedByMembershipId: adminMembershipId, completedAt: Date.UTC(2026, 7, 26) });
     });
     await syncJdReport(t);
     const admin = t.withIdentity(identity("admin"));
     const doneIn = async (date: string) => (await admin.query(api.analytics.dashboard, { companyId, now, period: { unit: "month", date } })).jd.done;
-    expect([await doneIn("2026-08-15"), await doneIn("2026-09-15")]).toEqual([1, 0]);
 
     await admin.mutation(api.workCalendar.addHoliday, { companyId, name: "Closure", startDate: "2026-08-30", endDate: "2026-08-31" });
-    await refreshJdReport(t);
-    expect([await doneIn("2026-08-15"), await doneIn("2026-09-15")]).toEqual([0, 1]);
+    const reportJobs = await t.run(async (ctx) => (await ctx.db.system.query("_scheduled_functions").collect()).filter((job) => job.name.includes("jdReport")));
+    expect(reportJobs).toEqual([]);
+    // Nothing to rebuild: a fresh rebuild under the new calendar lands on the
+    // same month.
+    await t.mutation(internal.jdReport.rebuildCompany, { companyId });
+    await t.finishAllScheduledFunctions(() => vi.advanceTimersByTime(0));
+    expect([await doneIn("2026-08-15"), await doneIn("2026-09-15")]).toEqual([1, 0]);
   });
 
   test("a rebuild spanning several month pages keeps every stored total", { timeout: 30_000 }, async () => {

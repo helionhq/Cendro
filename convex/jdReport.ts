@@ -4,7 +4,6 @@ import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx } from "./_generated/server";
 import { internalMutation } from "./functions";
 import { currentJdCycle, nextJdCycleStart } from "./taskCycles";
-import { loadWorkCalendar, occurrenceDeadline } from "./workCalendar";
 
 /**
  * Dashboard JD totals, maintained from the ledger instead of rebuilt per read.
@@ -15,8 +14,10 @@ import { loadWorkCalendar, occurrenceDeadline } from "./workCalendar";
  * month straight from the ledger and swap the old contribution for the new,
  * so the totals always equal a fresh merge no matter which write changed
  * what. jdReportTriggers.ts notes every write to the ledger, the task, the
- * company time zone, or its work calendar, and functions.ts applies them
- * before the writing mutation commits.
+ * company time zone, and functions.ts applies them before the writing
+ * mutation commits. Every completion writes a ledger row, so the task's
+ * status stamp and the work calendar never enter a stored count: deadlines
+ * come from the rows themselves.
  *
  * The one input the totals do not cover is time: an elapsed cycle nobody
  * recorded yet. The hourly missed-cycle job records those, and until it runs
@@ -48,7 +49,7 @@ const rebuildMonthsPerPage = 6;
  * pass every row stored at each cycle start they cover.
  */
 export function jdLedgerOutcomes(
-  task: Pick<Doc<"jdTasks">, "recurrence" | "status" | "statusCycleStart">,
+  task: Pick<Doc<"jdTasks">, "recurrence">,
   timeZone: string | null,
   rows: JdLedgerRows,
 ): JdOutcome[] {
@@ -96,10 +97,12 @@ export function jdLedgerOutcomes(
   }
   for (const record of rows.missed) put(record.cycleStart, record.cycleEnd - 1, false, record.retiredAt);
 
-  return [...cycles.values()].map((cycle) => {
-    const completed = cycle.completed || (!cycle.retired && task.status === "completed" && task.statusCycleStart === cycle.start);
-    return { start: cycle.start, dueAt: cycle.dueAt, retired: cycle.retired, status: completed ? "done" : pendingStarts.has(cycle.start) ? "waiting" : "missed" };
-  });
+  return [...cycles.values()].map((cycle) => ({
+    start: cycle.start,
+    dueAt: cycle.dueAt,
+    retired: cycle.retired,
+    status: cycle.completed ? "done" : pendingStarts.has(cycle.start) ? "waiting" : "missed",
+  }));
 }
 
 /**
@@ -138,17 +141,6 @@ async function ledgerRowsStartingBetween(ctx: MutationCtx, jdTaskId: Id<"jdTasks
 async function taskMonthCounts(ctx: MutationCtx, task: Doc<"jdTasks">, timeZone: string | null, monthStart: number, now: number) {
   const monthEnd = nextJdCycleStart(monthStart, "monthly", timeZone) - 1;
   const outcomes = jdLedgerOutcomes(task, timeZone, await ledgerRowsStartingBetween(ctx, task._id, monthStart, monthEnd));
-  // Legacy tasks completed before the completion ledger existed: the stamp is
-  // the only record of a cycle still on the task's grid. The missed-cycle job
-  // turns it into a row before the floor moves past it.
-  const stamp = task.statusCycleStart;
-  if (task.status === "completed" && stamp !== undefined && stamp >= monthStart && stamp <= monthEnd && !outcomes.some((outcome) => outcome.start === stamp && !outcome.retired)) {
-    const calendar = await loadWorkCalendar(ctx, task.companyId);
-    const deadline = occurrenceDeadline(calendar, task.recurrence, nextJdCycleStart(stamp, task.recurrence, timeZone), timeZone);
-    if (deadline !== null && stamp >= currentJdCycle(task.recurrence, task.cycleStartedAt, timeZone).start) {
-      outcomes.push({ start: stamp, dueAt: deadline - 1, retired: false, status: "done" });
-    }
-  }
 
   const bySegment = new Map<number, JdReportMonthCount>();
   let nextCountableAt: number | null = null;
@@ -256,7 +248,6 @@ export async function rebuildJdTaskReportPage(ctx: MutationCtx, jdTaskId: Id<"jd
     ctx.db.query("taskConfirmationRequests").withIndex("by_taskType_and_taskId_and_cycleStart", (q) => q.eq("taskType", "jd").eq("taskId", jdTaskId).gte("cycleStart", 0)).order(order).first(),
   ]));
   const starts = ends.flatMap((row) => (row?.cycleStart === undefined ? [] : [row.cycleStart]));
-  if (task.status === "completed" && task.statusCycleStart !== undefined) starts.push(task.statusCycleStart);
   if (starts.length === 0) return null;
   const last = Math.max(...starts);
   let monthStart = cursor ?? currentJdCycle("monthly", Math.min(...starts), timeZone).start;
