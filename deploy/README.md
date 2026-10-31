@@ -9,9 +9,17 @@ systemd timer.
 GitHub main ──> npx convex deploy (Convex Cloud)
             └─> ghcr.io/helionhq/cendro-web
 VPS timer ──> docker compose pull + up -d
-Cloudflare Tunnel ──> 127.0.0.1:3000
-Tailscale ──> SSH / admin
+Browser ──> Caddy :443 (cendro.im) ──> web :3000
+                  └─ /api/convex-relay/* ──> Convex (backup route)
+Tailscale ──> SSH / admin (SSH is closed to the public internet)
 ```
+
+Why Caddy instead of the Cloudflare proxy or a Cloudflare Tunnel: from the office
+network in Pakistan, ISP filtering intermittently resets connections to shared
+Cloudflare addresses. `*.convex.cloud` is also behind Cloudflare. Serving
+cendro.im from the VPS's own address keeps the page reachable. The Convex backup
+route goes VPS → Convex, so browsers that cannot reach Convex directly still
+connect.
 
 ## One-time VPS setup
 
@@ -43,7 +51,7 @@ short name does not resolve, use the address from `tailscale ip -4`.
 ### 3. Docker, swap, firewall
 
 ```sh
-sudo ufw allow OpenSSH
+sudo ufw allow in on tailscale0 to any port 22 proto tcp
 sudo ufw --force enable
 
 curl -fsSL https://get.docker.com | sudo sh
@@ -56,25 +64,32 @@ sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
 
-Only SSH is open. Cloudflare Tunnel makes outbound connections; no inbound
-80/443 rule is needed.
+SSH is reachable only over Tailscale. Ports 80/443 are published by Docker for
+Caddy; Docker manages those firewall rules itself, so ufw needs no 80/443 rule.
 
-### 4. Cloudflare Tunnel
+Harden SSH (key-only, no root):
 
-In the Cloudflare dashboard: **Networking > Tunnels > Create a tunnel >
-Cloudflared**, name it `cendro-vps`, and run the generated install command on
-the VPS. Then add a public hostname:
+```sh
+printf 'PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+' | sudo tee /etc/ssh/sshd_config.d/00-cendro-hardening.conf
+sudo sshd -t && sudo systemctl reload ssh
+```
 
-| Hostname | Service |
-| --- | --- |
-| `cendro.im` | `http://localhost:3000` |
-| `www.cendro.im` | `http://localhost:3000` (or a redirect rule to apex) |
+### 4. DNS
 
-If a `cendro.im` record still points at Vercel, replace it. Do **not** touch the
-Clerk CNAMEs, Resend MX/SPF/DKIM records, or any other DNS records.
+In Cloudflare DNS for `cendro.im`, create these records with the proxy **off**
+(grey cloud, "DNS only"). The VPS address comes from `curl -4 ifconfig.me`.
 
-Check: `sudo systemctl status cloudflared` and, from outside the VPS,
-`curl -I https://cendro.im`.
+| Type | Name | Content | Proxy |
+| --- | --- | --- | --- |
+| A | `cendro.im` | VPS IPv4 | DNS only |
+| A | `www` | VPS IPv4 | DNS only |
+
+Caddy redirects `www` to the apex and fetches certificates itself. Cloudflare
+redirect rules, WAF and tunnels do not apply to grey-cloud records. Do **not**
+touch the Clerk CNAMEs, Resend MX/SPF/DKIM records, or any other DNS records.
 
 ### 5. Checkout and environment
 
@@ -129,7 +144,11 @@ cd /opt/cendro/deploy
 sudo docker compose up -d --wait --wait-timeout 180
 sudo docker compose ps
 curl -f http://127.0.0.1:3000/api/health
+curl -fI https://cendro.im
 ```
+
+The timer only updates `web`. After changing `Caddyfile`, run
+`sudo docker compose up -d --force-recreate caddy`.
 
 ### 8. Auto-update timer
 
@@ -211,7 +230,8 @@ df -h
 docker system df
 ```
 
-- The app is bound to `127.0.0.1:3000`; only Cloudflare Tunnel can reach it.
+- The app is bound to `127.0.0.1:3000`; the public reaches it only through Caddy.
+- Caddy is pinned in `docker-compose.yml`. Bump it when a new 2.x release ships.
 - Docker logs rotate at 10 MB x 3 per container.
 - Old `sha-*` images are intentionally kept for rollback. Prune manually when
   disk usage matters.
@@ -219,12 +239,12 @@ docker system df
   include daily backups, schedule
   `npx convex export --prod --include-file-storage` and store the ZIP off-site.
 - Update the OS and Docker monthly: `sudo apt update && sudo apt upgrade`.
-- Tailscale updates itself; `cloudflared` updates through `apt`.
+- Tailscale updates itself; Ubuntu security updates install automatically.
 
 ## Troubleshooting
 
-- **Cloudflare 502/522** — check `docker compose ps`, the health endpoint, and
-  `systemctl status cloudflared`.
+- **Site unreachable or 502** — check `docker compose ps`, the health endpoint,
+  and `docker compose logs caddy` (certificate errors appear there).
 - **App loads but Convex calls fail** — the `NEXT_PUBLIC_CONVEX_URL` baked into
   the image must match the runtime value in `.env`; rebuild the image if it
   changed.

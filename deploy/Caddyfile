@@ -1,0 +1,34 @@
+# Public entrance for cendro.im. Caddy gets and renews the HTTPS certificates
+# and redirects HTTP to HTTPS. DNS for cendro.im and www.cendro.im must be
+# "DNS only" (grey cloud) A records pointing at this VPS: some Pakistani ISP
+# paths intermittently reset connections to shared Cloudflare addresses.
+{
+	servers {
+		# The same ISP paths also break QUIC; serve HTTP/1.1 and HTTP/2 only.
+		protocols h1 h2
+	}
+}
+
+cendro.im {
+	header Strict-Transport-Security "max-age=31536000"
+
+	# Backup Convex route used by src/lib/convex-connection-recovery.ts when the
+	# browser cannot reach *.convex.cloud directly. It reaches only this
+	# deployment's sync endpoint; Convex still authenticates every session.
+	@convex {
+		path_regexp version ^/api/convex-relay/(\d{1,4}\.\d{1,4}\.\d{1,4})$
+		header Origin https://cendro.im
+	}
+	handle @convex {
+		rewrite * /api/{re.version.1}/sync
+		reverse_proxy {$CONVEX_URL}
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+}
+
+www.cendro.im {
+	redir https://cendro.im{uri} permanent
+}

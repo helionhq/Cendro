@@ -6,7 +6,7 @@ export const dynamic = "force-static";
 // Baked per build: each deploy serves different worker bytes, so browsers see a
 // real update even when the app — not the worker script — changed.
 const BUILD_VERSION =
-  process.env.NEXT_PUBLIC_APP_BUILD ?? process.env.VERCEL_GIT_COMMIT_SHA ?? "dev";
+  process.env.NEXT_PUBLIC_APP_BUILD ?? "dev";
 
 export function GET() {
   const source = readFileSync(join(process.cwd(), "src/app/sw.js/worker.js"), "utf8");
