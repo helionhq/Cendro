@@ -21,7 +21,11 @@ cendro.im {
 	}
 	handle @convex {
 		rewrite * /api/{re.version.1}/sync
-		reverse_proxy {$CONVEX_URL}
+		reverse_proxy {$CONVEX_URL} {
+			# Convex authenticates with its own protocol messages; keep the
+			# browser's cendro.im cookies (including Clerk's session) here.
+			header_up -Cookie
+		}
 	}
 
 	handle {
