@@ -1,5 +1,6 @@
 import { ConvexError, v } from "convex/values";
-import { internalMutation, mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
+import { query, type MutationCtx, type QueryCtx } from "./_generated/server";
+import { internalMutation, mutation } from "./functions";
 import { internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import { currentJdCycle, localDayBoundaryUtc, localDayIndexAt, nextJdCycleStart, previousJdCycleStart, timeZoneOrDefault, type JdRecurrence } from "./taskCycles";

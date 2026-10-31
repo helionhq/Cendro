@@ -13,6 +13,18 @@ const eslintConfig = [
       "@typescript-eslint/no-unused-expressions": "off",
       "@typescript-eslint/no-unused-vars": ["warn", { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_", "ignoreRestSiblings": true }]
     }
+  },
+  {
+    files: ["convex/**/*.ts"],
+    rules: {
+      "no-restricted-imports": ["error", {
+        patterns: [{
+          group: ["**/_generated/server"],
+          importNames: ["mutation", "internalMutation"],
+          message: "Import mutation builders from ./functions so table triggers run.",
+        }],
+      }],
+    }
   }
 ];
 export default eslintConfig;

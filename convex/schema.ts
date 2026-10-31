@@ -9,6 +9,9 @@ const rec = v.union(v.literal("daily"), v.literal("every_other_day"), v.literal(
 const taskStatus = v.union(v.literal("due"), v.literal("in_progress"), v.literal("completed"), v.literal("awaiting_confirmation"));
 const scope = v.union(v.literal("company"), v.literal("branch"), v.literal("department"), v.literal("user"));
 const taskType = v.union(v.literal("jd"), v.literal("one_time"));
+// Countable JD cycle outcomes in one week-within-month segment: the smallest
+// span every dashboard bucket and period is a whole number of.
+const jdReportCount = v.object({ segmentStart: v.number(), recurrence: rec, done: v.number(), missed: v.number(), waiting: v.number() });
 
 export default defineSchema({
   appUsers: defineTable({ clerkSubject: v.string(), email: v.string(), firstName: v.string(), secondName: v.optional(v.string()), imageUrl: v.optional(v.string()), createdAt: v.number(), updatedAt: v.number() }).index("by_subject", ["clerkSubject"]).index("by_email", ["email"]),
@@ -55,6 +58,13 @@ export default defineSchema({
   jdTaskCompletions: defineTable({ companyId: v.id("companies"), jdTaskId: v.id("jdTasks"), cycleStart: v.number(), cycleEnd: v.optional(v.number()), retiredAt: v.optional(v.number()), completedByMembershipId: v.optional(v.id("companyMemberships")), completedAt: v.number(), note: v.optional(v.string()) }).index("by_task_and_cycleStart", ["jdTaskId", "cycleStart"]).index("by_companyId_and_cycleStart", ["companyId", "cycleStart"]),
   // Kept optional while legacy schedule-generation records remain live.
   jdTaskCycleRecords: defineTable({ companyId: v.id("companies"), jdTaskId: v.id("jdTasks"), cycleStart: v.number(), cycleEnd: v.number(), status: v.literal("missed"), recordedAt: v.number(), retiredAt: v.optional(v.number()), scheduleGeneration: v.optional(v.number()) }).index("by_task_and_cycleStart", ["jdTaskId", "cycleStart"]).index("by_task_and_cycleEnd", ["jdTaskId", "cycleEnd"]).index("by_companyId_and_cycleEnd", ["companyId", "cycleEnd"]),
+  // Derived from the JD ledger by convex/jdReport.ts; never write directly.
+  // What one task's cycles starting in one company-local month add to the
+  // totals, kept so a refresh can subtract exactly what it added before.
+  jdReportTaskMonths: defineTable({ companyId: v.id("companies"), jdTaskId: v.id("jdTasks"), monthStart: v.number(), assigneeMembershipIds: v.array(v.id("companyMemberships")), counts: v.array(v.object({ monthStart: v.number(), count: jdReportCount })) }).index("by_jdTaskId_and_monthStart", ["jdTaskId", "monthStart"]),
+  // Dashboard JD totals per due month and assignee set. Keying by the whole
+  // set keeps shared tasks counted once in team totals.
+  jdReportTotals: defineTable({ companyId: v.id("companies"), monthStart: v.number(), assigneeKey: v.string(), assigneeMembershipIds: v.array(v.id("companyMemberships")), counts: v.array(jdReportCount) }).index("by_companyId_and_monthStart_and_assigneeKey", ["companyId", "monthStart", "assigneeKey"]),
   // One row per company: which weekdays count as working days for JD task
   // due dates. Holidays live in their own rows so ranges stay unbounded in
   // number without rewriting a shared document.

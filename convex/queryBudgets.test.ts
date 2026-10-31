@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "./_generated/api";
 import schema from "./schema";
 import { localDateField } from "./taskCycles";
+import { dashboardTaskLimit } from "./analytics";
 
 const modules = import.meta.glob("./**/*.ts");
 // Pinned so the dashboard period and seeded createdAt values never straddle a
@@ -21,56 +22,53 @@ function identity(key: string, email = `${key}@example.com`) {
   return { tokenIdentifier: `clerk|${key}`, subject: key, issuer: "https://clerk.test", email, name: key };
 }
 
-describe("WP-07: Query budgets and silent incompleteness prevention", () => {
-  test("501 tasks detect overflow via limit + 1 and mark dashboard and metrics as truncated/incomplete", { timeout: 15_000 }, async () => {
-    const t = convexTest(schema, modules);
-    const now = Date.now();
-
-    const { companyId, adminM } = await t.run(async (ctx) => {
-      const companyId = await ctx.db.insert("companies", { name: "Budget Corp", createdAt: now });
-      const adminUser = await ctx.db.insert("appUsers", { clerkSubject: "clerk|admin", email: "admin@example.com", firstName: "Admin", createdAt: now, updatedAt: now });
-      const adminM = await ctx.db.insert("companyMemberships", { companyId, userId: adminUser, role: "Admin", active: true, createdAt: now, updatedAt: now });
-
-      // Exactly at the cap is still a complete report.
-      for (let i = 1; i <= 500; i++) {
-        await ctx.db.insert("oneTimeTasks", {
-          companyId,
-          reference: `TASK-${i}`,
-          title: `Task ${i}`,
-          priority: "medium",
-          status: "due",
-          assigneeMembershipIds: [adminM],
-          createdByMembershipId: adminM,
-          createdAt: now + i,
-          updatedAt: now + i,
-        });
-      }
-
-      return { companyId, adminM };
-    });
-
-    const completeDash = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now: Date.now(), period: yearPeriod() });
-    expect(completeDash.isTruncated).toBe(false);
-
-    await t.run(async (ctx) => {
+async function seedOneTimeTasks(count: number) {
+  const t = convexTest(schema, modules);
+  const now = Date.now();
+  const { companyId, adminM } = await t.run(async (ctx) => {
+    const companyId = await ctx.db.insert("companies", { name: "Budget Corp", createdAt: now });
+    const adminUser = await ctx.db.insert("appUsers", { clerkSubject: "clerk|admin", email: "admin@example.com", firstName: "Admin", createdAt: now, updatedAt: now });
+    const adminM = await ctx.db.insert("companyMemberships", { companyId, userId: adminUser, role: "Admin", active: true, createdAt: now, updatedAt: now });
+    return { companyId, adminM };
+  });
+  const addTasks = (from: number, to: number) => t.run(async (ctx) => {
+    for (let i = from; i <= to; i++) {
       await ctx.db.insert("oneTimeTasks", {
         companyId,
-        reference: "TASK-501",
-        title: "Task 501",
+        reference: `TASK-${i}`,
+        title: `Task ${i}`,
         priority: "medium",
         status: "due",
         assigneeMembershipIds: [adminM],
         createdByMembershipId: adminM,
-        createdAt: now + 501,
-        updatedAt: now + 501,
+        createdAt: now + i,
+        updatedAt: now + i,
       });
-    });
+    }
+  });
+  await addTasks(1, count);
+  return { t, companyId, addOneMore: () => addTasks(count + 1, count + 1) };
+}
 
-    // 1. Dashboard query MUST report incomplete/truncated state.
-    const dash = await t.withIdentity(identity("admin")).query(api.analytics.dashboard, { companyId, now: Date.now(), period: yearPeriod() });
-    expect(dash.isTruncated).toBe(true);
+describe("WP-07: Query budgets and silent incompleteness prevention", () => {
+  test("the dashboard counts tasks up to its ceiling and flags the overflow", { timeout: 60_000 }, async () => {
+    const { t, companyId, addOneMore } = await seedOneTimeTasks(dashboardTaskLimit);
+    const admin = t.withIdentity(identity("admin"));
 
-    // 2. aiSummary query MUST report incomplete/truncated state
+    // Exactly at the cap is still a complete report.
+    const complete = await admin.query(api.analytics.dashboard, { companyId, now: Date.now(), period: yearPeriod() });
+    expect(complete.isTruncated).toBe(false);
+    expect(complete.tasks.assigned).toBe(dashboardTaskLimit);
+
+    await addOneMore();
+    const overflow = await admin.query(api.analytics.dashboard, { companyId, now: Date.now(), period: yearPeriod() });
+    expect(overflow.isTruncated).toBe(true);
+  });
+
+  test("501 tasks detect overflow via limit + 1 and mark metrics as truncated/incomplete", { timeout: 15_000 }, async () => {
+    const { t, companyId } = await seedOneTimeTasks(501);
+
+    // aiSummary query MUST report incomplete/truncated state
     const aiSum = await t.withIdentity(identity("admin")).query(api.analytics.aiSummary, { companyId });
     expect(aiSum.isTruncated).toBe(true);
     expect(aiSum.isComplete).toBe(false);
