@@ -10,7 +10,6 @@ afterEach(() => {
 async function workerFor(build: string) {
   vi.resetModules();
   vi.stubEnv("NEXT_PUBLIC_APP_BUILD", build);
-  vi.stubEnv("VERCEL_GIT_COMMIT_SHA", undefined);
   const { GET } = await import("./route");
   return (await GET()).text();
 }
