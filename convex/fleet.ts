@@ -21,8 +21,6 @@ import {
 import {
   FLEET_UPLOAD_CLAIM_TTL_MS,
   FUEL_INSIGHT_SCAN_LIMIT,
-  isFleetBlobReferenced,
-  isFleetEntryBlobReferenced,
   loadCompanyVehicles,
   loadLatestServices,
   loadOpenTrips,
@@ -32,6 +30,12 @@ import {
   MAX_FLEET_PHOTO_BYTES,
   metersToKm,
 } from "./fleetInternal";
+import {
+  isStorageBlobClaimed,
+  isStorageBlobContentReferenced,
+  isStorageBlobOwned,
+  storagePredatesClaim,
+} from "./uploadOwnership";
 import { fetchAndApplyCompanyVehicles } from "./fleetSync";
 import {
   fetchTrackerVehicles,
@@ -164,7 +168,7 @@ async function validatePhotoClaim(
   const metadata = await ctx.db.system.get("_storage", args.photo.storageId);
   if (!metadata) throw new ConvexError("Uploaded photo not found.");
   const { contentType, size } = validatePhotoMetadata(metadata);
-  if (await isFleetEntryBlobReferenced(ctx, args.photo.storageId)) {
+  if (await isStorageBlobContentReferenced(ctx, args.photo.storageId)) {
     throw new ConvexError("This photo is already attached.");
   }
   return {
@@ -340,6 +344,7 @@ async function buildFuelInsights(
     vehicleName: string;
     registrationNumber: string;
     filledAt: number;
+    entryCreatedAt: number;
     kmPerL: number;
     medianKmPerL: number;
     litres: number;
@@ -358,9 +363,20 @@ async function buildFuelInsights(
       .first();
     const vehicleHasThreeMonthsHistory =
       earliestVehicleFill !== null && earliestVehicleFill.filledAt <= windows.threeMonthsAgoStart;
+    // The spend window starts three months back; the last six earlier fills
+    // supply the five prior efficiencies needed to judge the first in-window
+    // fill-up. Bounded and indexed per vehicle.
+    const precedingFills = await ctx.db
+      .query("fleetFuelEntries")
+      .withIndex("by_vehicleId_and_filledAt", (q) =>
+        q.eq("vehicleId", vehicleId).lt("filledAt", windows.threeMonthsAgoStart),
+      )
+      .order("desc")
+      .take(6);
     const series = computeFuelSeries(
-      vehicleFills.map((fill) => ({
+      [...precedingFills].reverse().concat(vehicleFills).map((fill) => ({
         id: fill._id,
+        creationTime: fill._creationTime,
         filledAt: fill.filledAt,
         litres: fill.litres,
         amount: fill.amount,
@@ -375,6 +391,7 @@ async function buildFuelInsights(
           vehicleName: name,
           registrationNumber,
           filledAt: point.filledAt,
+          entryCreatedAt: point.creationTime,
           kmPerL: point.kmPerL as number,
           medianKmPerL: point.medianKmPerL as number,
           litres: point.litres,
@@ -392,7 +409,9 @@ async function buildFuelInsights(
     });
   }
 
-  anomalies.sort((a, b) => b.filledAt - a.filledAt);
+  anomalies.sort(
+    (a, b) => b.filledAt - a.filledAt || b.entryCreatedAt - a.entryCreatedAt,
+  );
   byVehicleSpend.sort((a, b) => b.currentMonthSpend - a.currentMonthSpend);
   const fleet = computeSpendSummary(fills, windows, now, fleetHasThreeMonthsHistory);
 
@@ -493,7 +512,7 @@ async function buildAlerts(
         at: vehicle.serviceStatus.nextDueAt,
       });
     }
-    if (vehicle.status === "missing") {
+    if (vehicle.missingFromTrackerAt !== null) {
       alerts.push({
         key: `vehicle_missing:${vehicle._id}`,
         kind: "vehicle_missing",
@@ -595,10 +614,9 @@ export const connect = action({
     ctx,
     args,
   ): Promise<{ connected: true; keyHint: string; vehicleCount: number; syncedAt: number }> => {
-    const auth: { membershipId: Id<"companyMemberships"> } = await ctx.runQuery(
-      internal.fleetAuth.requireManage,
-      { companyId: args.companyId },
-    );
+    await ctx.runQuery(internal.fleetAuth.requireManage, {
+      companyId: args.companyId,
+    });
     const secretKey = args.secretKey.trim();
     if (!secretKey) throw new ConvexError("Enter the tracker key.");
 
@@ -617,7 +635,6 @@ export const connect = action({
         companyId: args.companyId,
         secretKey,
         keyHint: trackerKeyHint(secretKey),
-        connectedByMembershipId: auth.membershipId,
         now,
         vehicles,
       },
@@ -656,24 +673,39 @@ export const syncNow = action({
     missingCount: number | null;
   }> => {
     await ctx.runQuery(internal.fleetAuth.requireView, { companyId: args.companyId });
-    const source: {
-      connection: { secretKey: string; lastSyncAt: number | null; connectedAt: number } | null;
-    } = await ctx.runQuery(internal.fleetInternal.getSyncSource, {
-      companyId: args.companyId,
-    });
-    if (!source.connection) throw new ConvexError("Connect the tracker first.");
-
     const now = Date.now();
-    if (source.connection.lastSyncAt !== null && now - source.connection.lastSyncAt < SYNC_NOW_COOLDOWN_MS) {
+    // Reserve the attempt atomically before the fetch so failures and
+    // concurrent taps also observe the cooldown.
+    const reservation: {
+      reserved: boolean;
+      reason: "not_connected" | "cooldown" | null;
+      lastSyncAt: number | null;
+    } = await ctx.runMutation(internal.fleetInternal.reserveSyncAttempt, {
+      companyId: args.companyId,
+      now,
+      cooldownMs: SYNC_NOW_COOLDOWN_MS,
+    });
+    if (!reservation.reserved) {
+      if (reservation.reason === "not_connected") {
+        throw new ConvexError("Connect the tracker first.");
+      }
       return {
         skipped: true,
-        syncedAt: source.connection.lastSyncAt,
+        syncedAt: reservation.lastSyncAt,
         vehicleCount: null,
         missingCount: null,
       };
     }
 
     const result = await fetchAndApplyCompanyVehicles(ctx, args.companyId);
+    if (result.stale) {
+      return {
+        skipped: true,
+        syncedAt: null,
+        vehicleCount: null,
+        missingCount: null,
+      };
+    }
     if (!result.ok) throw new ConvexError(result.error ?? "Could not reach the tracker.");
     return {
       skipped: false,
@@ -740,6 +772,7 @@ export const getVehicle = query({
         .reverse()
         .map((fill) => ({
           id: fill._id,
+          creationTime: fill._creationTime,
           filledAt: fill.filledAt,
           litres: fill.litres,
           amount: fill.amount,
@@ -1012,10 +1045,7 @@ export const startTrip = action({
     ctx,
     args,
   ): Promise<{ tripId: Id<"fleetTrips">; startOdometerMeters: number | null }> => {
-    const auth: { membershipId: Id<"companyMemberships"> } = await ctx.runQuery(
-      internal.fleetAuth.requireLog,
-      { companyId: args.companyId },
-    );
+    await ctx.runQuery(internal.fleetAuth.requireLog, { companyId: args.companyId });
     // A fresh reading improves the start odometer, but trip logging must never
     // be blocked by the tracker or the office network.
     try {
@@ -1025,7 +1055,6 @@ export const startTrip = action({
     }
     return await ctx.runMutation(internal.fleetInternal.applyStartTrip, {
       companyId: args.companyId,
-      membershipId: auth.membershipId,
       vehicleId: args.vehicleId,
       driverId: args.driverId,
       destination: args.destination,
@@ -1266,7 +1295,9 @@ export const createFuelEntry = mutation({
     companyId: v.id("companies"),
     vehicleId: v.id("fleetVehicles"),
     driverId: v.optional(v.id("fleetDrivers")),
-    filledAt: v.number(),
+    // Omit for "now"; the server uses its own clock. Do not round a client time
+    // down, or a fresh tracker reading can look newer than the event.
+    filledAt: v.optional(v.number()),
     litres: v.number(),
     amount: v.number(),
     odometerMeters: v.optional(v.number()),
@@ -1277,27 +1308,37 @@ export const createFuelEntry = mutation({
     const { membership } = await requireCapability(ctx, args.companyId, "fleet:log");
     const vehicle = await requireFleetVehicle(ctx, args.companyId, args.vehicleId);
     if (args.driverId) await requireFleetDriver(ctx, args.companyId, args.driverId);
-    validateDate(args.filledAt, "Fill-up date");
+    const now = Date.now();
+    const filledAt = args.filledAt ?? now;
+    validateDate(filledAt, "Fill-up date");
     if (!Number.isFinite(args.litres) || args.litres <= 0) {
       throw new ConvexError("Litres must be greater than zero.");
     }
     validateMoney(args.amount, "Amount");
-    const odometerMeters =
-      validateOdometer(args.odometerMeters, "Odometer") ?? vehicle.odometerMeters ?? null;
+    const explicitOdometer = validateOdometer(args.odometerMeters, "Odometer");
+    // Borrow the tracker reading only when no newer reading could include
+    // driving after the fill-up. Fuel always needs an odometer for km/L.
+    const readingUsable =
+      vehicle.odometerMeters !== undefined &&
+      vehicle.recordedAt !== undefined &&
+      vehicle.recordedAt <= filledAt;
+    const odometerMeters = explicitOdometer ?? (readingUsable ? vehicle.odometerMeters : null);
+    if (odometerMeters === null) {
+      throw new ConvexError("Enter the odometer reading for a backdated fill-up.");
+    }
     const photo = await validatePhotoClaim(ctx, {
       companyId: args.companyId,
       membershipId: membership._id,
       photo: args.photo,
     });
-    const now = Date.now();
     const entryId = await ctx.db.insert("fleetFuelEntries", {
       companyId: args.companyId,
       vehicleId: args.vehicleId,
       ...(args.driverId ? { driverId: args.driverId } : {}),
-      filledAt: args.filledAt,
+      filledAt,
       litres: args.litres,
       amount: args.amount,
-      ...(odometerMeters !== null ? { odometerMeters } : {}),
+      odometerMeters,
       ...(args.notes?.trim() ? { notes: args.notes.trim() } : {}),
       photoStorageId: photo.photoStorageId,
       photoFileName: photo.photoFileName,
@@ -1313,19 +1354,29 @@ export const createFuelEntry = mutation({
 });
 
 async function fuelMetricsForEntry(ctx: QueryCtx, entry: Doc<"fleetFuelEntries">) {
-  const prior = await ctx.db
+  // Equal filledAt values are ordered by _creationTime, so fetch the same
+  // timestamp's entries too and keep only those strictly earlier in that order.
+  const candidates = await ctx.db
     .query("fleetFuelEntries")
     .withIndex("by_vehicleId_and_filledAt", (q) =>
-      q.eq("vehicleId", entry.vehicleId).lt("filledAt", entry.filledAt),
+      q.eq("vehicleId", entry.vehicleId).lte("filledAt", entry.filledAt),
     )
     .order("desc")
-    .take(6);
+    .take(12);
+  const prior = candidates
+    .filter(
+      (fill) =>
+        fill.filledAt < entry.filledAt ||
+        (fill.filledAt === entry.filledAt && fill._creationTime < entry._creationTime),
+    )
+    .slice(0, 6);
   const points = computeFuelSeries(
     [...prior]
       .reverse()
       .concat(entry)
       .map((fill) => ({
         id: fill._id,
+        creationTime: fill._creationTime,
         filledAt: fill.filledAt,
         litres: fill.litres,
         amount: fill.amount,
@@ -1466,7 +1517,7 @@ export const updateFuelEntry = mutation({
     if (newPhoto) {
       await ctx.db.delete(newPhoto.claimId);
       if (oldStorageId !== newPhoto.photoStorageId) {
-        if (!(await isFleetBlobReferenced(ctx, oldStorageId))) {
+        if (!(await isStorageBlobOwned(ctx, oldStorageId))) {
           await ctx.storage.delete(oldStorageId);
         }
       }
@@ -1483,7 +1534,7 @@ export const deleteFuelEntry = mutation({
     if (!entry || entry.companyId !== args.companyId) throw new ConvexError("Fuel entry not found.");
     const storageId = entry.photoStorageId;
     await ctx.db.delete(entry._id);
-    if (!(await isFleetBlobReferenced(ctx, storageId))) await ctx.storage.delete(storageId);
+    if (!(await isStorageBlobOwned(ctx, storageId))) await ctx.storage.delete(storageId);
     return null;
   },
 });
@@ -1496,7 +1547,8 @@ export const createServiceEntry = mutation({
   args: {
     companyId: v.id("companies"),
     vehicleId: v.id("fleetVehicles"),
-    servicedAt: v.number(),
+    // Omit for "now"; the server uses its own clock.
+    servicedAt: v.optional(v.number()),
     odometerMeters: v.optional(v.number()),
     description: v.string(),
     cost: v.optional(v.number()),
@@ -1506,14 +1558,22 @@ export const createServiceEntry = mutation({
   handler: async (ctx, args) => {
     const { membership } = await requireCapability(ctx, args.companyId, "fleet:log");
     const vehicle = await requireFleetVehicle(ctx, args.companyId, args.vehicleId);
-    validateDate(args.servicedAt, "Service date");
+    const now = Date.now();
+    const servicedAt = args.servicedAt ?? now;
+    validateDate(servicedAt, "Service date");
     const description = nonEmpty(args.description, "Description");
     if (description.length > MAX_SERVICE_DESCRIPTION) {
       throw new ConvexError("Description is too long.");
     }
     if (args.cost !== undefined) validateMoney(args.cost, "Cost");
-    const odometerMeters =
-      validateOdometer(args.odometerMeters, "Odometer") ?? vehicle.odometerMeters ?? null;
+    const explicitOdometer = validateOdometer(args.odometerMeters, "Odometer");
+    // Only borrow the tracker reading when it predates the service; otherwise
+    // leave the odometer unset for the user to correct.
+    const readingUsable =
+      vehicle.odometerMeters !== undefined &&
+      vehicle.recordedAt !== undefined &&
+      vehicle.recordedAt <= servicedAt;
+    const odometerMeters = explicitOdometer ?? (readingUsable ? vehicle.odometerMeters : null);
     const photo = args.photo
       ? await validatePhotoClaim(ctx, {
           companyId: args.companyId,
@@ -1521,11 +1581,10 @@ export const createServiceEntry = mutation({
           photo: args.photo,
         })
       : null;
-    const now = Date.now();
     const entryId = await ctx.db.insert("fleetServiceEntries", {
       companyId: args.companyId,
       vehicleId: args.vehicleId,
-      servicedAt: args.servicedAt,
+      servicedAt,
       ...(odometerMeters !== null ? { odometerMeters } : {}),
       description,
       ...(args.cost !== undefined ? { cost: args.cost } : {}),
@@ -1668,7 +1727,7 @@ export const updateServiceEntry = mutation({
     if (newPhoto) {
       await ctx.db.delete(newPhoto.claimId);
       if (oldStorageId && oldStorageId !== newPhoto.photoStorageId) {
-        if (!(await isFleetBlobReferenced(ctx, oldStorageId))) {
+        if (!(await isStorageBlobOwned(ctx, oldStorageId))) {
           await ctx.storage.delete(oldStorageId);
         }
       }
@@ -1687,7 +1746,7 @@ export const deleteServiceEntry = mutation({
     }
     const storageId = entry.photoStorageId;
     await ctx.db.delete(entry._id);
-    if (storageId && !(await isFleetBlobReferenced(ctx, storageId))) {
+    if (storageId && !(await isStorageBlobOwned(ctx, storageId))) {
       await ctx.storage.delete(storageId);
     }
     return null;
@@ -1733,19 +1792,24 @@ export const bindUploadClaim = mutation({
     }
     const metadata = await ctx.db.system.get("_storage", args.storageId);
     if (!metadata) throw new ConvexError("Uploaded photo not found.");
-
-    const [entryReference, boundClaim] = await Promise.all([
-      isFleetEntryBlobReferenced(ctx, args.storageId),
-      ctx.db
-        .query("fleetUploadClaims")
-        .withIndex("by_storageId", (q) => q.eq("storageId", args.storageId))
-        .first(),
-    ]);
+    const owned =
+      (await isStorageBlobContentReferenced(ctx, args.storageId)) ||
+      (await isStorageBlobClaimed(ctx, args.storageId, { fleetClaimId: claim._id }));
+    if (owned) {
+      // Bind the claim so the sweep has a cleanup handle, but never delete a
+      // blob another feature owns.
+      if (claim.storageId === undefined) {
+        await ctx.db.patch(claim._id, { storageId: args.storageId });
+      }
+      return { ok: false, error: "This photo is already attached." };
+    }
+    // A claim may only own a blob uploaded after it was issued. A predated
+    // blob belongs to an earlier upload, so it must not be bound.
+    if (storagePredatesClaim(metadata, claim.createdAt)) {
+      throw new ConvexError("This upload predates its claim. Upload the photo again.");
+    }
     if (claim.storageId === undefined) {
       await ctx.db.patch(claim._id, { storageId: args.storageId });
-    }
-    if (entryReference || (boundClaim && boundClaim._id !== claim._id)) {
-      return { ok: false, error: "This photo is already attached." };
     }
     const contentType = (metadata.contentType ?? "").toLowerCase();
     if (!isAllowedPhotoContentType(contentType)) {
@@ -1768,7 +1832,7 @@ export const discardUpload = mutation({
     }
     const storageId = claim.storageId;
     await ctx.db.delete(claim._id);
-    if (storageId && !(await isFleetBlobReferenced(ctx, storageId))) {
+    if (storageId && !(await isStorageBlobOwned(ctx, storageId))) {
       await ctx.storage.delete(storageId);
     }
     return null;

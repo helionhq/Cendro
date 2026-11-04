@@ -7,6 +7,7 @@ import { EMPTY_TRACKER_RESPONSE_MESSAGE, fetchTrackerVehicles, trackerSafeMessag
 export type CompanySyncResult = {
   connected: boolean;
   ok: boolean;
+  stale: boolean;
   lastSyncAt: number | null;
   error: string | null;
   vehicleCount: number;
@@ -33,6 +34,7 @@ export async function fetchAndApplyCompanyVehicles(
     return {
       connected: false,
       ok: false,
+      stale: false,
       lastSyncAt: null,
       error: "Connect the tracker first.",
       vehicleCount: 0,
@@ -47,12 +49,14 @@ export async function fetchAndApplyCompanyVehicles(
     const message = trackerSafeMessage(error);
     await ctx.runMutation(internal.fleetInternal.recordSyncFailure, {
       companyId,
+      connectionGeneration: source.connection.generation,
       message,
       now: Date.now(),
     });
     return {
       connected: true,
       ok: false,
+      stale: false,
       lastSyncAt: source.connection.lastSyncAt,
       error: message,
       vehicleCount: 0,
@@ -70,21 +74,37 @@ export async function fetchAndApplyCompanyVehicles(
     missing: number;
     present: number;
     emptyResponse: boolean;
+    stale: boolean;
   } = await ctx.runMutation(internal.fleetInternal.applyTrackerSync, {
     companyId,
+    connectionGeneration: source.connection.generation,
     now,
     vehicles: parsed.vehicles,
   });
+  if (applied.stale) {
+    // The key was replaced or disconnected while this request was in flight.
+    return {
+      connected: true,
+      ok: false,
+      stale: true,
+      lastSyncAt: source.connection.lastSyncAt,
+      error: null,
+      vehicleCount: 0,
+      counts: null,
+    };
+  }
   if (applied.emptyResponse) {
     // The mutation wrote nothing: no missing markers and no lastSyncAt change.
     await ctx.runMutation(internal.fleetInternal.recordSyncFailure, {
       companyId,
+      connectionGeneration: source.connection.generation,
       message: EMPTY_TRACKER_RESPONSE_MESSAGE,
       now,
     });
     return {
       connected: true,
       ok: false,
+      stale: false,
       lastSyncAt: source.connection.lastSyncAt,
       error: EMPTY_TRACKER_RESPONSE_MESSAGE,
       vehicleCount: 0,
@@ -94,6 +114,7 @@ export async function fetchAndApplyCompanyVehicles(
   return {
     connected: true,
     ok: true,
+    stale: false,
     lastSyncAt: now,
     error: null,
     vehicleCount: parsed.vehicles.length,
@@ -106,7 +127,7 @@ export const syncAllTrackers = internalAction({
   handler: async (
     ctx,
     args,
-  ): Promise<{ processed: number; succeeded: number; failed: number }> => {
+  ): Promise<{ processed: number; succeeded: number; failed: number; stale: number }> => {
     const page: {
       connections: { companyId: Id<"companies">; secretKey: string }[];
       isDone: boolean;
@@ -117,11 +138,13 @@ export const syncAllTrackers = internalAction({
 
     let succeeded = 0;
     let failed = 0;
+    let stale = 0;
     for (const connection of page.connections) {
       // One company's failure (tracker or database) must not block the rest.
       try {
         const result = await fetchAndApplyCompanyVehicles(ctx, connection.companyId);
-        if (result.ok) succeeded += 1;
+        if (result.stale) stale += 1;
+        else if (result.ok) succeeded += 1;
         else failed += 1;
       } catch {
         failed += 1;
@@ -133,6 +156,6 @@ export const syncAllTrackers = internalAction({
         cursor: page.continueCursor,
       });
     }
-    return { processed: page.connections.length, succeeded, failed };
+    return { processed: page.connections.length, succeeded, failed, stale };
   },
 });

@@ -83,7 +83,7 @@ export default defineSchema({
   // One row per issued upload URL. Held until addAttachment consumes it, so
   // orphan cleanup can prove the caller was issued an upload slot in this
   // company instead of deleting arbitrary unreferenced blobs cross-tenant.
-  taskUploadClaims: defineTable({ companyId: v.id("companies"), membershipId: v.id("companyMemberships"), storageId: v.optional(v.id("_storage")), createdAt: v.number() }).index("by_company", ["companyId"]),
+  taskUploadClaims: defineTable({ companyId: v.id("companies"), membershipId: v.id("companyMemberships"), storageId: v.optional(v.id("_storage")), createdAt: v.number() }).index("by_company", ["companyId"]).index("by_storageId", ["storageId"]),
   // Evidence binds to the completed cycle for recurring tasks; one active row
   // per cycle (JD) or per completion (one-time). Rows are deleted on reopen and
   // retired (never deleted) when a recurrence change supersedes their cycle.
@@ -111,7 +111,7 @@ export default defineSchema({
   taskImportPreviews: defineTable({ companyId: v.id("companies"), actorMembershipId: v.id("companyMemberships"), kind: taskType, fingerprint: v.string(), rowCount: v.number(), createdAt: v.number() }),
   // One tracker connection per company. `secretKey` is write-only from the
   // client: no query returns it, and sync/connect errors never include it.
-  fleetTrackerConnections: defineTable({ companyId: v.id("companies"), secretKey: v.string(), keyHint: v.string(), connectedAt: v.number(), connectedByMembershipId: v.id("companyMemberships"), lastSyncAt: v.optional(v.number()), lastSyncError: v.optional(v.string()), updatedAt: v.number() }).index("by_company", ["companyId"]),
+  fleetTrackerConnections: defineTable({ companyId: v.id("companies"), secretKey: v.string(), keyHint: v.string(), connectedAt: v.number(), connectedByMembershipId: v.id("companyMemberships"), lastSyncAt: v.optional(v.number()), lastSyncAttemptAt: v.optional(v.number()), lastSyncError: v.optional(v.string()), generation: v.optional(v.number()), updatedAt: v.number() }).index("by_company", ["companyId"]),
   // Vehicles are upserted from the tracker; `displayName` and the service
   // intervals are user-owned and never touched by sync.
   fleetVehicles: defineTable({ companyId: v.id("companies"), registrationNumber: v.string(), displayName: v.optional(v.string()), odometerMeters: v.optional(v.number()), lat: v.optional(v.number()), lng: v.optional(v.number()), address: v.optional(v.string()), speed: v.optional(v.number()), ignitionOn: v.optional(v.boolean()), recordedAt: v.optional(v.number()), lastSeenAt: v.optional(v.number()), missingFromTrackerAt: v.optional(v.number()), serviceIntervalKm: v.optional(v.number()), serviceIntervalDays: v.optional(v.number()), createdAt: v.number(), updatedAt: v.number() }).index("by_company", ["companyId"]).index("by_companyId_and_registrationNumber", ["companyId", "registrationNumber"]),

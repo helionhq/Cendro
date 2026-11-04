@@ -7,9 +7,11 @@ import {
 } from "./_generated/server";
 import { internalMutation } from "./functions";
 import type { Doc, Id } from "./_generated/dataModel";
+import { requireCapability } from "./permissions";
 import { nonEmpty } from "./validation";
 import { takeWithOverflow } from "./queryLimits";
 import { trackerVehicleValidator, type TrackerVehicle, EMPTY_TRACKER_RESPONSE_MESSAGE } from "./fleetTracker";
+import { isStorageBlobOwned } from "./uploadOwnership";
 
 export const MAX_FLEET_VEHICLES = 500;
 export const MAX_FLEET_DRIVERS = 200;
@@ -70,49 +72,6 @@ export async function loadLatestServices(
   const latest = new Map<Id<"fleetVehicles">, Doc<"fleetServiceEntries"> | null>();
   for (const vehicle of vehicles) latest.set(vehicle._id, await loadLatestService(ctx, vehicle._id));
   return latest;
-}
-
-async function hasEntryBlobReference(
-  ctx: QueryCtx | MutationCtx,
-  storageId: Id<"_storage">,
-) {
-  const [fuel, service] = await Promise.all([
-    ctx.db
-      .query("fleetFuelEntries")
-      .withIndex("by_photoStorageId", (q) => q.eq("photoStorageId", storageId))
-      .first(),
-    ctx.db
-      .query("fleetServiceEntries")
-      .withIndex("by_photoStorageId", (q) => q.eq("photoStorageId", storageId))
-      .first(),
-  ]);
-  return Boolean(fuel || service);
-}
-
-/** A blob already owned by a fleet entry cannot be claimed by a new save. */
-export async function isFleetEntryBlobReferenced(
-  ctx: QueryCtx | MutationCtx,
-  storageId: Id<"_storage">,
-) {
-  return await hasEntryBlobReference(ctx, storageId);
-}
-
-/**
- * True when a blob is still owned by a fleet entry or another upload claim.
- * Cleanup must check this before deleting storage.
- */
-export async function isFleetBlobReferenced(
-  ctx: QueryCtx | MutationCtx,
-  storageId: Id<"_storage">,
-) {
-  const [entryReference, claim] = await Promise.all([
-    hasEntryBlobReference(ctx, storageId),
-    ctx.db
-      .query("fleetUploadClaims")
-      .withIndex("by_storageId", (q) => q.eq("storageId", storageId))
-      .first(),
-  ]);
-  return entryReference || Boolean(claim);
 }
 
 async function upsertTrackerVehicles(
@@ -238,6 +197,7 @@ export const getSyncSource = internalQuery({
             secretKey: connection.secretKey,
             lastSyncAt: connection.lastSyncAt ?? null,
             connectedAt: connection.connectedAt,
+            generation: connection.generation ?? 0,
           },
         }
       : { connection: null };
@@ -275,11 +235,13 @@ export const saveConnectionAndSync = internalMutation({
     companyId: v.id("companies"),
     secretKey: v.string(),
     keyHint: v.string(),
-    connectedByMembershipId: v.id("companyMemberships"),
     now: v.number(),
     vehicles: v.array(trackerVehicleValidator),
   },
   handler: async (ctx, args) => {
+    // The action authorized before the network call; re-check after it so a
+    // revoked member cannot still replace the company's tracker key.
+    const { membership } = await requireCapability(ctx, args.companyId, "fleet:manage");
     // A valid key that suddenly reports no vehicles is far more likely to be
     // the wrong tracker account than a fleet disappearing. Save nothing.
     if (args.vehicles.length === 0 && (await hasExistingVehicles(ctx, args.companyId))) {
@@ -294,9 +256,12 @@ export const saveConnectionAndSync = internalMutation({
         secretKey: args.secretKey,
         keyHint: args.keyHint,
         connectedAt: args.now,
-        connectedByMembershipId: args.connectedByMembershipId,
+        connectedByMembershipId: membership._id,
         lastSyncAt: args.now,
+        lastSyncAttemptAt: args.now,
         lastSyncError: undefined,
+        // Replacing a key invalidates any sync already in flight for the old one.
+        generation: (existing.generation ?? 0) + 1,
         updatedAt: args.now,
       });
     } else {
@@ -305,8 +270,10 @@ export const saveConnectionAndSync = internalMutation({
         secretKey: args.secretKey,
         keyHint: args.keyHint,
         connectedAt: args.now,
-        connectedByMembershipId: args.connectedByMembershipId,
+        connectedByMembershipId: membership._id,
         lastSyncAt: args.now,
+        lastSyncAttemptAt: args.now,
+        generation: 1,
         updatedAt: args.now,
       });
     }
@@ -318,34 +285,55 @@ export const saveConnectionAndSync = internalMutation({
 export const applyTrackerSync = internalMutation({
   args: {
     companyId: v.id("companies"),
+    connectionGeneration: v.number(),
     now: v.number(),
     vehicles: v.array(trackerVehicleValidator),
   },
   handler: async (ctx, args) => {
-    // An empty response while a fleet already exists must not mark every
-    // vehicle missing or count as a successful sync.
-    if (args.vehicles.length === 0 && (await hasExistingVehicles(ctx, args.companyId))) {
-      return { inserted: 0, updated: 0, unchanged: 0, missing: 0, present: 0, emptyResponse: true };
-    }
-    const counts = await upsertTrackerVehicles(ctx, args.companyId, args.vehicles, args.now);
+    // A key may have been replaced or disconnected while the request was in
+    // flight. Reject stale work before reading or writing anything else.
     const connection = await ctx.db
       .query("fleetTrackerConnections")
       .withIndex("by_company", (q) => q.eq("companyId", args.companyId))
       .unique();
-    if (connection) {
-      await ctx.db.patch(connection._id, {
-        lastSyncAt: args.now,
-        lastSyncError: undefined,
-        updatedAt: args.now,
-      });
+    if (!connection || (connection.generation ?? 0) !== args.connectionGeneration) {
+      return {
+        inserted: 0,
+        updated: 0,
+        unchanged: 0,
+        missing: 0,
+        present: 0,
+        emptyResponse: false,
+        stale: true,
+      };
     }
-    return { ...counts, emptyResponse: false };
+    // An empty response while a fleet already exists must not mark every
+    // vehicle missing or count as a successful sync.
+    if (args.vehicles.length === 0 && (await hasExistingVehicles(ctx, args.companyId))) {
+      return {
+        inserted: 0,
+        updated: 0,
+        unchanged: 0,
+        missing: 0,
+        present: 0,
+        emptyResponse: true,
+        stale: false,
+      };
+    }
+    const counts = await upsertTrackerVehicles(ctx, args.companyId, args.vehicles, args.now);
+    await ctx.db.patch(connection._id, {
+      lastSyncAt: args.now,
+      lastSyncError: undefined,
+      updatedAt: args.now,
+    });
+    return { ...counts, emptyResponse: false, stale: false };
   },
 });
 
 export const recordSyncFailure = internalMutation({
   args: {
     companyId: v.id("companies"),
+    connectionGeneration: v.number(),
     message: v.string(),
     now: v.number(),
   },
@@ -354,20 +342,54 @@ export const recordSyncFailure = internalMutation({
       .query("fleetTrackerConnections")
       .withIndex("by_company", (q) => q.eq("companyId", args.companyId))
       .unique();
-    if (connection) {
-      await ctx.db.patch(connection._id, {
-        lastSyncError: args.message,
-        updatedAt: args.now,
-      });
+    if (!connection || (connection.generation ?? 0) !== args.connectionGeneration) {
+      return null;
     }
+    await ctx.db.patch(connection._id, {
+      lastSyncError: args.message,
+      updatedAt: args.now,
+    });
     return null;
+  },
+});
+
+export const reserveSyncAttempt = internalMutation({
+  args: { companyId: v.id("companies"), now: v.number(), cooldownMs: v.number() },
+  handler: async (ctx, args) => {
+    const connection = await ctx.db
+      .query("fleetTrackerConnections")
+      .withIndex("by_company", (q) => q.eq("companyId", args.companyId))
+      .unique();
+    if (!connection) {
+      return { reserved: false, reason: "not_connected" as const, lastSyncAt: null };
+    }
+    if (
+      connection.lastSyncAttemptAt !== undefined &&
+      args.now - connection.lastSyncAttemptAt < args.cooldownMs
+    ) {
+      return {
+        reserved: false,
+        reason: "cooldown" as const,
+        lastSyncAt: connection.lastSyncAt ?? null,
+      };
+    }
+    // Reserve the attempt atomically before the network call so concurrent
+    // taps and failed attempts cannot bypass the cooldown.
+    await ctx.db.patch(connection._id, {
+      lastSyncAttemptAt: args.now,
+      updatedAt: args.now,
+    });
+    return {
+      reserved: true,
+      reason: null,
+      lastSyncAt: connection.lastSyncAt ?? null,
+    };
   },
 });
 
 export const applyStartTrip = internalMutation({
   args: {
     companyId: v.id("companies"),
-    membershipId: v.id("companyMemberships"),
     vehicleId: v.id("fleetVehicles"),
     driverId: v.id("fleetDrivers"),
     destination: v.string(),
@@ -376,6 +398,8 @@ export const applyStartTrip = internalMutation({
     now: v.number(),
   },
   handler: async (ctx, args) => {
+    // Re-check after any tracker fetch; the action's earlier check can be stale.
+    const { membership } = await requireCapability(ctx, args.companyId, "fleet:log");
     const vehicle = await ctx.db.get(args.vehicleId);
     if (!vehicle || vehicle.companyId !== args.companyId) throw new ConvexError("Vehicle not found.");
     const driver = await ctx.db.get(args.driverId);
@@ -402,6 +426,14 @@ export const applyStartTrip = internalMutation({
     const destination = nonEmpty(args.destination, "Destination");
     if (destination.length > MAX_DESTINATION) throw new ConvexError("Destination is too long.");
     const notes = args.notes?.trim();
+    // Only borrow the tracker reading if no newer reading could include driving
+    // after the departure. Otherwise leave it for correction.
+    const startOdometerMeters =
+      vehicle.odometerMeters !== undefined &&
+      vehicle.recordedAt !== undefined &&
+      vehicle.recordedAt <= departedAt
+        ? vehicle.odometerMeters
+        : undefined;
 
     const tripId = await ctx.db.insert("fleetTrips", {
       companyId: args.companyId,
@@ -411,14 +443,12 @@ export const applyStartTrip = internalMutation({
       ...(notes ? { notes } : {}),
       status: "open",
       departedAt,
-      ...(vehicle.odometerMeters !== undefined
-        ? { startOdometerMeters: vehicle.odometerMeters }
-        : {}),
-      createdByMembershipId: args.membershipId,
+      ...(startOdometerMeters !== undefined ? { startOdometerMeters } : {}),
+      createdByMembershipId: membership._id,
       createdAt: args.now,
       updatedAt: args.now,
     });
-    return { tripId, startOdometerMeters: vehicle.odometerMeters ?? null };
+    return { tripId, startOdometerMeters: startOdometerMeters ?? null };
   },
 });
 
@@ -430,6 +460,7 @@ export const applyReturnTrip = internalMutation({
     now: v.number(),
   },
   handler: async (ctx, args) => {
+    await requireCapability(ctx, args.companyId, "fleet:log");
     const trip = await ctx.db.get(args.tripId);
     if (!trip || trip.companyId !== args.companyId) throw new ConvexError("Trip not found.");
     if (trip.status === "returned") {
@@ -446,8 +477,15 @@ export const applyReturnTrip = internalMutation({
       throw new ConvexError("Return time cannot be before departure.");
     }
     const vehicle = await ctx.db.get(trip.vehicleId);
+    // A backdated return must not borrow a reading that may include later driving.
     const endOdometerMeters =
-      vehicle && vehicle.companyId === args.companyId ? vehicle.odometerMeters : undefined;
+      vehicle &&
+      vehicle.companyId === args.companyId &&
+      vehicle.odometerMeters !== undefined &&
+      vehicle.recordedAt !== undefined &&
+      vehicle.recordedAt <= returnedAt
+        ? vehicle.odometerMeters
+        : undefined;
     await ctx.db.patch(trip._id, {
       status: "returned",
       returnedAt,
@@ -479,7 +517,7 @@ export const sweepExpiredFleetUploadClaims = internalMutation({
       if (claim.createdAt >= cutoff) return null;
       const storageId = claim.storageId;
       await ctx.db.delete(claim._id);
-      if (storageId && !(await isFleetBlobReferenced(ctx, storageId))) {
+      if (storageId && !(await isStorageBlobOwned(ctx, storageId))) {
         await ctx.storage.delete(storageId);
       }
     }

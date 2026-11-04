@@ -62,6 +62,10 @@ function stubTrackerDown() {
   );
 }
 
+function fetchCallCount() {
+  return (globalThis.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
+}
+
 function stubTrackerRejected() {
   vi.stubGlobal(
     "fetch",
@@ -258,6 +262,68 @@ describe("fleet sync", () => {
       await f.asUser("adminB").query(api.fleet.getConnection, { companyId: f.companyB }),
     ).toMatchObject({ connected: true, vehicleCount: 0 });
   });
+
+  test("sync now reserves its attempt before the fetch, so a failure still cools down", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    await connectVehicles(f, [rawVehicle("APL-079", 100_000_000)]);
+
+    // Past the cooldown created by connect, so this attempt is allowed.
+    vi.setSystemTime(pinnedNow + 2 * 60_000);
+    stubTrackerDown();
+    await expect(
+      admin.action(api.fleet.syncNow, { companyId: f.companyA }),
+    ).rejects.toThrow("Could not reach the tracker.");
+    const callsAfterFailure = fetchCallCount();
+    expect(callsAfterFailure).toBe(1);
+
+    // The failed attempt reserved the cooldown, so the retry does not fetch.
+    const retried = await admin.action(api.fleet.syncNow, { companyId: f.companyA });
+    expect(retried.skipped).toBe(true);
+    expect(fetchCallCount()).toBe(callsAfterFailure);
+  });
+
+  test("a sync reply for a key replaced mid-flight is discarded", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    await connectVehicles(f, [rawVehicle("APL-079", 100_000_000)]);
+    const connection = await f.t.run((ctx) =>
+      ctx.db
+        .query("fleetTrackerConnections")
+        .withIndex("by_company", (q) => q.eq("companyId", f.companyA))
+        .unique(),
+    );
+
+    vi.setSystemTime(pinnedNow + 2 * 60_000);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        // Replace the key while the old key's request is in flight.
+        await f.t.run(async (ctx) => {
+          await ctx.db.patch(connection!._id, {
+            generation: (connection!.generation ?? 0) + 1,
+            secretKey: "replaced-key",
+          });
+        });
+        return new Response(
+          trackerBody([
+            rawVehicle("APL-079", 999_000_000, {
+              RecordDateTime: `/Date(${pinnedNow + 2 * 60_000})/`,
+            }),
+          ]),
+          { status: 200 },
+        );
+      }),
+    );
+
+    const result = await admin.action(api.fleet.syncNow, { companyId: f.companyA });
+    expect(result.skipped).toBe(true);
+    const vehicles = await admin.query(api.fleet.listVehicles, {
+      companyId: f.companyA,
+      now: Date.now(),
+    });
+    expect(vehicles.vehicles[0].odometerMeters).toBe(100_000_000);
+  });
 });
 
 describe("fleet trips", () => {
@@ -306,10 +372,10 @@ describe("fleet trips", () => {
     // Tracker is back: returning captures the fresh odometer.
     stubTracker([
       rawVehicle("APL-079", 100_003_500, {
-        RecordDateTime: `/Date(${pinnedNow + 60_000})/`,
+        RecordDateTime: `/Date(${pinnedNow})/`,
       }),
       rawVehicle("LE-3166", 20_000_000, {
-        RecordDateTime: `/Date(${pinnedNow + 60_000})/`,
+        RecordDateTime: `/Date(${pinnedNow})/`,
       }),
     ]);
     const returned = await admin.action(api.fleet.returnTrip, {
@@ -346,6 +412,82 @@ describe("fleet trips", () => {
       tripId: started.tripId,
     });
     expect(again.alreadyReturned).toBe(true);
+  });
+
+  test("a vehicle that disappears while on a trip still raises a missing alert", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    await connectVehicles(f, [
+      rawVehicle("APL-079", 100_000_000),
+      rawVehicle("LE-3166", 20_000_000),
+    ]);
+    const ids = await vehicleIdsByName(f);
+    const driverId = await admin.mutation(api.fleet.createDriver, {
+      companyId: f.companyA,
+      name: "Bilal",
+    });
+
+    stubTrackerDown();
+    await admin.action(api.fleet.startTrip, {
+      companyId: f.companyA,
+      vehicleId: ids.get("APL-079")!,
+      driverId,
+      destination: "Depot",
+    });
+
+    // The next successful response omits the vehicle that is out on a trip.
+    vi.setSystemTime(pinnedNow + 5 * 60_000);
+    stubTracker([
+      rawVehicle("LE-3166", 20_000_000, {
+        RecordDateTime: `/Date(${pinnedNow + 5 * 60_000})/`,
+      }),
+    ]);
+    await admin.action(api.fleet.syncNow, { companyId: f.companyA });
+
+    const alerts = await admin.query(api.fleet.alerts, {
+      companyId: f.companyA,
+      now: Date.now(),
+    });
+    expect(
+      alerts.alerts.some(
+        (alert) => alert.kind === "vehicle_missing" && alert.vehicleId === ids.get("APL-079"),
+      ),
+    ).toBe(true);
+  });
+
+  test("a trip start re-checks permission after the tracker fetch", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    await connectVehicles(f, [rawVehicle("APL-079", 100_000_000)]);
+    const ids = await vehicleIdsByName(f);
+    const driverId = await admin.mutation(api.fleet.createDriver, {
+      companyId: f.companyA,
+      name: "Bilal",
+    });
+    const manager = f.asUser("managerA");
+
+    // The Manager has fleet:log when the action authorizes, then loses it
+    // while the tracker fetch is in flight.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        await f.setRoleCapabilities(
+          f.companyA,
+          "Manager",
+          defaultRoleCapabilities.Manager.filter((capability) => capability !== "fleet:log"),
+        );
+        return new Response(trackerBody([rawVehicle("APL-079", 100_000_000)]), { status: 200 });
+      }),
+    );
+
+    await expect(
+      manager.action(api.fleet.startTrip, {
+        companyId: f.companyA,
+        vehicleId: ids.get("APL-079")!,
+        driverId,
+        destination: "Depot",
+      }),
+    ).rejects.toThrow("You do not have access to do that.");
   });
 });
 
@@ -651,6 +793,187 @@ describe("fleet fuel", () => {
       size: 5,
     });
     expect(list.page[0].odometerMeters).toBe(100_000_000);
+  });
+
+  test("the anomaly baseline includes fills before the spend window", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    await connectVehicles(f, [rawVehicle("APL-079", 92_800_000)]);
+    await f.t.run(async (ctx) => {
+      await ctx.db.patch(f.companyA, { timeZone: "UTC" });
+    });
+    const ids = await vehicleIdsByName(f);
+    const vehicleId = ids.get("APL-079")!;
+
+    // Six 10 km/L fills before 1 Aug, then a 6 km/L fill on 20 Oct. The four
+    // fills from May–July establish the baseline the spend window omits.
+    const filledAt = [
+      Date.UTC(2026, 4, 1, 12),
+      Date.UTC(2026, 4, 15, 12),
+      Date.UTC(2026, 5, 1, 12),
+      Date.UTC(2026, 5, 15, 12),
+      Date.UTC(2026, 6, 1, 12),
+      Date.UTC(2026, 6, 15, 12),
+      Date.UTC(2026, 9, 20, 12),
+    ];
+    const odometers = [
+      90_000_000, 90_500_000, 91_000_000, 91_500_000, 92_000_000, 92_500_000, 92_800_000,
+    ];
+    await f.t.run(async (ctx) => {
+      for (let index = 0; index < filledAt.length; index += 1) {
+        const storageId = await ctx.storage.store(
+          new Blob([`baseline-${index}`], { type: "image/jpeg" }),
+        );
+        await ctx.db.insert("fleetFuelEntries", {
+          companyId: f.companyA,
+          vehicleId,
+          filledAt: filledAt[index],
+          litres: 50,
+          amount: 1_000,
+          odometerMeters: odometers[index],
+          photoStorageId: storageId,
+          photoFileName: `baseline-${index}.jpg`,
+          photoContentType: "image/jpeg",
+          photoSize: 8,
+          createdByMembershipId: f.adminM,
+          createdAt: pinnedNow,
+          updatedAt: pinnedNow,
+        });
+      }
+    });
+
+    const insights = await admin.query(api.fleet.fuelInsights, {
+      companyId: f.companyA,
+      now: pinnedNow,
+    });
+    expect(insights.anomalies).toHaveLength(1);
+    expect(insights.anomalies[0]).toMatchObject({ kmPerL: 6, medianKmPerL: 10 });
+  });
+
+  test("a backdated entry never borrows a newer tracker odometer", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    await connectVehicles(f, [
+      rawVehicle("APL-079", 100_000_000, { RecordDateTime: `/Date(${pinnedNow})/` }),
+    ]);
+    const ids = await vehicleIdsByName(f);
+    const vehicleId = ids.get("APL-079")!;
+
+    // Omitted time means "now", so the tracker reading is usable.
+    const todayServiceId = await admin.mutation(api.fleet.createServiceEntry, {
+      companyId: f.companyA,
+      vehicleId,
+      description: "Today's service",
+    });
+    // A backdated service must not borrow a reading that may include later driving.
+    const backdatedServiceId = await admin.mutation(api.fleet.createServiceEntry, {
+      companyId: f.companyA,
+      vehicleId,
+      servicedAt: pinnedNow - DAY_MS,
+      description: "Old service",
+    });
+    const services = await admin.query(api.fleet.listServiceEntries, {
+      companyId: f.companyA,
+      paginationOpts: { numItems: 10, cursor: null },
+    });
+    const byId = new Map(services.page.map((row) => [row._id, row]));
+    expect(byId.get(todayServiceId)?.odometerMeters).toBe(100_000_000);
+    expect(byId.get(backdatedServiceId)?.odometerMeters).toBeNull();
+
+    // Fuel needs an odometer for km/L, so a backdated fill-up without an
+    // explicit reading is rejected.
+    const upload = await admin.mutation(api.fleet.generateUploadUrl, {
+      companyId: f.companyA,
+    });
+    const storageId = await f.t.run(async (ctx) => {
+      const id = await ctx.storage.store(new Blob(["photo"], { type: "image/jpeg" }));
+      await (ctx.db as unknown as { patch: (table: string, id: string, value: object) => Promise<void> }).patch(
+        "_storage",
+        id,
+        { contentType: "image/jpeg" },
+      );
+      return id;
+    });
+    await admin.mutation(api.fleet.bindUploadClaim, {
+      companyId: f.companyA,
+      claimId: upload.claimId,
+      storageId,
+    });
+    await expect(
+      admin.mutation(api.fleet.createFuelEntry, {
+        companyId: f.companyA,
+        vehicleId,
+        filledAt: pinnedNow - DAY_MS,
+        litres: 10,
+        amount: 1_000,
+        photo: { storageId, claimId: upload.claimId, fileName: "old.jpg" },
+      }),
+    ).rejects.toThrow("Enter the odometer reading for a backdated fill-up.");
+    await admin.mutation(api.fleet.discardUpload, {
+      companyId: f.companyA,
+      claimId: upload.claimId,
+    });
+  });
+});
+
+describe("fleet upload ownership", () => {
+  test("a fleet upload claim cannot bind or delete a task attachment blob", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    const taskId = await admin.mutation(api.tasks.createOneTime, {
+      companyId: f.companyA,
+      title: "Photo task",
+      dueDate: pinnedNow + DAY_MS,
+      priority: "medium",
+      assigneeMembershipIds: [f.adminM],
+    });
+
+    // Both claims are issued before the blob exists, so only the shared
+    // ownership check (not the creation-time check) can reject the crossing.
+    const fleetClaim = await admin.mutation(api.fleet.generateUploadUrl, {
+      companyId: f.companyA,
+    });
+    const taskClaim = await admin.mutation(api.tasks.generateAttachmentUploadUrl, {
+      companyId: f.companyA,
+    });
+    const storageId = await f.t.run(async (ctx) => {
+      const id = await ctx.storage.store(new Blob(["photo"], { type: "image/jpeg" }));
+      await (ctx.db as unknown as { patch: (table: string, id: string, value: object) => Promise<void> }).patch(
+        "_storage",
+        id,
+        { contentType: "image/jpeg" },
+      );
+      return id;
+    });
+    await admin.mutation(api.tasks.bindUploadClaim, {
+      companyId: f.companyA,
+      claimId: taskClaim.claimId,
+      storageId,
+    });
+    await admin.mutation(api.tasks.addAttachment, {
+      companyId: f.companyA,
+      taskType: "one_time",
+      taskId,
+      storageId,
+      fileName: "photo.jpg",
+      contentType: "image/jpeg",
+      size: 5,
+      claimId: taskClaim.claimId,
+    });
+
+    const bound = await admin.mutation(api.fleet.bindUploadClaim, {
+      companyId: f.companyA,
+      claimId: fleetClaim.claimId,
+      storageId,
+    });
+    expect(bound).toMatchObject({ ok: false, error: "This photo is already attached." });
+
+    await admin.mutation(api.fleet.discardUpload, {
+      companyId: f.companyA,
+      claimId: fleetClaim.claimId,
+    });
+    // The task's file survives the fleet cleanup path.
+    expect(await f.t.run((ctx) => ctx.db.system.get("_storage", storageId))).not.toBeNull();
   });
 });
 

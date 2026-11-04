@@ -105,6 +105,7 @@ export function median(values: readonly number[]): number | null {
 
 export type FuelFill = {
   id: string;
+  creationTime: number;
   filledAt: number;
   litres: number;
   amount: number;
@@ -125,7 +126,9 @@ export type FuelPoint = FuelFill & {
  */
 export function computeFuelSeries(fills: readonly FuelFill[]): FuelPoint[] {
   const sorted = [...fills].sort((a, b) =>
-    a.filledAt === b.filledAt ? a.id.localeCompare(b.id) : a.filledAt - b.filledAt,
+    a.filledAt === b.filledAt
+      ? a.creationTime - b.creationTime
+      : a.filledAt - b.filledAt,
   );
   const efficiencies: (number | null)[] = sorted.map(() => null);
 

@@ -17,7 +17,7 @@ import {
   Wrench,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../../../convex/_generated/api";
 import type { Id } from "../../../convex/_generated/dataModel";
 import { Badge } from "@/components/ui/badge";
@@ -835,6 +835,7 @@ function MaintenanceTab({
   const router = useRouter();
   const [editingEntry, setEditingEntry] = useState<FleetServiceRow | null>(null);
   const [deletingEntry, setDeletingEntry] = useState<FleetServiceRow | null>(null);
+  const [photo, setPhoto] = useState<{ url: string; label: string } | null>(null);
   const deleteServiceEntry = useMutation(api.fleet.deleteServiceEntry);
   const dueResult = useQuery(api.fleet.maintenanceStatus, { companyId, now });
   const serviceQuery = usePaginatedQuery(api.fleet.listServiceEntries, { companyId }, { initialNumItems: 20 });
@@ -900,7 +901,7 @@ function MaintenanceTab({
       ) : (
         <>
           <div className="hidden overflow-x-auto rounded-md border border-[var(--hairline)] md:block">
-            <table className="task-table min-w-[720px]">
+            <table className="task-table min-w-[800px]">
               <thead>
                 <tr>
                   <th scope="col">Vehicle</th>
@@ -908,12 +909,14 @@ function MaintenanceTab({
                   <th scope="col">Description</th>
                   <th scope="col" className="text-right">Odometer</th>
                   <th scope="col" className="text-right">Cost</th>
+                  <th scope="col">Photo</th>
                   {canManage && <th scope="col"><span className="sr-only">Actions</span></th>}
                 </tr>
               </thead>
               <tbody>
                 {rows.map((entry) => {
                   const name = entry.vehicle?.name ?? "Unknown vehicle";
+                  const photoUrl = entry.photo?.url ?? null;
                   return (
                     <tr key={entry._id}>
                       <td className="font-medium text-[var(--ink)]">{name}</td>
@@ -921,6 +924,19 @@ function MaintenanceTab({
                       <td className="max-w-[260px] truncate">{entry.description}</td>
                       <td className="text-right tabular-nums">{formatKm(entry.odometerKm)}</td>
                       <td className="text-right tabular-nums">{entry.cost == null ? "—" : formatAmount(entry.cost)}</td>
+                      <td>
+                        {photoUrl ? (
+                          <button
+                            type="button"
+                            className="h-9 w-9 rounded border border-[var(--hairline)] bg-[var(--surface-muted)] bg-cover bg-center"
+                            style={{ backgroundImage: `url(${photoUrl})` }}
+                            aria-label={`View service photo for ${name}`}
+                            onClick={() => setPhoto({ url: photoUrl, label: `Service photo · ${name}` })}
+                          />
+                        ) : (
+                          <span className="text-[var(--ink-faint)]">—</span>
+                        )}
+                      </td>
                       {canManage && (
                         <td className="w-10">
                           <RecordMenu
@@ -940,6 +956,7 @@ function MaintenanceTab({
           <div className="grid gap-2 md:hidden">
             {rows.map((entry) => {
               const name = entry.vehicle?.name ?? "Unknown vehicle";
+              const photoUrl = entry.photo?.url ?? null;
               return (
                 <div key={entry._id} className="rounded-md border border-[var(--hairline)] bg-[var(--surface)] p-3">
                   <div className="flex items-start justify-between gap-2">
@@ -947,13 +964,24 @@ function MaintenanceTab({
                       <div className="truncate text-sm font-semibold text-[var(--ink)]">{name}</div>
                       <div className="text-[12px] text-[var(--ink-faint)]">{formatDateOnly(entry.servicedAt)}</div>
                     </div>
-                    {canManage && (
-                      <RecordMenu
-                        label={`service for ${name}`}
-                        onEdit={() => setEditingEntry(entry)}
-                        onDelete={() => setDeletingEntry(entry)}
-                      />
-                    )}
+                    <div className="flex items-center gap-1">
+                      {photoUrl && (
+                        <button
+                          type="button"
+                          className="h-10 w-10 shrink-0 rounded border border-[var(--hairline)] bg-[var(--surface-muted)] bg-cover bg-center"
+                          style={{ backgroundImage: `url(${photoUrl})` }}
+                          aria-label={`View service photo for ${name}`}
+                          onClick={() => setPhoto({ url: photoUrl, label: `Service photo · ${name}` })}
+                        />
+                      )}
+                      {canManage && (
+                        <RecordMenu
+                          label={`service for ${name}`}
+                          onEdit={() => setEditingEntry(entry)}
+                          onDelete={() => setDeletingEntry(entry)}
+                        />
+                      )}
+                    </div>
                   </div>
                   <p className="mt-1 text-[13px] text-[var(--ink-secondary)]">{entry.description}</p>
                   <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-1 text-[12px] text-[var(--ink-muted)]">
@@ -978,6 +1006,7 @@ function MaintenanceTab({
           onClose={() => setEditingEntry(null)}
         />
       )}
+      {photo && <PhotoLightbox url={photo.url} label={photo.label} onClose={() => setPhoto(null)} />}
       {deletingEntry && (
         <ConfirmDialog
           open
@@ -986,6 +1015,23 @@ function MaintenanceTab({
           onConfirm={async () => { await deleteServiceEntry({ companyId, entryId: deletingEntry._id }); }}
           onClose={() => setDeletingEntry(null)}
         />
+      )}
+    </div>
+  );
+}
+
+function DisconnectedBanner({ canManage, onConnect }: { canManage: boolean; onConnect: () => void }) {
+  return (
+    <div className="mb-4 flex flex-wrap items-center gap-2 rounded-md border border-[var(--hairline)] bg-[var(--surface-muted)] px-3 py-2.5">
+      <AlertTriangle className="h-4 w-4 shrink-0 text-[var(--badge-yellow-fg)]" />
+      <p className="min-w-0 flex-1 text-[13px] text-[var(--ink-secondary)]">
+        Tracker disconnected. Existing vehicles, history and manual logging still work.
+        {!canManage && " Ask an admin to reconnect the tracker."}
+      </p>
+      {canManage && (
+        <Button type="button" variant="secondary" className="h-9 shrink-0" onClick={onConnect}>
+          Reconnect tracker
+        </Button>
       )}
     </div>
   );
@@ -1058,9 +1104,11 @@ function FleetListContent({
   );
   const connection = connectionResult as FleetConnection | undefined;
   const connected = connection?.connected === true;
+  const hasVehicles = (connection?.vehicleCount ?? 0) > 0;
+  // Alerts derive from history too, so they stay available while disconnected.
   const alertsResult = useQuery(
     api.fleet.alerts,
-    activeCompanyId && canView && connected ? { companyId: activeCompanyId, now } : "skip",
+    activeCompanyId && canView ? { companyId: activeCompanyId, now } : "skip",
   );
   const syncNow = useAction(api.fleet.syncNow);
 
@@ -1114,7 +1162,7 @@ function FleetListContent({
 
   const actions = (
     <div className="flex flex-wrap items-center justify-end gap-2">
-      {connected && canLog && (
+      {canLog && (connected || hasVehicles) && (
         <div className="flex w-full gap-2 sm:w-auto">
           <Button type="button" size="lg" variant="primary" className="h-10 flex-1 px-2 text-[13px] sm:flex-none sm:px-3 sm:text-sm" onClick={() => setLog({ kind: "trip" })}>
             <Route className="hidden h-4 w-4 sm:block" />
@@ -1167,10 +1215,13 @@ function FleetListContent({
 
       {connectionResult === undefined ? (
         <TabSkeleton />
-      ) : !connected ? (
+      ) : !connected && !hasVehicles ? (
         <NotConnectedPanel canManage={canManage} onConnect={() => setSettingsOpen(true)} />
       ) : (
         <>
+          {!connected && (
+            <DisconnectedBanner canManage={canManage} onConnect={() => setSettingsOpen(true)} />
+          )}
           {alertsResult && alertsResult.alerts.length > 0 && (
             <AlertsPanel alerts={alertsResult.alerts as FleetAlertRow[]} now={now} onSelect={openAlert} />
           )}
@@ -1429,15 +1480,31 @@ function VehicleDetailContent({ id }: { id: string }) {
   const { activeCompanyId, active } = useCompany();
   const now = useMinuteNow();
   const [log, setLog] = useState<LogState | null>(null);
+  const [photo, setPhoto] = useState<{ url: string; label: string } | null>(null);
   const canLog = hasCapability(active, "fleet:log");
   const canManage = hasCapability(active, "fleet:manage");
+  const identity = activeCompanyId ? `${activeCompanyId}:${id}` : null;
+  // Keep the last successful detail while a clock tick refreshes the query, so
+  // rename/interval inputs are not unmounted every minute.
+  const [lastDetail, setLastDetail] = useState<{ key: string; detail: FleetVehicleDetail } | null>(null);
   const detailResult = useQuery_experimental({
     query: api.fleet.getVehicle,
     args: activeCompanyId
       ? { companyId: activeCompanyId, vehicleId: id as Id<"fleetVehicles">, now }
       : "skip",
   });
-  const detail = detailResult.status === "success" ? (detailResult.data as FleetVehicleDetail) : undefined;
+  const liveDetail = detailResult.status === "success" ? (detailResult.data as FleetVehicleDetail) : undefined;
+  useEffect(() => {
+    if (liveDetail && identity) setLastDetail({ key: identity, detail: liveDetail });
+  }, [identity, liveDetail]);
+  useEffect(() => {
+    if (!identity) {
+      setLastDetail(null);
+      return;
+    }
+    if (lastDetail && lastDetail.key !== identity) setLastDetail(null);
+  }, [identity, lastDetail]);
+  const detail = liveDetail ?? (identity && lastDetail?.key === identity ? lastDetail.detail : undefined);
 
   function close() {
     if (!requestDetailDrawerClose("/fleet")) router.push("/fleet");
@@ -1617,23 +1684,38 @@ function VehicleDetailContent({ id }: { id: string }) {
           <p className="text-[13px] text-[var(--ink-muted)]">No service entries yet.</p>
         ) : (
           <div className="divide-y divide-[var(--hairline)] rounded-md border border-[var(--hairline)] bg-[var(--surface)]">
-            {detail.recentServices.map((entry) => (
-              <div key={entry._id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5">
-                <div className="min-w-0">
-                  <div className="text-[13px] text-[var(--ink)]">{entry.description}</div>
-                  <div className="text-[12px] text-[var(--ink-muted)]">
-                    {formatDateOnly(entry.servicedAt)} · {formatKm(entry.odometerKm)}
+            {detail.recentServices.map((entry) => {
+              const photoUrl = entry.photo?.url ?? null;
+              return (
+                <div key={entry._id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5">
+                  <div className="min-w-0">
+                    <div className="text-[13px] text-[var(--ink)]">{entry.description}</div>
+                    <div className="text-[12px] text-[var(--ink-muted)]">
+                      {formatDateOnly(entry.servicedAt)} · {formatKm(entry.odometerKm)}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {photoUrl && (
+                      <button
+                        type="button"
+                        className="h-9 w-9 shrink-0 rounded border border-[var(--hairline)] bg-[var(--surface-muted)] bg-cover bg-center"
+                        style={{ backgroundImage: `url(${photoUrl})` }}
+                        aria-label={`View service photo for ${vehicle.name}`}
+                        onClick={() => setPhoto({ url: photoUrl, label: `Service photo · ${vehicle.name}` })}
+                      />
+                    )}
+                    <div className="text-[13px] tabular-nums text-[var(--ink)]">
+                      {entry.cost == null ? "—" : formatAmount(entry.cost)}
+                    </div>
                   </div>
                 </div>
-                <div className="text-[13px] tabular-nums text-[var(--ink)]">
-                  {entry.cost == null ? "—" : formatAmount(entry.cost)}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </section>
 
+      {photo && <PhotoLightbox url={photo.url} label={photo.label} onClose={() => setPhoto(null)} />}
       {activeCompanyId && log?.kind === "trip" && (
         <TripDialog
           mode="create"

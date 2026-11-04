@@ -388,7 +388,7 @@ export function TripDialog({
   const startTrip = useAction(api.fleet.startTrip);
   const updateTrip = useMutation(api.fleet.updateTrip);
   const vehiclesResult = useQuery(api.fleet.listVehicles, { companyId, now });
-  const driversResult = useQuery(api.fleet.listDrivers, { companyId });
+  const driversResult = useQuery(api.fleet.listDrivers, { companyId, includeInactive: true });
   const openTripsResult = useQuery(api.fleet.listOpenTrips, { companyId });
   const vehicles = vehiclesResult?.vehicles;
   const drivers = driversResult?.drivers;
@@ -429,9 +429,11 @@ export function TripDialog({
 
   useEffect(() => {
     if (!drivers) return;
+    // A saved driver is never silently replaced; only a create form adopts a default.
+    if (editing && driverId) return;
     if (driverId && eligibleDrivers.some((driver) => driver._id === driverId)) return;
     setDriverId(eligibleDrivers[0]?._id ?? "");
-  }, [driverId, drivers, eligibleDrivers]);
+  }, [driverId, drivers, editing, eligibleDrivers]);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -509,7 +511,9 @@ export function TripDialog({
             >
               <option value="">{drivers ? "Select driver" : "Loading drivers…"}</option>
               {eligibleDrivers.map((driver) => (
-                <option key={driver._id} value={driver._id}>{driver.name}</option>
+                <option key={driver._id} value={driver._id}>
+                  {driver.name}{driver.active ? "" : " (inactive)"}
+                </option>
               ))}
             </SelectField>
           </Field>
@@ -568,7 +572,7 @@ export function FuelDialog({
   const createFuelEntry = useMutation(api.fleet.createFuelEntry);
   const updateFuelEntry = useMutation(api.fleet.updateFuelEntry);
   const vehiclesResult = useQuery(api.fleet.listVehicles, { companyId, now });
-  const driversResult = useQuery(api.fleet.listDrivers, { companyId });
+  const driversResult = useQuery(api.fleet.listDrivers, { companyId, includeInactive: true });
   const vehicles = vehiclesResult?.vehicles;
   const drivers = driversResult?.drivers;
   const editing = mode === "edit" && Boolean(entry);
@@ -579,11 +583,16 @@ export function FuelDialog({
   const [dateValue, setDateValue] = useState(
     entry ? dateFieldFromTimestamp(entry.filledAt) : dateFieldFromTimestamp(now),
   );
+  const [odometer, setOdometer] = useState(entry ? kmInputFromMeters(entry.odometerMeters) : "");
   const [litres, setLitres] = useState(entry ? String(entry.litres) : "");
   const [amount, setAmount] = useState(entry ? String(entry.amount) : "");
   const [notes, setNotes] = useState(entry?.notes ?? "");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const selectedVehicle = vehicles?.find((vehicle) => vehicle._id === vehicleId);
+  // Leaving the date at today means "now": the server may default the reading.
+  const isNow = !editing && dateValue === dateFieldFromTimestamp(now);
+  const odometerRequired = !editing && !isNow;
 
   useEffect(() => {
     if (!vehicles) return;
@@ -599,22 +608,30 @@ export function FuelDialog({
     if (!Number.isFinite(litresValue) || litresValue <= 0) { setError("Litres must be greater than zero."); return; }
     const amountValue = Number(amount);
     if (!Number.isFinite(amountValue) || amountValue < 0) { setError("Enter a valid amount."); return; }
+    const odometerMeters = metersFromKmInput(odometer);
+    if (odometer.trim() && odometerMeters === null) { setError("Odometer is invalid."); return; }
+    if (odometerRequired && odometerMeters === null) { setError("Odometer is required for a past date."); return; }
     if (!editing && !upload.photo) { setError("Add a photo of the fuel gauge or receipt."); return; }
     setSaving(true);
     setError(null);
     try {
       const filledAt = entry
         ? timestampForEditedDateField(dateValue, entry.filledAt)
-        : timestampForDateField(dateValue, now);
+        : isNow
+          ? null
+          : timestampForDateField(dateValue, now);
+      const timeArgs = filledAt === null ? {} : { filledAt };
+      const odometerArgs = odometerMeters === null ? {} : { odometerMeters };
       if (editing && entry) {
         await updateFuelEntry({
           companyId,
           entryId: entry._id,
           driverId: driverId ? (driverId as Id<"fleetDrivers">) : null,
-          filledAt,
+          ...timeArgs,
           litres: litresValue,
           amount: amountValue,
           notes: notes.trim() || null,
+          ...odometerArgs,
           ...(photoInput(upload.photo) ? { photo: photoInput(upload.photo)! } : {}),
         });
       } else {
@@ -624,10 +641,11 @@ export function FuelDialog({
           companyId,
           vehicleId: vehicleId as Id<"fleetVehicles">,
           driverId: driverId ? (driverId as Id<"fleetDrivers">) : undefined,
-          filledAt,
+          ...timeArgs,
           litres: litresValue,
           amount: amountValue,
           notes: notes.trim() || undefined,
+          ...odometerArgs,
           photo,
         });
       }
@@ -685,6 +703,29 @@ export function FuelDialog({
           <Field label="Date">
             <DateField value={dateValue} onChange={setDateValue} aria-label="Fill-up date" className={dialogControlClass} />
           </Field>
+          <Field
+            label="Odometer (km)"
+            required={odometerRequired}
+            htmlFor="fleet-fuel-odometer"
+            hint={
+              editing
+                ? "Odometer recorded for this fill-up."
+                : isNow
+                  ? selectedVehicle?.odometerKm != null
+                    ? `Latest reading: ${formatKm(selectedVehicle.odometerKm)}. Leave blank to use it.`
+                    : "Leave blank to use the latest reading."
+                  : "Required for a past date."
+            }
+          >
+            <Input
+              id="fleet-fuel-odometer"
+              className={dialogControlClass}
+              inputMode="decimal"
+              value={odometer}
+              onChange={(event) => setOdometer(event.target.value)}
+              placeholder={isNow ? "Latest reading" : "Odometer at fill-up"}
+            />
+          </Field>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Litres" required htmlFor="fleet-fuel-litres">
               <Input
@@ -732,7 +773,7 @@ export function FuelDialog({
         <DialogFooter
           saving={saving}
           label={editing ? "Save changes" : "Save fuel entry"}
-          disabled={!vehicleId || !litres.trim() || !amount.trim() || upload.uploading || (!editing && !upload.photo)}
+          disabled={!vehicleId || !litres.trim() || !amount.trim() || upload.uploading || (!editing && !upload.photo) || (odometerRequired && !odometer.trim())}
           onCancel={onClose}
         />
       </form>
@@ -767,7 +808,6 @@ export function ServiceDialog({
     entry ? dateFieldFromTimestamp(entry.servicedAt) : dateFieldFromTimestamp(now),
   );
   const [odometer, setOdometer] = useState(entry ? kmInputFromMeters(entry.odometerMeters) : "");
-  const [odometerTouched, setOdometerTouched] = useState(Boolean(entry));
   const [description, setDescription] = useState(entry?.description ?? "");
   const [cost, setCost] = useState(entry?.cost != null ? String(entry.cost) : "");
   const [notes, setNotes] = useState(entry?.notes ?? "");
@@ -775,17 +815,14 @@ export function ServiceDialog({
   const [error, setError] = useState<string | null>(null);
 
   const selectedVehicle = vehicles?.find((vehicle) => vehicle._id === vehicleId);
+  // Leaving the date at today means "now": the server may default the reading.
+  const isNow = !editing && dateValue === dateFieldFromTimestamp(now);
 
   useEffect(() => {
     if (!vehicles) return;
     if (vehicleId && vehicles.some((vehicle) => vehicle._id === vehicleId)) return;
     setVehicleId(vehicles[0]?._id ?? "");
   }, [vehicleId, vehicles]);
-
-  useEffect(() => {
-    if (editing || odometerTouched) return;
-    setOdometer(selectedVehicle?.odometerKm != null ? String(selectedVehicle.odometerKm) : "");
-  }, [editing, odometerTouched, selectedVehicle?.odometerKm]);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -804,12 +841,15 @@ export function ServiceDialog({
     try {
       const servicedAt = entry
         ? timestampForEditedDateField(dateValue, entry.servicedAt)
-        : timestampForDateField(dateValue, now);
+        : isNow
+          ? null
+          : timestampForDateField(dateValue, now);
+      const timeArgs = servicedAt === null ? {} : { servicedAt };
       if (editing && entry) {
         await updateServiceEntry({
           companyId,
           entryId: entry._id,
-          servicedAt,
+          ...timeArgs,
           odometerMeters,
           description: description.trim(),
           cost: costValue,
@@ -820,7 +860,7 @@ export function ServiceDialog({
         await createServiceEntry({
           companyId,
           vehicleId: vehicleId as Id<"fleetVehicles">,
-          servicedAt,
+          ...timeArgs,
           ...(odometerMeters !== null ? { odometerMeters } : {}),
           description: description.trim(),
           ...(costValue !== null ? { cost: costValue } : {}),
@@ -850,10 +890,7 @@ export function ServiceDialog({
               id="fleet-service-vehicle"
               ariaLabel="Vehicle"
               value={vehicleId}
-              onChange={(value) => {
-                setVehicleId(value);
-                if (!editing) setOdometerTouched(false);
-              }}
+              onChange={setVehicleId}
               disabled={editing || !vehicles}
             >
               <option value="">{vehicles ? "Select vehicle" : "Loading vehicles…"}</option>
@@ -870,15 +907,23 @@ export function ServiceDialog({
           <Field
             label="Odometer (km)"
             htmlFor="fleet-service-odometer"
-            hint={selectedVehicle?.odometerKm != null ? `Latest reading: ${formatKm(selectedVehicle.odometerKm)}` : undefined}
+            hint={
+              editing
+                ? "Odometer recorded for this service."
+                : !isNow
+                  ? "Optional for a past date."
+                  : selectedVehicle?.odometerKm != null
+                    ? `Latest reading: ${formatKm(selectedVehicle.odometerKm)}. Leave blank to use it.`
+                    : "Leave blank to use the latest reading."
+            }
           >
             <Input
               id="fleet-service-odometer"
               className={dialogControlClass}
               inputMode="decimal"
               value={odometer}
-              onChange={(event) => { setOdometer(event.target.value); setOdometerTouched(true); }}
-              placeholder="Leave blank to use the latest reading"
+              onChange={(event) => setOdometer(event.target.value)}
+              placeholder={editing ? "Odometer at service" : !isNow ? "Odometer at service (optional)" : "Leave blank to use the latest reading"}
             />
           </Field>
           <Field label="Description" required htmlFor="fleet-service-description">

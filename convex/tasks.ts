@@ -9,6 +9,12 @@ import { effectiveCurrentJdCycle, elapsedJdOccurrences, loadWorkCalendar, occurr
 import { activeCompanyMembershipIds, assertCanAssign, assertCanChangeTaskConfirmer, assertCanDeleteTask, assertCanUpdateTask, canViewTask, getManagedMembershipIds, hasAllManagedMemberships, hasAnyManagedMembership, memberFirstName, memberFullName, membershipCapabilities, requireCapability, requireMembership, roleNameCapabilities, scanManagedMembershipIds, scopedMembershipIds } from "./permissions";
 import type { Capability } from "../src/lib/permissions";
 import { nonEmpty } from "./validation";
+import {
+  isStorageBlobClaimed,
+  isStorageBlobContentReferenced,
+  isStorageBlobOwned,
+  storagePredatesClaim,
+} from "./uploadOwnership";
 import { DEFAULT_QUERY_LIMIT, takeWithOverflow } from "./queryLimits";
 import { paletteSearchInput, searchPaletteRows, referenceSearchKey } from "./searchText";
 import { ASSIGNEE_SEARCH_MAX_LENGTH } from "../src/lib/assignee-search";
@@ -19,7 +25,6 @@ import {
   deleteTaskEvidenceBatch,
   evidenceInputValidator,
   evidenceMatchesSubmission,
-  isBlobReferenced,
   retireTaskEvidenceAtCycle,
   storeTaskEvidence,
   TASK_UPLOAD_CLAIM_TTL_MS,
@@ -2400,9 +2405,16 @@ async function bindClaimToStorage(
   }
   const metadata = await ctx.db.system.get("_storage", storageId);
   if (!metadata) throw new ConvexError("Uploaded file not found.");
-  // A claim cannot adopt a blob that task data already owns, so binding can
-  // never turn another row's file into this upload's cleanup target.
-  if (await isBlobReferenced(ctx, storageId)) throw new ConvexError("This file is already attached.");
+  // A blob owned by any feature (or another claim) must never become this
+  // claim's cleanup target.
+  const owned =
+    (await isStorageBlobContentReferenced(ctx, storageId)) ||
+    (await isStorageBlobClaimed(ctx, storageId, { taskClaimId: claimId }));
+  if (owned) throw new ConvexError("This file is already attached.");
+  // A claim may only own a blob uploaded after it was issued.
+  if (storagePredatesClaim(metadata, claim.createdAt)) {
+    throw new ConvexError("This upload predates its claim. Upload the file again.");
+  }
   await ctx.db.patch(claimId, { storageId });
 }
 
@@ -2463,7 +2475,7 @@ async function discardUploadClaim(
   await ctx.db.delete(claimId);
   if (!blobId) return;
   const [referenced, metadata] = await Promise.all([
-    isBlobReferenced(ctx, blobId),
+    isStorageBlobOwned(ctx, blobId),
     ctx.db.system.get("_storage", blobId),
   ]);
   if (!referenced && metadata) await ctx.storage.delete(blobId);
@@ -2569,10 +2581,11 @@ export const sweepExpiredTaskUploadClaims = internalMutation({
     for (const claim of page.page) {
       // Rows scan in creation order — a fresh claim means the rest are fresh.
       if (claim.createdAt >= cutoff) return null;
-      if (claim.storageId) {
-        if (!(await isBlobReferenced(ctx, claim.storageId))) await ctx.storage.delete(claim.storageId);
-      }
+      const storageId = claim.storageId;
       await ctx.db.delete(claim._id);
+      if (storageId && !(await isStorageBlobOwned(ctx, storageId))) {
+        await ctx.storage.delete(storageId);
+      }
     }
     if (!page.isDone) await ctx.scheduler.runAfter(0, internal.tasks.sweepExpiredTaskUploadClaims, { cursor: page.continueCursor });
     return null;

@@ -177,34 +177,37 @@ export function parseGetVDataBody(body: string): ParsedGetVData {
 export async function fetchTrackerVehicles(secretKey: string): Promise<ParsedGetVData> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TRACKER_TIMEOUT_MS);
-  let response: Response;
   try {
-    response = await fetch(TRACKER_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "text/xml; charset=utf-8",
-        SOAPAction: `"${GET_VDATA_ACTION}"`,
-      },
-      body: buildGetVDataRequest(secretKey),
-      signal: controller.signal,
-    });
-  } catch {
-    throw new TrackerError("Could not reach the tracker. Showing the last synced data.");
+    let response: Response;
+    try {
+      response = await fetch(TRACKER_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/xml; charset=utf-8",
+          SOAPAction: `"${GET_VDATA_ACTION}"`,
+        },
+        body: buildGetVDataRequest(secretKey),
+        signal: controller.signal,
+      });
+    } catch {
+      throw new TrackerError("Could not reach the tracker. Showing the last synced data.");
+    }
+
+    if (!response.ok) {
+      throw new TrackerError("The tracker returned an error. Try again in a moment.");
+    }
+
+    let body: string;
+    try {
+      // Keep the abort timer alive through the body read, not just headers.
+      body = await response.text();
+    } catch {
+      throw new TrackerError("The tracker returned an unexpected response.");
+    }
+    return parseGetVDataBody(body);
   } finally {
     clearTimeout(timeout);
   }
-
-  if (!response.ok) {
-    throw new TrackerError("The tracker returned an error. Try again in a moment.");
-  }
-
-  let body: string;
-  try {
-    body = await response.text();
-  } catch {
-    throw new TrackerError("The tracker returned an unexpected response.");
-  }
-  return parseGetVDataBody(body);
 }
 
 export function trackerKeyHint(secretKey: string) {

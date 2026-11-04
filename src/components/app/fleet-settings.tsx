@@ -18,7 +18,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
-import { errorMessage } from "./fleet-dialogs";
+import { errorMessage, ConfirmDialog } from "./fleet-dialogs";
 import { relativeTime, type FleetConnection, type FleetDriverRow } from "./fleet-format";
 
 const fieldLabelClass = "text-[13px] font-medium text-[var(--ink-secondary)]";
@@ -175,6 +175,7 @@ export function FleetSettingsDialog({
   const [driverError, setDriverError] = useState<string | null>(null);
   const [editingDriverId, setEditingDriverId] = useState<string | null>(null);
   const [pendingDriverId, setPendingDriverId] = useState<string | null>(null);
+  const [deletingDriver, setDeletingDriver] = useState<FleetDriverRow | null>(null);
 
   async function handleConnect() {
     const secretKey = keyInput.trim();
@@ -276,7 +277,8 @@ export function FleetSettingsDialog({
   const showKeyForm = !connected || replacing;
 
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+    <>
+      <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-[2px]" />
         <Dialog.Content
@@ -493,7 +495,7 @@ export function FleetSettingsDialog({
                       onCancelEdit={() => setEditingDriverId(null)}
                       onSave={(name, phone) => handleSaveDriver(driver._id, name, phone)}
                       onToggleActive={() => void handleToggleDriver(driver)}
-                      onDelete={() => void handleDeleteDriver(driver)}
+                      onDelete={() => setDeletingDriver(driver)}
                     />
                   ))
                 )}
@@ -509,5 +511,15 @@ export function FleetSettingsDialog({
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
+      {deletingDriver && (
+        <ConfirmDialog
+          open
+          title="Delete driver?"
+          description={`Delete ${deletingDriver.name}? Drivers with history cannot be deleted; deactivate them instead.`}
+          onConfirm={async () => { await handleDeleteDriver(deletingDriver); }}
+          onClose={() => setDeletingDriver(null)}
+        />
+      )}
+    </>
   );
 }
