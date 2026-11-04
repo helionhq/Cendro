@@ -975,6 +975,61 @@ describe("fleet upload ownership", () => {
     // The task's file survives the fleet cleanup path.
     expect(await f.t.run((ctx) => ctx.db.system.get("_storage", storageId))).not.toBeNull();
   });
+
+  test("a fleet entry photo cannot be attached to a task", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    await connectVehicles(f, [
+      rawVehicle("APL-079", 100_000_000, { RecordDateTime: `/Date(${pinnedNow})/` }),
+    ]);
+    const vehicleId = (await vehicleIdsByName(f)).get("APL-079")!;
+
+    const upload = await admin.mutation(api.fleet.generateUploadUrl, {
+      companyId: f.companyA,
+    });
+    const storageId = await f.t.run(async (ctx) => {
+      const id = await ctx.storage.store(new Blob(["image"], { type: "image/jpeg" }));
+      await (ctx.db as unknown as { patch: (table: string, id: string, value: object) => Promise<void> }).patch(
+        "_storage",
+        id,
+        { contentType: "image/jpeg" },
+      );
+      return id;
+    });
+    await admin.mutation(api.fleet.bindUploadClaim, {
+      companyId: f.companyA,
+      claimId: upload.claimId,
+      storageId,
+    });
+    await admin.mutation(api.fleet.createFuelEntry, {
+      companyId: f.companyA,
+      vehicleId,
+      litres: 10,
+      amount: 1_000,
+      photo: { storageId, claimId: upload.claimId, fileName: "receipt.jpg" },
+    });
+
+    const taskId = await admin.mutation(api.tasks.createOneTime, {
+      companyId: f.companyA,
+      title: "Attach a fleet photo",
+      dueDate: pinnedNow + DAY_MS,
+      priority: "medium",
+      assigneeMembershipIds: [f.adminM],
+    });
+    // The blob is owned by a fleet entry, so attaching it to a task would make
+    // either feature's cleanup delete a file the other still uses.
+    await expect(
+      admin.mutation(api.tasks.addAttachment, {
+        companyId: f.companyA,
+        taskType: "one_time",
+        taskId,
+        storageId,
+        fileName: "receipt.jpg",
+        contentType: "image/jpeg",
+        size: 5,
+      }),
+    ).rejects.toThrow("This file is already attached.");
+  });
 });
 
 describe("fleet role defaults", () => {

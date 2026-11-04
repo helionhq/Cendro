@@ -2369,11 +2369,9 @@ export const addAttachment = mutation({
   handler: async (ctx, args) => {
     const { membership, capabilities } = await requireCapability(ctx, args.companyId, "tasks:attachment:add");
     const { normalized } = await getVisibleTask(ctx, args.companyId, membership, args.taskType, args.taskId, await taskVisibilityAuth(ctx, args.companyId, membership, capabilities));
-    const existing = await ctx.db
-      .query("taskAttachments")
-      .withIndex("by_storageId", (q) => q.eq("storageId", args.storageId))
-      .first();
-    if (existing) throw new ConvexError("This file is already attached.");
+    if (await isStorageBlobContentReferenced(ctx, args.storageId)) {
+      throw new ConvexError("This file is already attached.");
+    }
     const metadata = await ctx.db.system.get("_storage", args.storageId);
     if (!metadata) throw new ConvexError("Uploaded file not found.");
     const attachmentId = await ctx.db.insert("taskAttachments", { companyId: args.companyId, taskType: args.taskType, taskId: normalized, storageId: args.storageId, fileName: nonEmpty(args.fileName, "File name"), contentType: metadata.contentType ?? args.contentType, size: metadata.size ?? args.size, createdByMembershipId: membership._id, createdAt: Date.now() });

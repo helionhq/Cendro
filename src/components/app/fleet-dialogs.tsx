@@ -592,7 +592,9 @@ export function FuelDialog({
   const selectedVehicle = vehicles?.find((vehicle) => vehicle._id === vehicleId);
   // Leaving the date at today means "now": the server may default the reading.
   const isNow = !editing && dateValue === dateFieldFromTimestamp(now);
-  const odometerRequired = !editing && !isNow;
+  // Fuel always needs an odometer; only a fill-up made now can borrow the
+  // tracker reading, so one is required when there is no reading to borrow.
+  const odometerRequired = !editing && (!isNow || selectedVehicle?.odometerKm == null);
 
   useEffect(() => {
     if (!vehicles) return;
@@ -610,7 +612,10 @@ export function FuelDialog({
     if (!Number.isFinite(amountValue) || amountValue < 0) { setError("Enter a valid amount."); return; }
     const odometerMeters = metersFromKmInput(odometer);
     if (odometer.trim() && odometerMeters === null) { setError("Odometer is invalid."); return; }
-    if (odometerRequired && odometerMeters === null) { setError("Odometer is required for a past date."); return; }
+    if (odometerRequired && odometerMeters === null) {
+      setError(isNow ? "Enter the odometer for this fill-up." : "Odometer is required for a past date.");
+      return;
+    }
     if (!editing && !upload.photo) { setError("Add a photo of the fuel gauge or receipt."); return; }
     setSaving(true);
     setError(null);
@@ -713,7 +718,7 @@ export function FuelDialog({
                 : isNow
                   ? selectedVehicle?.odometerKm != null
                     ? `Latest reading: ${formatKm(selectedVehicle.odometerKm)}. Leave blank to use it.`
-                    : "Leave blank to use the latest reading."
+                    : "This vehicle has no tracker reading. Enter the odometer."
                   : "Required for a past date."
             }
           >
@@ -723,7 +728,7 @@ export function FuelDialog({
               inputMode="decimal"
               value={odometer}
               onChange={(event) => setOdometer(event.target.value)}
-              placeholder={isNow ? "Latest reading" : "Odometer at fill-up"}
+              placeholder={odometerRequired ? "Odometer at fill-up" : "Latest reading"}
             />
           </Field>
           <div className="grid gap-4 sm:grid-cols-2">
