@@ -57,6 +57,9 @@ describe("permissions catalog and defaults", () => {
       "sops:delete:branch",
       "sops:delete:department",
       "ai:use",
+      "fleet:view",
+      "fleet:log",
+      "fleet:manage",
     ]);
 
     const actual = new Set(defaultRoleCapabilities.Manager);

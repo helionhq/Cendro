@@ -119,6 +119,46 @@ describe("task authorization hardening", () => {
     ).rejects.toThrow("This file is already attached.");
   });
 
+  test("a blob reserved by an upload claim cannot be attached without that claim", async () => {
+    const f = await createAuthzFixture();
+
+    const jdTaskId = await f.asUser("adminA").mutation(api.tasks.createJd, {
+      companyId: f.companyA,
+      title: "Reserved upload target",
+      recurrence: "daily",
+      assigneeMembershipIds: [f.adminM],
+    });
+    const { claimId } = await f.asUser("adminA").mutation(api.tasks.generateAttachmentUploadUrl, { companyId: f.companyA });
+    const storageId = await f.t.run(async (ctx) => ctx.storage.store(new Blob(["reserved"], { type: "text/plain" })));
+    await f.asUser("adminA").mutation(api.tasks.bindUploadClaim, { companyId: f.companyA, claimId, storageId });
+
+    // Without its claim, the blob is reserved for that upload not this one.
+    await expect(
+      f.asUser("adminA").mutation(api.tasks.addAttachment, {
+        companyId: f.companyA,
+        taskType: "jd",
+        taskId: jdTaskId,
+        storageId,
+        fileName: "reserved.txt",
+        contentType: "text/plain",
+        size: 8,
+      })
+    ).rejects.toThrow("This file is already attached.");
+
+    // The claim's own flow still attaches and consumes it.
+    await f.asUser("adminA").mutation(api.tasks.addAttachment, {
+      companyId: f.companyA,
+      taskType: "jd",
+      taskId: jdTaskId,
+      storageId,
+      fileName: "reserved.txt",
+      contentType: "text/plain",
+      size: 8,
+      claimId,
+    });
+    expect(await f.t.run(async (ctx) => ctx.db.get(claimId))).toBeNull();
+  });
+
   test("Upload claims bind a single blob and gate orphan cleanup", async () => {
     const f = await createAuthzFixture();
 

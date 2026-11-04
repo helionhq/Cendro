@@ -9,6 +9,12 @@ import { effectiveCurrentJdCycle, elapsedJdOccurrences, loadWorkCalendar, occurr
 import { activeCompanyMembershipIds, assertCanAssign, assertCanChangeTaskConfirmer, assertCanDeleteTask, assertCanUpdateTask, canViewTask, getManagedMembershipIds, hasAllManagedMemberships, hasAnyManagedMembership, memberFirstName, memberFullName, membershipCapabilities, requireCapability, requireMembership, roleNameCapabilities, scanManagedMembershipIds, scopedMembershipIds } from "./permissions";
 import type { Capability } from "../src/lib/permissions";
 import { nonEmpty } from "./validation";
+import {
+  isStorageBlobClaimed,
+  isStorageBlobContentReferenced,
+  isStorageBlobOwned,
+  storagePredatesClaim,
+} from "./uploadOwnership";
 import { DEFAULT_QUERY_LIMIT, takeWithOverflow } from "./queryLimits";
 import { paletteSearchInput, searchPaletteRows, referenceSearchKey } from "./searchText";
 import { ASSIGNEE_SEARCH_MAX_LENGTH } from "../src/lib/assignee-search";
@@ -19,7 +25,6 @@ import {
   deleteTaskEvidenceBatch,
   evidenceInputValidator,
   evidenceMatchesSubmission,
-  isBlobReferenced,
   retireTaskEvidenceAtCycle,
   storeTaskEvidence,
   TASK_UPLOAD_CLAIM_TTL_MS,
@@ -2364,20 +2369,31 @@ export const addAttachment = mutation({
   handler: async (ctx, args) => {
     const { membership, capabilities } = await requireCapability(ctx, args.companyId, "tasks:attachment:add");
     const { normalized } = await getVisibleTask(ctx, args.companyId, membership, args.taskType, args.taskId, await taskVisibilityAuth(ctx, args.companyId, membership, capabilities));
-    const existing = await ctx.db
-      .query("taskAttachments")
-      .withIndex("by_storageId", (q) => q.eq("storageId", args.storageId))
-      .first();
-    if (existing) throw new ConvexError("This file is already attached.");
+    if (await isStorageBlobContentReferenced(ctx, args.storageId)) {
+      throw new ConvexError("This file is already attached.");
+    }
     const metadata = await ctx.db.system.get("_storage", args.storageId);
     if (!metadata) throw new ConvexError("Uploaded file not found.");
-    const attachmentId = await ctx.db.insert("taskAttachments", { companyId: args.companyId, taskType: args.taskType, taskId: normalized, storageId: args.storageId, fileName: nonEmpty(args.fileName, "File name"), contentType: metadata.contentType ?? args.contentType, size: metadata.size ?? args.size, createdByMembershipId: membership._id, createdAt: Date.now() });
-    // Consume the upload claim so it cannot later "clean up" this blob. A
-    // claim bound to a different blob stays for the sweep to reclaim it.
-    if (args.claimId) {
-      const claim = await ctx.db.get(args.claimId);
-      if (claim && claim.companyId === args.companyId && claim.membershipId === membership._id && claim.storageId === args.storageId) await ctx.db.delete(args.claimId);
+    // Only the caller's own claim, for this exact blob, is exempt from the
+    // reservation check below. Anything else would name someone else's upload.
+    const claim = args.claimId ? await ctx.db.get(args.claimId) : null;
+    if (
+      args.claimId &&
+      (!claim ||
+        claim.companyId !== args.companyId ||
+        claim.membershipId !== membership._id ||
+        claim.storageId !== args.storageId)
+    ) {
+      throw new ConvexError("Upload claim not found.");
     }
+    // A blob is reserved for the upload that claimed it; attaching it here
+    // would take the file that uploader is about to save.
+    if (await isStorageBlobClaimed(ctx, args.storageId, { taskClaimId: claim?._id })) {
+      throw new ConvexError("This file is already attached.");
+    }
+    const attachmentId = await ctx.db.insert("taskAttachments", { companyId: args.companyId, taskType: args.taskType, taskId: normalized, storageId: args.storageId, fileName: nonEmpty(args.fileName, "File name"), contentType: metadata.contentType ?? args.contentType, size: metadata.size ?? args.size, createdByMembershipId: membership._id, createdAt: Date.now() });
+    // Consume the upload claim so it cannot later "clean up" this blob.
+    if (claim) await ctx.db.delete(claim._id);
     return attachmentId;
   },
 });
@@ -2400,9 +2416,16 @@ async function bindClaimToStorage(
   }
   const metadata = await ctx.db.system.get("_storage", storageId);
   if (!metadata) throw new ConvexError("Uploaded file not found.");
-  // A claim cannot adopt a blob that task data already owns, so binding can
-  // never turn another row's file into this upload's cleanup target.
-  if (await isBlobReferenced(ctx, storageId)) throw new ConvexError("This file is already attached.");
+  // A blob owned by any feature (or another claim) must never become this
+  // claim's cleanup target.
+  const owned =
+    (await isStorageBlobContentReferenced(ctx, storageId)) ||
+    (await isStorageBlobClaimed(ctx, storageId, { taskClaimId: claimId }));
+  if (owned) throw new ConvexError("This file is already attached.");
+  // A claim may only own a blob uploaded after it was issued.
+  if (storagePredatesClaim(metadata, claim.createdAt)) {
+    throw new ConvexError("This upload predates its claim. Upload the file again.");
+  }
   await ctx.db.patch(claimId, { storageId });
 }
 
@@ -2463,7 +2486,7 @@ async function discardUploadClaim(
   await ctx.db.delete(claimId);
   if (!blobId) return;
   const [referenced, metadata] = await Promise.all([
-    isBlobReferenced(ctx, blobId),
+    isStorageBlobOwned(ctx, blobId),
     ctx.db.system.get("_storage", blobId),
   ]);
   if (!referenced && metadata) await ctx.storage.delete(blobId);
@@ -2569,10 +2592,11 @@ export const sweepExpiredTaskUploadClaims = internalMutation({
     for (const claim of page.page) {
       // Rows scan in creation order — a fresh claim means the rest are fresh.
       if (claim.createdAt >= cutoff) return null;
-      if (claim.storageId) {
-        if (!(await isBlobReferenced(ctx, claim.storageId))) await ctx.storage.delete(claim.storageId);
-      }
+      const storageId = claim.storageId;
       await ctx.db.delete(claim._id);
+      if (storageId && !(await isStorageBlobOwned(ctx, storageId))) {
+        await ctx.storage.delete(storageId);
+      }
     }
     if (!page.isDone) await ctx.scheduler.runAfter(0, internal.tasks.sweepExpiredTaskUploadClaims, { cursor: page.continueCursor });
     return null;

@@ -40,3 +40,9 @@ Inactive JD tasks retain their activity, comments, attachments, completions, and
 New default Admin roles include independent `tasks:jd:pause` and `tasks:jd:resume` grants; Manager and Employee defaults do not. Customized roles are left unchanged and can be granted either permission in Roles. Do not rerun the release backfill after administrators deliberately revoke both grants.
 
 Company deletion in `/admin` is a soft delete: the company becomes inaccessible and hidden from normal company selection, while child records are retained for audit.
+
+## Fleet rollout
+
+Fleet adds `fleet:view`, `fleet:log`, and `fleet:manage`. New companies' default Admin and Manager roles include them. Existing deployments must run `npx convex run roles:enableFleetDefaults '{}'` once during rollout; it upgrades only untouched default Admin/Manager roles and leaves customized roles alone.
+
+Each company connects its own TrackWorld key in Fleet settings. The key is stored per company and is never returned by a query. Tracker sync runs every 10 minutes, "Sync now" is rate-limited to once per minute, and Fleet photos use the same short-lived upload-claim pattern as task uploads.

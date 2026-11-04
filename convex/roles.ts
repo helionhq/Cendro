@@ -144,6 +144,28 @@ export const enableTaskConfirmationDefaults = internalMutation({
   },
 });
 
+/** One-time release backfill for untouched default Admin and Manager roles, not customized roles. */
+export const enableFleetDefaults = internalMutation({
+  args: { cursor: v.optional(v.union(v.string(), v.null())) },
+  handler: async (ctx, args) => {
+    const fleetCapabilities = new Set<Capability>(["fleet:view", "fleet:log", "fleet:manage"]);
+    const page = await ctx.db.query("roles").paginate({ numItems: 100, cursor: args.cursor ?? null });
+    let updated = 0;
+    for (const role of page.page) {
+      if (role.name !== "Admin" && role.name !== "Manager") continue;
+      const next = defaultRoleCapabilities[role.name];
+      const previous = new Set(next.filter((capability) => !fleetCapabilities.has(capability)));
+      const caps = new Set(role.capabilities);
+      if (caps.size === previous.size && [...previous].every((cap) => caps.has(cap))) {
+        await ctx.db.patch(role._id, { capabilities: [...next], updatedAt: Date.now() });
+        updated++;
+      }
+    }
+    if (!page.isDone) await ctx.scheduler.runAfter(0, internal.roles.enableFleetDefaults, { cursor: page.continueCursor });
+    return updated;
+  },
+});
+
 export const ensureDefaults = mutation({
   args: { companyId: v.id("companies") },
   handler: async (ctx, args) => {
