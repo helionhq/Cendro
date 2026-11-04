@@ -2374,13 +2374,26 @@ export const addAttachment = mutation({
     }
     const metadata = await ctx.db.system.get("_storage", args.storageId);
     if (!metadata) throw new ConvexError("Uploaded file not found.");
-    const attachmentId = await ctx.db.insert("taskAttachments", { companyId: args.companyId, taskType: args.taskType, taskId: normalized, storageId: args.storageId, fileName: nonEmpty(args.fileName, "File name"), contentType: metadata.contentType ?? args.contentType, size: metadata.size ?? args.size, createdByMembershipId: membership._id, createdAt: Date.now() });
-    // Consume the upload claim so it cannot later "clean up" this blob. A
-    // claim bound to a different blob stays for the sweep to reclaim it.
-    if (args.claimId) {
-      const claim = await ctx.db.get(args.claimId);
-      if (claim && claim.companyId === args.companyId && claim.membershipId === membership._id && claim.storageId === args.storageId) await ctx.db.delete(args.claimId);
+    // Only the caller's own claim, for this exact blob, is exempt from the
+    // reservation check below. Anything else would name someone else's upload.
+    const claim = args.claimId ? await ctx.db.get(args.claimId) : null;
+    if (
+      args.claimId &&
+      (!claim ||
+        claim.companyId !== args.companyId ||
+        claim.membershipId !== membership._id ||
+        claim.storageId !== args.storageId)
+    ) {
+      throw new ConvexError("Upload claim not found.");
     }
+    // A blob is reserved for the upload that claimed it; attaching it here
+    // would take the file that uploader is about to save.
+    if (await isStorageBlobClaimed(ctx, args.storageId, { taskClaimId: claim?._id })) {
+      throw new ConvexError("This file is already attached.");
+    }
+    const attachmentId = await ctx.db.insert("taskAttachments", { companyId: args.companyId, taskType: args.taskType, taskId: normalized, storageId: args.storageId, fileName: nonEmpty(args.fileName, "File name"), contentType: metadata.contentType ?? args.contentType, size: metadata.size ?? args.size, createdByMembershipId: membership._id, createdAt: Date.now() });
+    // Consume the upload claim so it cannot later "clean up" this blob.
+    if (claim) await ctx.db.delete(claim._id);
     return attachmentId;
   },
 });
