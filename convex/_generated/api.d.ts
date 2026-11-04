@@ -39,6 +39,7 @@ import type * as taskEvidence from "../taskEvidence.js";
 import type * as taskImports from "../taskImports.js";
 import type * as taskListPreferences from "../taskListPreferences.js";
 import type * as tasks from "../tasks.js";
+import type * as uploadOwnership from "../uploadOwnership.js";
 import type * as users from "../users.js";
 import type * as validation from "../validation.js";
 import type * as workCalendar from "../workCalendar.js";
@@ -81,6 +82,7 @@ declare const fullApi: ApiFromModules<{
   taskImports: typeof taskImports;
   taskListPreferences: typeof taskListPreferences;
   tasks: typeof tasks;
+  uploadOwnership: typeof uploadOwnership;
   users: typeof users;
   validation: typeof validation;
   workCalendar: typeof workCalendar;

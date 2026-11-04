@@ -194,6 +194,7 @@ export const getSyncSource = internalQuery({
     return connection
       ? {
           connection: {
+            id: connection._id,
             secretKey: connection.secretKey,
             lastSyncAt: connection.lastSyncAt ?? null,
             connectedAt: connection.connectedAt,
@@ -285,18 +286,24 @@ export const saveConnectionAndSync = internalMutation({
 export const applyTrackerSync = internalMutation({
   args: {
     companyId: v.id("companies"),
+    connectionId: v.id("fleetTrackerConnections"),
     connectionGeneration: v.number(),
     now: v.number(),
     vehicles: v.array(trackerVehicleValidator),
   },
   handler: async (ctx, args) => {
     // A key may have been replaced or disconnected while the request was in
-    // flight. Reject stale work before reading or writing anything else.
+    // flight. The row identity matters too: a reconnect inserts a new row whose
+    // generation restarts, so generation alone cannot tell it from the old one.
     const connection = await ctx.db
       .query("fleetTrackerConnections")
       .withIndex("by_company", (q) => q.eq("companyId", args.companyId))
       .unique();
-    if (!connection || (connection.generation ?? 0) !== args.connectionGeneration) {
+    if (
+      !connection ||
+      connection._id !== args.connectionId ||
+      (connection.generation ?? 0) !== args.connectionGeneration
+    ) {
       return {
         inserted: 0,
         updated: 0,
@@ -333,16 +340,23 @@ export const applyTrackerSync = internalMutation({
 export const recordSyncFailure = internalMutation({
   args: {
     companyId: v.id("companies"),
+    connectionId: v.id("fleetTrackerConnections"),
     connectionGeneration: v.number(),
     message: v.string(),
     now: v.number(),
   },
   handler: async (ctx, args) => {
+    // A stale failure must never describe a connection that replaced the one
+    // the sync started with, even when the new row's generation coincides.
     const connection = await ctx.db
       .query("fleetTrackerConnections")
       .withIndex("by_company", (q) => q.eq("companyId", args.companyId))
       .unique();
-    if (!connection || (connection.generation ?? 0) !== args.connectionGeneration) {
+    if (
+      !connection ||
+      connection._id !== args.connectionId ||
+      (connection.generation ?? 0) !== args.connectionGeneration
+    ) {
       return null;
     }
     await ctx.db.patch(connection._id, {

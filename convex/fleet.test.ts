@@ -324,6 +324,57 @@ describe("fleet sync", () => {
     });
     expect(vehicles.vehicles[0].odometerMeters).toBe(100_000_000);
   });
+
+  test("a sync reply is discarded when the connection row was recreated", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    await connectVehicles(f, [rawVehicle("APL-079", 100_000_000)]);
+    const connection = await f.t.run((ctx) =>
+      ctx.db
+        .query("fleetTrackerConnections")
+        .withIndex("by_company", (q) => q.eq("companyId", f.companyA))
+        .unique(),
+    );
+
+    vi.setSystemTime(pinnedNow + 2 * 60_000);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        // Disconnect and reconnect while the old key's request is in flight.
+        // The replacement row restarts at generation 1, so only its identity
+        // can tell it apart from the row the sync started with.
+        await f.t.run(async (ctx) => {
+          await ctx.db.delete(connection!._id);
+          await ctx.db.insert("fleetTrackerConnections", {
+            companyId: f.companyA,
+            secretKey: "new-key",
+            keyHint: "new-key-6789",
+            connectedAt: pinnedNow + 2 * 60_000,
+            connectedByMembershipId: connection!.connectedByMembershipId,
+            generation: 1,
+            lastSyncAttemptAt: pinnedNow + 2 * 60_000,
+            updatedAt: pinnedNow + 2 * 60_000,
+          });
+        });
+        return new Response(
+          trackerBody([
+            rawVehicle("APL-079", 999_000_000, {
+              RecordDateTime: `/Date(${pinnedNow + 2 * 60_000})/`,
+            }),
+          ]),
+          { status: 200 },
+        );
+      }),
+    );
+
+    const result = await admin.action(api.fleet.syncNow, { companyId: f.companyA });
+    expect(result.skipped).toBe(true);
+    const vehicles = await admin.query(api.fleet.listVehicles, {
+      companyId: f.companyA,
+      now: Date.now(),
+    });
+    expect(vehicles.vehicles[0].odometerMeters).toBe(100_000_000);
+  });
 });
 
 describe("fleet trips", () => {

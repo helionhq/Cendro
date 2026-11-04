@@ -49,6 +49,7 @@ export async function fetchAndApplyCompanyVehicles(
     const message = trackerSafeMessage(error);
     await ctx.runMutation(internal.fleetInternal.recordSyncFailure, {
       companyId,
+      connectionId: source.connection.id,
       connectionGeneration: source.connection.generation,
       message,
       now: Date.now(),
@@ -77,6 +78,7 @@ export async function fetchAndApplyCompanyVehicles(
     stale: boolean;
   } = await ctx.runMutation(internal.fleetInternal.applyTrackerSync, {
     companyId,
+    connectionId: source.connection.id,
     connectionGeneration: source.connection.generation,
     now,
     vehicles: parsed.vehicles,
@@ -97,6 +99,7 @@ export async function fetchAndApplyCompanyVehicles(
     // The mutation wrote nothing: no missing markers and no lastSyncAt change.
     await ctx.runMutation(internal.fleetInternal.recordSyncFailure, {
       companyId,
+      connectionId: source.connection.id,
       connectionGeneration: source.connection.generation,
       message: EMPTY_TRACKER_RESPONSE_MESSAGE,
       now,
