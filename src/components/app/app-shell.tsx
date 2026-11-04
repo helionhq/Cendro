@@ -20,6 +20,7 @@ import {
   Settings,
   SquareCheck,
   Sun,
+  Truck,
   X,
 } from "lucide-react";
 import dynamic from "next/dynamic";
@@ -30,6 +31,7 @@ import { useTheme } from "./theme";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { canAccessCompanyManagement, canViewDashboard } from "@/lib/permissions";
+import { useMinuteNow } from "@/lib/use-minute-now";
 import { shellStageLabel, type ShellConnection, type ShellLoadingStage } from "@/lib/shell-access";
 import type { AuthDiagnostic } from "@/lib/auth-diagnostics";
 import { useShellStall } from "./shell-stall";
@@ -46,16 +48,34 @@ const nav = [
   { href: "/jd-tasks", label: "Job Description", icon: Repeat },
   { href: "/one-time-tasks", label: "Tasks", icon: SquareCheck },
   { href: "/sops", label: "SOP's", icon: FileText },
+  { href: "/fleet", label: "Fleet", icon: Truck, requiresFleet: true },
   { href: "/company", label: "Settings", icon: Building2, requiresCompanyManagement: true },
 ];
+
+type NavItem = {
+  href: string;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+  requiresDashboard?: boolean;
+  requiresCompanyManagement?: boolean;
+  requiresFleet?: boolean;
+  badge?: number;
+};
 
 const dropdownItemClass =
   "flex min-h-9 cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-sm text-[var(--ink-secondary)] outline-none data-[highlighted]:bg-[var(--surface-hover)] data-[highlighted]:text-[var(--ink)]";
 
-function navForCapabilities(active: CompanyAccess | null | undefined) {
+function navForCapabilities(active: CompanyAccess | null | undefined, fleetAlertCount = 0): NavItem[] {
   const canManage = canAccessCompanyManagement(active?.capabilities);
   const canDash = canViewDashboard(active?.capabilities);
-  return nav.filter((item) => (!item.requiresCompanyManagement || canManage) && (!item.requiresDashboard || canDash));
+  const canUseFleet = Boolean(active?.capabilities.includes("fleet:view"));
+  return nav
+    .filter((item) =>
+      (!item.requiresCompanyManagement || canManage) &&
+      (!item.requiresDashboard || canDash) &&
+      (!item.requiresFleet || canUseFleet),
+    )
+    .map((item) => (item.href === "/fleet" && fleetAlertCount > 0 ? { ...item, badge: fleetAlertCount } : item));
 }
 
 function NavLinks({
@@ -64,7 +84,7 @@ function NavLinks({
   onNavigate,
   className,
 }: {
-  items: typeof nav;
+  items: NavItem[];
   path: string;
   onNavigate?: () => void;
   className?: string;
@@ -80,6 +100,7 @@ function NavLinks({
             href={item.href}
             onClick={onNavigate}
             aria-current={activeRow ? "page" : undefined}
+            aria-label={item.badge ? `${item.label}, ${item.badge} alerts` : undefined}
             className={cn(
               "flex items-center gap-2 rounded-md text-sm uppercase text-[var(--ink-secondary)] transition-colors hover:bg-[var(--surface-hover)]",
               activeRow && "bg-[var(--surface-pressed)] text-[var(--ink)]",
@@ -87,7 +108,12 @@ function NavLinks({
             )}
           >
             <Icon className="h-4 w-4 shrink-0 text-[var(--ink-muted)]" />
-            <span className="truncate">{item.label}</span>
+            <span className="min-w-0 flex-1 truncate">{item.label}</span>
+            {item.badge ? (
+              <span className="shrink-0 rounded-full bg-[var(--badge-red-bg)] px-1.5 text-center text-[10px] font-semibold leading-5 text-[var(--badge-red-fg)]">
+                {item.badge > 99 ? "99+" : item.badge}
+              </span>
+            ) : null}
           </Link>
         );
       })}
@@ -104,7 +130,7 @@ function MobileNavDrawer({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  items: typeof nav;
+  items: NavItem[];
   path: string;
   isPlatformAdmin: boolean;
 }) {
@@ -278,7 +304,7 @@ function SearchCommandDialog({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  items: typeof nav;
+  items: NavItem[];
   companies: CompanyAccess[];
   activeCompanyId: CompanyAccess["company"]["_id"] | null;
   setActiveCompanyId: (id: CompanyAccess["company"]["_id"]) => void;
@@ -667,6 +693,12 @@ function ShellInner({ children, isPlatformAdmin }: { children: React.ReactNode; 
   const [aiOpen, setAiOpen] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const { stalled, elapsedMs, reloads, diagnostic, retry } = useShellStall(accessStatus, loadingStage, connection);
+  const clockNow = useMinuteNow();
+  const canUseFleet = Boolean(active?.capabilities.includes("fleet:view"));
+  const fleetAlerts = useQuery(
+    api.fleet.alerts,
+    activeCompanyId && canUseFleet ? { companyId: activeCompanyId, now: clockNow } : "skip",
+  );
 
   useEffect(() => {
     if (accessStatus === "signedOut") router.replace(`/sign-in?redirect_url=${encodeURIComponent(path)}`);
@@ -689,7 +721,10 @@ function ShellInner({ children, isPlatformAdmin }: { children: React.ReactNode; 
     return () => wide.removeEventListener("change", onChange);
   }, []);
 
-  const visibleNav = useMemo(() => navForCapabilities(active), [active]);
+  const visibleNav = useMemo(
+    () => navForCapabilities(active, fleetAlerts?.count ?? 0),
+    [active, fleetAlerts?.count],
+  );
 
   if (accessStatus === "loading") {
     if (stalled) {

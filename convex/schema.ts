@@ -9,6 +9,7 @@ const rec = v.union(v.literal("daily"), v.literal("every_other_day"), v.literal(
 const taskStatus = v.union(v.literal("due"), v.literal("in_progress"), v.literal("completed"), v.literal("awaiting_confirmation"));
 const scope = v.union(v.literal("company"), v.literal("branch"), v.literal("department"), v.literal("user"));
 const taskType = v.union(v.literal("jd"), v.literal("one_time"));
+const fleetTripStatus = v.union(v.literal("open"), v.literal("returned"));
 // Countable JD cycle outcomes in one week-within-month segment: the smallest
 // span every dashboard bucket and period is a whole number of.
 const jdReportCount = v.object({ segmentStart: v.number(), recurrence: rec, done: v.number(), missed: v.number(), waiting: v.number() });
@@ -108,4 +109,25 @@ export default defineSchema({
   aiChatPersistenceRequests: defineTable({ requestId: v.string(), createdAt: v.number() }).index("by_requestId", ["requestId"]),
   taskImportBatches: defineTable({ companyId: v.id("companies"), actorMembershipId: v.id("companyMemberships"), kind: taskType, importKey: v.string(), batchKey: v.string(), source: v.union(v.literal("cendro"), v.literal("ai")), requestFingerprint: v.string(), result: v.object({ created: v.number(), updated: v.number(), skipped: v.number(), failed: v.number(), taskReferences: v.array(v.string()) }), createdAt: v.number() }).index("by_companyId_and_importKey_and_batchKey", ["companyId", "importKey", "batchKey"]),
   taskImportPreviews: defineTable({ companyId: v.id("companies"), actorMembershipId: v.id("companyMemberships"), kind: taskType, fingerprint: v.string(), rowCount: v.number(), createdAt: v.number() }),
+  // One tracker connection per company. `secretKey` is write-only from the
+  // client: no query returns it, and sync/connect errors never include it.
+  fleetTrackerConnections: defineTable({ companyId: v.id("companies"), secretKey: v.string(), keyHint: v.string(), connectedAt: v.number(), connectedByMembershipId: v.id("companyMemberships"), lastSyncAt: v.optional(v.number()), lastSyncError: v.optional(v.string()), updatedAt: v.number() }).index("by_company", ["companyId"]),
+  // Vehicles are upserted from the tracker; `displayName` and the service
+  // intervals are user-owned and never touched by sync.
+  fleetVehicles: defineTable({ companyId: v.id("companies"), registrationNumber: v.string(), displayName: v.optional(v.string()), odometerMeters: v.optional(v.number()), lat: v.optional(v.number()), lng: v.optional(v.number()), address: v.optional(v.string()), speed: v.optional(v.number()), ignitionOn: v.optional(v.boolean()), recordedAt: v.optional(v.number()), lastSeenAt: v.optional(v.number()), missingFromTrackerAt: v.optional(v.number()), serviceIntervalKm: v.optional(v.number()), serviceIntervalDays: v.optional(v.number()), createdAt: v.number(), updatedAt: v.number() }).index("by_company", ["companyId"]).index("by_companyId_and_registrationNumber", ["companyId", "registrationNumber"]),
+  // Fleet's own driver roster; tracker data has no drivers and drivers are not
+  // required to be Cendro users.
+  fleetDrivers: defineTable({ companyId: v.id("companies"), name: v.string(), phone: v.optional(v.string()), active: v.boolean(), createdAt: v.number(), updatedAt: v.number() }).index("by_company", ["companyId"]).index("by_companyId_and_active", ["companyId", "active"]),
+  // `status` is the indexable twin of `returnedAt`; both are written in the
+  // same mutation. At most one open trip per vehicle and per driver.
+  fleetTrips: defineTable({ companyId: v.id("companies"), vehicleId: v.id("fleetVehicles"), driverId: v.id("fleetDrivers"), destination: v.string(), notes: v.optional(v.string()), status: fleetTripStatus, departedAt: v.number(), returnedAt: v.optional(v.number()), startOdometerMeters: v.optional(v.number()), endOdometerMeters: v.optional(v.number()), createdByMembershipId: v.id("companyMemberships"), createdAt: v.number(), updatedAt: v.number() }).index("by_companyId_and_departedAt", ["companyId", "departedAt"]).index("by_companyId_and_status_and_departedAt", ["companyId", "status", "departedAt"]).index("by_vehicleId_and_departedAt", ["vehicleId", "departedAt"]).index("by_vehicleId_and_status", ["vehicleId", "status"]).index("by_driverId_and_status", ["driverId", "status"]),
+  // Photo fields are flattened so `photoStorageId` can be indexed for safe
+  // blob deletion and claim binding.
+  fleetFuelEntries: defineTable({ companyId: v.id("companies"), vehicleId: v.id("fleetVehicles"), driverId: v.optional(v.id("fleetDrivers")), filledAt: v.number(), litres: v.number(), amount: v.number(), odometerMeters: v.optional(v.number()), notes: v.optional(v.string()), photoStorageId: v.id("_storage"), photoFileName: v.string(), photoContentType: v.string(), photoSize: v.number(), createdByMembershipId: v.id("companyMemberships"), createdAt: v.number(), updatedAt: v.number() }).index("by_companyId_and_filledAt", ["companyId", "filledAt"]).index("by_vehicleId_and_filledAt", ["vehicleId", "filledAt"]).index("by_photoStorageId", ["photoStorageId"]).index("by_driverId", ["driverId"]),
+  fleetServiceEntries: defineTable({ companyId: v.id("companies"), vehicleId: v.id("fleetVehicles"), servicedAt: v.number(), odometerMeters: v.optional(v.number()), description: v.string(), cost: v.optional(v.number()), notes: v.optional(v.string()), photoStorageId: v.optional(v.id("_storage")), photoFileName: v.optional(v.string()), photoContentType: v.optional(v.string()), photoSize: v.optional(v.number()), createdByMembershipId: v.id("companyMemberships"), createdAt: v.number(), updatedAt: v.number() }).index("by_companyId_and_servicedAt", ["companyId", "servicedAt"]).index("by_vehicleId_and_servicedAt", ["vehicleId", "servicedAt"]).index("by_photoStorageId", ["photoStorageId"]),
+  // Short-lived upload URLs for fleet photos, mirroring taskUploadClaims. The
+  // claim proves the caller was issued an upload slot in this company, and
+  // binding records which blob the slot produced so cleanup can never delete
+  // an unrelated tenant's blob.
+  fleetUploadClaims: defineTable({ companyId: v.id("companies"), membershipId: v.id("companyMemberships"), storageId: v.optional(v.id("_storage")), createdAt: v.number() }).index("by_storageId", ["storageId"]),
 });

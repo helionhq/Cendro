@@ -63,6 +63,9 @@ export const capabilities = [
   "company:manage_roles",
   "company:view_audit_log",
   "ai:use",
+  "fleet:view",
+  "fleet:log",
+  "fleet:manage",
 ] as const;
 
 export type Capability = (typeof capabilities)[number];
@@ -140,6 +143,9 @@ export const defaultRoleCapabilities: Record<DefaultRoleName, Capability[]> = {
     "sops:delete:branch",
     "sops:delete:department",
     "ai:use",
+    "fleet:view",
+    "fleet:log",
+    "fleet:manage",
   ],
   Employee: [
     "analytics:view:self",
@@ -249,6 +255,9 @@ export const capabilityLabels: Record<Capability, string> = {
   "company:manage_roles": "Manage roles",
   "company:view_audit_log": "View audit log",
   "ai:use": "Use AI features",
+  "fleet:view": "View fleet",
+  "fleet:log": "Log trips, fuel and service",
+  "fleet:manage": "Manage fleet settings and records",
 };
 
 export const capabilityGroups: { title: string; capabilities: Capability[] }[] = [
@@ -345,5 +354,9 @@ export const capabilityGroups: { title: string; capabilities: Capability[] }[] =
   {
     title: "AI",
     capabilities: ["ai:use"],
+  },
+  {
+    title: "Fleet",
+    capabilities: ["fleet:view", "fleet:log", "fleet:manage"],
   },
 ];
