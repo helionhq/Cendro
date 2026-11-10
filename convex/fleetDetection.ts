@@ -124,7 +124,8 @@ export function findNearestPlace<T extends PlaceLike>(
 /**
  * The base a trip started from: the nearest base to the start observation.
  * The destination is excluded when another base exists, so a base-to-base
- * trip still has a meaningful corridor.
+ * trip still has a meaningful corridor. When the destination is the only base
+ * there is no corridor to measure, so route checks are skipped.
  */
 export function selectBasePlace<T extends PlaceLike>(
   start: LatLng | null | undefined,
@@ -135,7 +136,7 @@ export function selectBasePlace<T extends PlaceLike>(
   const alternatives = destinationPlaceId
     ? bases.filter((place) => place._id !== destinationPlaceId)
     : bases;
-  return findNearestPlace(start, alternatives.length > 0 ? alternatives : bases);
+  return alternatives.length > 0 ? findNearestPlace(start, alternatives) : null;
 }
 
 /**

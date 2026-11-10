@@ -1212,4 +1212,149 @@ describe("review regressions", () => {
     const trip = await f.t.run((ctx) => ctx.db.get(tripId));
     expect(trip?.actualDistanceMeters).toBe(5_000);
   });
+
+  test("a future service-due date does not outrank today's alerts", async () => {
+    const f = await createAuthzFixture();
+    await connect(f, [
+      rawVehicle("APL-079", 31.4623, 74.458, { Odometer: 54_600_000 }),
+    ]);
+    const vehicleId = await vehicleIdOf(f);
+    await f.asUser("adminA").mutation(api.fleet.setServiceInterval, {
+      companyId: f.companyA,
+      vehicleId,
+      serviceIntervalKm: 5_000,
+      serviceIntervalDays: 30,
+    });
+    // Serviced 25 days ago at 50,000 km: due at 55,000 km in 5 days.
+    await f.asUser("adminA").mutation(api.fleet.createServiceEntry, {
+      companyId: f.companyA,
+      vehicleId,
+      servicedAt: pinnedNow - 25 * 24 * HOUR,
+      odometerMeters: 50_000_000,
+      description: "Oil and filter",
+    });
+
+    const feed = await f.asUser("adminA").query(api.fleetMonitoring.alertsFeed, {
+      companyId: f.companyA,
+      now: pinnedNow,
+    });
+    expect(
+      feed.alerts.find((alert) => alert.kind === "service_due_soon"),
+    ).toMatchObject({ occurredAt: pinnedNow, status: "open" });
+  });
+
+  test("a late earlier segment moves an open outing's start", async () => {
+    const f = await createAuthzFixture();
+    await connect(f, [rawVehicle("APL-079", 31.4623, 74.458)]);
+    const vehicleId = await vehicleIdOf(f);
+
+    await insertTrackerTrip(f, vehicleId, {
+      startedAt: pinnedNow - 2 * HOUR,
+      endedAt: pinnedNow - 110 * MINUTE,
+      distanceMeters: 1_500,
+      startLandmark: "Depot",
+      endLat: 31.47,
+      endLng: 74.47,
+      endLandmark: "Market",
+    });
+    await reconcile(f, vehicleId);
+    expect(await alertsForVehicle(f, vehicleId, "unlogged_movement")).toHaveLength(1);
+
+    // The incoming segment ends five minutes before the outing, so it belongs
+    // to the same group and makes the outing start earlier.
+    await insertTrackerTrip(f, vehicleId, {
+      startedAt: pinnedNow - 140 * MINUTE,
+      endedAt: pinnedNow - 125 * MINUTE,
+      distanceMeters: 1_200,
+      startLandmark: "Warehouse",
+      endLat: 31.46,
+      endLng: 74.46,
+      endLandmark: "Depot",
+    });
+    await reconcile(f, vehicleId);
+
+    const alerts = await alertsForVehicle(f, vehicleId, "unlogged_movement");
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatchObject({
+      status: "open",
+      occurredAt: pinnedNow - 140 * MINUTE,
+      fromAddress: "Warehouse",
+    });
+  });
+
+  test("an open outing clears once a logged trip covers it", async () => {
+    const f = await createAuthzFixture();
+    await connect(f, [rawVehicle("APL-079", 31.4623, 74.458)]);
+    const vehicleId = await vehicleIdOf(f);
+    const driverId = await driverIdOf(f);
+
+    await insertTrackerTrip(f, vehicleId, {
+      startedAt: pinnedNow - 2 * HOUR,
+      endedAt: pinnedNow - 110 * MINUTE,
+      distanceMeters: 1_500,
+      startLandmark: "Depot",
+      endLat: 31.47,
+      endLng: 74.47,
+      endLandmark: "Market",
+    });
+    await reconcile(f, vehicleId);
+    expect(
+      (await alertsForVehicle(f, vehicleId, "unlogged_movement")).filter(
+        (alert) => alert.status === "open",
+      ),
+    ).toHaveLength(1);
+
+    await f.asUser("adminA").action(api.fleet.startTrip, {
+      companyId: f.companyA,
+      vehicleId,
+      driverId,
+      destination: "Market",
+      departedAt: pinnedNow - 2 * HOUR,
+    });
+    await reconcile(f, vehicleId);
+
+    expect(
+      (await alertsForVehicle(f, vehicleId, "unlogged_movement")).filter(
+        (alert) => alert.status === "open",
+      ),
+    ).toHaveLength(0);
+    const resolved = await f.asUser("adminA").query(api.fleetMonitoring.alertsFeed, {
+      companyId: f.companyA,
+      now: pinnedNow,
+      status: "resolved",
+    });
+    expect(
+      resolved.alerts.find((alert) => alert.kind === "unlogged_movement"),
+    ).toMatchObject({ resolutionNote: "A logged trip now covers this movement." });
+  });
+
+  test("the destination chart keeps every destination beyond the top ten", async () => {
+    const f = await createAuthzFixture();
+    await connect(f, [rawVehicle("APL-079", 31.4623, 74.458)]);
+    const vehicleId = await vehicleIdOf(f);
+    const driverId = await driverIdOf(f);
+    for (let index = 0; index < 11; index += 1) {
+      const departedAt = pinnedNow - (index + 1) * HOUR;
+      await f.t.run((ctx) =>
+        ctx.db.insert("fleetTrips", {
+          companyId: f.companyA,
+          vehicleId,
+          driverId,
+          destination: `Destination ${index + 1}`,
+          status: "returned",
+          departedAt,
+          returnedAt: departedAt + 30 * MINUTE,
+          createdByMembershipId: f.adminM,
+          createdAt: departedAt,
+          updatedAt: departedAt,
+        }),
+      );
+    }
+
+    const activity = await f.asUser("adminA").query(api.fleetDashboard.activity, {
+      companyId: f.companyA,
+      now: pinnedNow,
+    });
+    expect(activity.tripsByDestination).toHaveLength(11);
+  });
 });

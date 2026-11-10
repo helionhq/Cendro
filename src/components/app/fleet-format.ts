@@ -794,8 +794,8 @@ export function vehicleStatusChip(vehicle: VehicleStatusInput): {
         ? { label: `At ${vehicle.place.name}`, tone: "green" }
         : { label: "Parked", tone: "neutral" };
     case "missing":
-    case "offline":
       return { label: "Offline", tone: "red" };
+    case "offline":
     case "unknown":
       return vehicle.lastUpdate == null
         ? { label: "Not seen yet", tone: "neutral" }
@@ -817,7 +817,6 @@ export function openTripStatusChip(trip: {
 
 export function tripStatusChip(trip: {
   status: "open" | "returned";
-  autoReturned?: boolean;
 }): { label: string; tone: BadgeTone } {
   if (trip.status === "open") return { label: "Out now", tone: "blue" };
   // Auto-closed trips keep the "Auto" badge beside the status in list views;

@@ -63,6 +63,11 @@ describe("fleet geometry", () => {
       selectBasePlace({ lat: 0.0001, lng: 0.0001 }, [baseA, baseB], "b")?._id,
     ).toBe("a");
   });
+
+  test("base selection skips route checks when the destination is the only base", () => {
+    const only = { _id: "a", lat: 0, lng: 0, radiusMeters: 300 };
+    expect(selectBasePlace({ lat: 0.0001, lng: 0.0001 }, [only], "a")).toBeNull();
+  });
 });
 
 describe("tracker trip coverage and grouping", () => {

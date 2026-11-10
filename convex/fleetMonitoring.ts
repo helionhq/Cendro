@@ -17,6 +17,7 @@ import {
   loadOpenTrips,
   MAX_ALERTS,
   MAX_DESTINATION,
+  resolveTripOverdueAlerts,
 } from "./fleetInternal";
 import { buildDerivedAlerts } from "./fleet";
 import { loadCompanyPlaces } from "./fleetPlaces";
@@ -174,28 +175,6 @@ async function upsertStoredAlert(
     createdAt: args.now,
     updatedAt: args.now,
   });
-}
-
-/** Resolve the open overdue alert for a trip that has now returned. */
-async function resolveTripOverdueAlert(
-  ctx: MutationCtx,
-  tripId: Id<"fleetTrips">,
-  note: string,
-  at: number,
-) {
-  const alerts = await ctx.db
-    .query("fleetAlerts")
-    .withIndex("by_tripId", (q) => q.eq("tripId", tripId))
-    .take(10);
-  for (const alert of alerts) {
-    if (alert.kind !== "trip_overdue" || alert.status === "resolved") continue;
-    await ctx.db.patch(alert._id, {
-      status: "resolved",
-      resolvedAt: at,
-      resolutionNote: note,
-      updatedAt: at,
-    });
-  }
 }
 
 type Observation = {
@@ -376,7 +355,7 @@ async function applyTripObservations(ctx: MutationCtx, options: TripFactOptions)
           : {}),
         updatedAt: now,
       });
-      await resolveTripOverdueAlert(
+      await resolveTripOverdueAlerts(
         ctx,
         trip._id,
         "The trip returned automatically.",
@@ -586,6 +565,28 @@ async function reconcileVehicleState(
     )
     .sort((a, b) => a.startedAt - b.startedAt);
 
+  // An outing alert is a live condition: a trip logged after the alert was
+  // raised (start, backdated edit, or the pre-departure buffer) can cover the
+  // whole movement. Resolve those instead of leaving a false review item.
+  for (const alert of vehicleAlerts) {
+    if (alert.kind !== "unlogged_movement" || alert.status === "resolved") continue;
+    // Older outings may have segments outside the loaded tracker window.
+    if (alert.occurredAt < now - INGEST_LOOKBACK_MS) continue;
+    const alertEnd = alert.endedAt ?? alert.occurredAt;
+    const stillUncovered = uncovered.some(
+      (trip) =>
+        trip.startedAt <= alertEnd + UNLOGGED_GROUP_GAP_MS &&
+        trip.endedAt >= alert.occurredAt - UNLOGGED_GROUP_GAP_MS,
+    );
+    if (stillUncovered) continue;
+    await ctx.db.patch(alert._id, {
+      status: "resolved",
+      resolvedAt: now,
+      resolutionNote: "A logged trip now covers this movement.",
+      updatedAt: now,
+    });
+  }
+
   for (const group of groupConsecutiveTrips(uncovered, UNLOGGED_GROUP_GAP_MS)) {
     const first = group[0];
     const last = group[group.length - 1];
@@ -605,6 +606,10 @@ async function reconcileVehicleState(
       // A reviewed outing is a closed decision: extend only open alerts.
       if (overlapping.status === "open") {
         const patch: Partial<Doc<"fleetAlerts">> = { updatedAt: now };
+        if (first.startedAt < overlapping.occurredAt) {
+          patch.occurredAt = first.startedAt;
+          if (fromAddress) patch.fromAddress = fromAddress;
+        }
         if ((overlapping.endedAt ?? 0) < last.endedAt) patch.endedAt = last.endedAt;
         if ((overlapping.distanceMeters ?? 0) < distanceMeters) {
           patch.distanceMeters = distanceMeters;
@@ -1166,7 +1171,9 @@ export async function buildAlertsFeed(
       vehicleId: alert.vehicleId,
       vehicleName,
       tripId: null,
-      occurredAt: alert.at,
+      // A due-soon service alert carries its future due date; group and sort
+      // it by the moment it became actionable instead.
+      occurredAt: alert.at === null ? null : Math.min(alert.at, now),
       endedAt: null,
       status: "open" as const,
       lat: null,

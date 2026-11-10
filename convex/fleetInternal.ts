@@ -56,6 +56,28 @@ export async function loadOpenTrips(ctx: QueryCtx | MutationCtx, companyId: Id<"
   );
 }
 
+/** Resolve the open overdue alert for a trip that is no longer open. */
+export async function resolveTripOverdueAlerts(
+  ctx: MutationCtx,
+  tripId: Id<"fleetTrips">,
+  note: string,
+  at: number,
+) {
+  const alerts = await ctx.db
+    .query("fleetAlerts")
+    .withIndex("by_tripId", (q) => q.eq("tripId", tripId))
+    .take(10);
+  for (const alert of alerts) {
+    if (alert.kind !== "trip_overdue" || alert.status === "resolved") continue;
+    await ctx.db.patch(alert._id, {
+      status: "resolved",
+      resolvedAt: at,
+      resolutionNote: note,
+      updatedAt: at,
+    });
+  }
+}
+
 async function loadLatestService(
   ctx: QueryCtx | MutationCtx,
   vehicleId: Id<"fleetVehicles">,

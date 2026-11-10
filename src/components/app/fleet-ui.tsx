@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { FleetAlertFeedRow, FleetBoardVehicle } from "./fleet-format";
-import { formatTime, vehicleStatusChip } from "./fleet-format";
+import { formatTime, relativeTime, vehicleStatusChip } from "./fleet-format";
 
 export function KpiTile({
   label,
@@ -317,8 +317,8 @@ function vehicleContext(vehicle: FleetBoardVehicle, now: number, timeZone?: stri
     }
     case "moving":
       return vehicle.requiresTripLogging === false
-        ? { primary: "Personal vehicle — no trip alerts", secondary: `Last update ${relativeBoard(vehicle.lastUpdate, now)}` }
-        : { primary: "No trip logged", secondary: `Last update ${relativeBoard(vehicle.lastUpdate, now)}` };
+        ? { primary: "Personal vehicle — no trip alerts", secondary: `Last update ${relativeTime(vehicle.lastUpdate, now)}` }
+        : { primary: "No trip logged", secondary: `Last update ${relativeTime(vehicle.lastUpdate, now)}` };
     case "parked":
       if (vehicle.place) {
         return {
@@ -339,19 +339,8 @@ function vehicleContext(vehicle: FleetBoardVehicle, now: number, timeZone?: stri
     case "offline":
       return vehicle.lastUpdate == null
         ? { primary: "Waiting for the first tracker update", secondary: "" }
-        : { primary: `Last seen ${relativeBoard(vehicle.lastUpdate, now)}`, secondary: vehicle.place ? `Last at ${vehicle.place.name}` : vehicle.address ?? "" };
+        : { primary: `Last seen ${relativeTime(vehicle.lastUpdate, now)}`, secondary: vehicle.place ? `Last at ${vehicle.place.name}` : vehicle.address ?? "" };
   }
-}
-
-function relativeBoard(ms: number | null, now: number) {
-  if (ms == null) return "never";
-  const diff = Math.max(0, now - ms);
-  if (diff < 60_000) return "just now";
-  const minutes = Math.floor(diff / 60_000);
-  if (minutes < 60) return `${minutes} min ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} hr ago`;
-  return `${Math.floor(hours / 24)} days ago`;
 }
 
 export function AlertSeverityDot({ severity }: { severity: "critical" | "warning" }) {

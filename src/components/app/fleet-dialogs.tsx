@@ -599,7 +599,13 @@ export function StartTripDialog({
           ...(notes.trim() ? { notes: notes.trim() } : {}),
         });
       }
-      onSaved?.(trip ? "Trip updated." : "Trip started. We'll mark arrival automatically.");
+      onSaved?.(
+        trip
+          ? "Trip updated."
+          : destinationKind === "place"
+            ? "Trip started. We'll mark arrival automatically."
+            : "Trip started. Mark it returned when the vehicle is back.",
+      );
       onClose();
     } catch (err) {
       setError(errorMessage(err));

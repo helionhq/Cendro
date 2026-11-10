@@ -9,6 +9,7 @@ import {
   serviceRemainingLabel,
   timestampForEditedDateField,
   timestampForDateField,
+  vehicleStatusChip,
 } from "./fleet-format";
 
 test("relativeTime keeps recent sightings readable and falls back to a date", () => {
@@ -18,6 +19,21 @@ test("relativeTime keeps recent sightings readable and falls back to a date", ()
   expect(relativeTime(now - 3 * 3_600_000, now)).toBe("3 hr ago");
   expect(relativeTime(now - 2 * 86_400_000, now)).toBe("2 days ago");
   expect(relativeTime(null, now)).toBe("never");
+});
+
+test("a never-seen vehicle reads as Not seen yet, not Offline", () => {
+  expect(vehicleStatusChip({ status: "offline", lastUpdate: null })).toEqual({
+    label: "Not seen yet",
+    tone: "neutral",
+  });
+  expect(vehicleStatusChip({ status: "offline", lastUpdate: Date.now() })).toEqual({
+    label: "Offline",
+    tone: "red",
+  });
+  expect(vehicleStatusChip({ status: "missing", lastUpdate: Date.now() })).toEqual({
+    label: "Offline",
+    tone: "red",
+  });
 });
 
 test("serviceRemainingLabel distinguishes time left from time overdue", () => {

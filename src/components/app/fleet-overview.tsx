@@ -194,8 +194,10 @@ function OverviewContent() {
     (!activity && activityResult.status === "pending");
 
   const connected = connection?.connected === true;
-  const hasVehicles = (connection?.vehicleCount ?? 0) > 0;
   const board = overview?.vehicleBoard ?? [];
+  // Prefer the loaded board: a failed connection query must not replace a
+  // loaded dashboard with the "Connect your tracker" empty state.
+  const hasVehicles = overview ? board.length > 0 : (connection?.vehicleCount ?? 0) > 0;
   const allOnTrip = board.length > 0 && board.every((vehicle) => vehicle.status === "on_trip");
   const canStartTrip = canLog && board.length > 0 && !allOnTrip;
   const activeDrivers = drivers.filter((driver) => driver.active);

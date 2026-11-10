@@ -29,6 +29,7 @@ import {
   MAX_FLEET_DRIVERS,
   MAX_FLEET_PHOTO_BYTES,
   metersToKm,
+  resolveTripOverdueAlerts,
 } from "./fleetInternal";
 import {
   isStorageBlobClaimed,
@@ -88,28 +89,6 @@ async function requireFleetTrip(
   const trip = await ctx.db.get(tripId);
   if (!trip || trip.companyId !== companyId) throw new ConvexError("Trip not found.");
   return trip;
-}
-
-/** An overdue alert is a live condition; close it when the trip stops being open. */
-async function resolveTripOverdueAlerts(
-  ctx: MutationCtx,
-  tripId: Id<"fleetTrips">,
-  note: string,
-  at: number,
-) {
-  const alerts = await ctx.db
-    .query("fleetAlerts")
-    .withIndex("by_tripId", (q) => q.eq("tripId", tripId))
-    .take(10);
-  for (const alert of alerts) {
-    if (alert.kind !== "trip_overdue" || alert.status === "resolved") continue;
-    await ctx.db.patch(alert._id, {
-      status: "resolved",
-      resolvedAt: at,
-      resolutionNote: note,
-      updatedAt: at,
-    });
-  }
 }
 
 function validateOdometer(value: number | null | undefined, label: string): number | null {

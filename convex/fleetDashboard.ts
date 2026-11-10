@@ -3,7 +3,7 @@ import type { Doc, Id } from "./_generated/dataModel";
 import { query, type QueryCtx } from "./_generated/server";
 import { requireCapability } from "./permissions";
 import { takeWithOverflow } from "./queryLimits";
-import { buildFuelInsights, buildVehicleRows } from "./fleet";
+import { buildVehicleRows } from "./fleet";
 import { buildAlertsFeed } from "./fleetMonitoring";
 import { loadCompanyPlaces } from "./fleetPlaces";
 import {
@@ -25,7 +25,6 @@ const MAX_DESTINATION_TRIPS = 1_000;
 const MAX_UPCOMING_SERVICE = 5;
 const MAX_ATTENTION = 5;
 const MAX_RECENT_ACTIVITY = 10;
-const MAX_TRIPS_BY_DESTINATION = 10;
 const TRIPS_BY_DESTINATION_WINDOW_MS = 30 * DAY_MS;
 
 function dayWindows(now: number, timeZone: string | null | undefined, count: number) {
@@ -71,8 +70,7 @@ function odometerDistance(trip: Doc<"fleetTrips">) {
 
 /**
  * Fleet overview: KPIs, the live vehicle board, attention items and upcoming
- * service. Bounded reads only; fuel analytics live in `activity` because the
- * derivation scans fills per vehicle.
+ * service. Bounded reads only; fuel analytics live in `fleet.fuelInsights`.
  */
 export const overview = query({
   args: { companyId: v.id("companies"), now: v.number() },
@@ -198,8 +196,8 @@ export const overview = query({
 });
 
 /**
- * Trend panels: tracker km per local day, trips by destination, fuel spend and
- * efficiency, and a merged recent-activity list.
+ * Trend panels: tracker km per local day, trips by destination, and a merged
+ * recent-activity list.
  */
 export const activity = query({
   args: { companyId: v.id("companies"), now: v.number() },
@@ -260,30 +258,9 @@ export const activity = query({
       entry.destination = trip.destination;
       byDestination.set(key, entry);
     }
-    const tripsByDestination = [...byDestination.values()]
-      .sort((a, b) => b.count - a.count || b.km - a.km)
-      .slice(0, MAX_TRIPS_BY_DESTINATION);
-
-    const insights = await buildFuelInsights(
-      ctx,
-      args.companyId,
-      timeZone,
-      args.now,
+    const tripsByDestination = [...byDestination.values()].sort(
+      (a, b) => b.count - a.count || b.km - a.km,
     );
-    const fuel = {
-      currentMonthStart: insights.currentMonthStart,
-      previousMonthStart: insights.previousMonthStart,
-      currentMonthSpend: insights.fleet.currentMonthSpend,
-      previousMonthSpend: insights.fleet.previousMonthSpend,
-      previousThreeMonthAverage: insights.fleet.previousThreeMonthAverage,
-      monthOverMonthChange: insights.fleet.monthOverMonthChange,
-      spendSpike: insights.fleet.spendSpike,
-      hasThreeMonthsHistory: insights.fleet.hasThreeMonthsHistory,
-      kmPerL: insights.fleetKmPerL,
-      currentMonthKm: insights.currentMonthKm,
-      currentMonthLitres: insights.currentMonthLitres,
-      isTruncated: insights.isTruncated,
-    };
 
     const [recentTrips, recentFuel, recentService, recentAlerts] = await Promise.all([
       ctx.db
@@ -368,12 +345,8 @@ export const activity = query({
     return {
       kmLast7Days,
       tripsByDestination,
-      fuel,
       recentActivity,
-      isTruncated:
-        trackerTrips.isTruncated ||
-        destinationTrips.isTruncated ||
-        fuel.isTruncated,
+      isTruncated: trackerTrips.isTruncated || destinationTrips.isTruncated,
     };
   },
 });
