@@ -533,6 +533,27 @@ describe("trip detection", () => {
     expect((today.trackerTrips[0] as { matchedTripId: string }).matchedTripId).toBe(
       started.tripId,
     );
+    // The trip sheet opens from this payload, so it must carry the real facts.
+    const matchedTrip = (
+      today.trackerTrips[0] as {
+        matchedTrip: {
+          placeId: string | null;
+          driverName: string | null;
+          arrivedAt: number | null;
+          autoReturned: boolean;
+          offRoute: boolean;
+          maxDeviationKm: number | null;
+        } | null;
+      }
+    ).matchedTrip;
+    expect(matchedTrip).toMatchObject({
+      placeId: destinationPlaceId,
+      driverName: "Bilal",
+      arrivedAt: pinnedNow + 30 * MINUTE,
+      autoReturned: true,
+      offRoute: false,
+    });
+    expect(matchedTrip?.maxDeviationKm).toBeLessThan(0.05);
   });
 
   test("an off-route point raises one alert whose max deviation keeps growing", async () => {
@@ -962,6 +983,45 @@ describe("review regressions", () => {
     expect(trip?.status).toBe("open");
     expect(trip?.arrivedAt).toBeUndefined();
     expect(trip?.returnedAt).toBeUndefined();
+  });
+
+  test("a trip to the base the vehicle is parked in gets no foreign corridor", async () => {
+    const f = await createAuthzFixture();
+    const base = { lat: 31.4623, lng: 74.458 };
+    const otherBase = { lat: 31.5934, lng: 74.2611 };
+    await connect(f, [rawVehicle("APL-079", base.lat, base.lng)]);
+    const vehicleId = await vehicleIdOf(f);
+    const driverId = await driverIdOf(f);
+    const basePlaceId = await createPlace(f, { name: "Warehouse", kind: "base", ...base });
+    await createPlace(f, { name: "Old Yard", kind: "base", ...otherBase });
+
+    const started = await f.asUser("adminA").action(api.fleet.startTrip, {
+      companyId: f.companyA,
+      vehicleId,
+      driverId,
+      placeId: basePlaceId,
+      departedAt: pinnedNow,
+    });
+
+    const afterStart = await f.t.run((ctx) => ctx.db.get(started.tripId));
+    expect(afterStart?.basePlaceId).toBeUndefined();
+
+    // Leave the base far from the Old Yard→Warehouse line.
+    await patchVehicleReading(f, vehicleId, {
+      lat: base.lat,
+      lng: base.lng + 0.2,
+      recordedAt: pinnedNow + 10 * MINUTE,
+      address: "Elsewhere",
+    });
+    await f.t.mutation(internal.fleetMonitoring.reconcileLivePositions, {
+      companyId: f.companyA,
+      now: pinnedNow + 10 * MINUTE,
+    });
+
+    const trip = await f.t.run((ctx) => ctx.db.get(started.tripId));
+    expect(trip?.basePlaceId).toBeUndefined();
+    expect(trip?.maxDeviationMeters).toBeUndefined();
+    expect(await alertsForVehicle(f, vehicleId, "off_route")).toHaveLength(0);
   });
 
   test("editing the departure time clears derived arrival and deviation", async () => {

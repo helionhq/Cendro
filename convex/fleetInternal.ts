@@ -13,7 +13,7 @@ import { takeWithOverflow } from "./queryLimits";
 import { trackerVehicleValidator, type TrackerVehicle, EMPTY_TRACKER_RESPONSE_MESSAGE } from "./fleetTracker";
 import { isStorageBlobOwned } from "./uploadOwnership";
 import { loadCompanyPlaces } from "./fleetPlaces";
-import { selectBasePlace } from "./fleetDetection";
+import { isInsideRadius, selectBasePlace } from "./fleetDetection";
 
 export const MAX_FLEET_VEHICLES = 500;
 export const MAX_FLEET_DRIVERS = 200;
@@ -508,9 +508,16 @@ export const applyStartTrip = internalMutation({
 
     // Off-route checks need a straight corridor base→destination. Pick the
     // nearest base to the start observation; reconcile fills it in later when
-    // the start position was not known at logging time.
+    // the start position was not known at logging time. A trip that begins
+    // inside its destination has no such corridor, and choosing another base
+    // would fabricate an off-route alert as the vehicle leaves.
     let basePlaceId: Id<"fleetPlaces"> | undefined;
-    if (place && startLat !== undefined && startLng !== undefined) {
+    if (
+      place &&
+      startLat !== undefined &&
+      startLng !== undefined &&
+      !isInsideRadius({ lat: startLat, lng: startLng }, place, place.radiusMeters)
+    ) {
       const places = await loadCompanyPlaces(ctx, args.companyId, false);
       const bases = places.rows.filter((candidate) => candidate.kind === "base");
       basePlaceId =

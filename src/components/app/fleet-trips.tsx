@@ -62,7 +62,9 @@ export function TripsPage() {
   // The cutoff is anchored when the page opens so the subscription does not
   // restart (and lose pagination) every minute.
   const [filterAnchor] = useState(() => Math.floor(Date.now() / 60_000) * 60_000);
-  const periodDays = periodOptions.find((option) => option.value === period)?.days ?? 30;
+  const periodOption = periodOptions.find((option) => option.value === period);
+  // "all" keeps its null sentinel; only an unknown period falls back to 30 days.
+  const periodDays = periodOption ? periodOption.days : 30;
 
   const [notice, setNotice] = useState<string | null>(null);
   const [returningId, setReturningId] = useState<string | null>(null);

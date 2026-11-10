@@ -213,6 +213,7 @@ export const activity = query({
           .withIndex("by_companyId_and_startAt", (q) =>
             q.eq("companyId", args.companyId).gte("startedAt", windows[0].start),
           )
+          .order("desc")
           .take(limit),
       MAX_DAILY_TRACKER_TRIPS,
     );
@@ -238,6 +239,7 @@ export const activity = query({
               args.now - TRIPS_BY_DESTINATION_WINDOW_MS,
             ),
           )
+          .order("desc")
           .take(limit),
       MAX_DESTINATION_TRIPS,
     );
@@ -409,6 +411,13 @@ export const vehicleTimeline = query({
     ]);
 
     const loggedById = new Map(loggedResult.rows.map((trip) => [trip._id, trip]));
+    // Match rows are opened as the trip sheet, which needs the driver name.
+    const driverNames = new Map<Id<"fleetDrivers">, string | null>();
+    for (const trip of loggedResult.rows) {
+      if (driverNames.has(trip.driverId)) continue;
+      const driver = await ctx.db.get(trip.driverId);
+      driverNames.set(trip.driverId, driver?.name ?? null);
+    }
     const buckets = new Map<
       number,
       {
@@ -460,6 +469,18 @@ export const vehicleTimeline = query({
               status: match.status,
               departedAt: match.departedAt,
               returnedAt: match.returnedAt ?? null,
+              placeId: match.placeId ?? null,
+              driverName: driverNames.get(match.driverId) ?? null,
+              notes: match.notes ?? null,
+              arrivedAt: match.arrivedAt ?? null,
+              autoReturned: match.autoReturned ?? false,
+              offRoute:
+                match.maxDeviationMeters !== undefined &&
+                match.maxDeviationMeters > OFF_ROUTE_CORRIDOR_METERS,
+              maxDeviationKm:
+                match.maxDeviationMeters === undefined
+                  ? null
+                  : match.maxDeviationMeters / 1000,
             }
           : null,
       });

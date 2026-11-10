@@ -329,11 +329,11 @@ async function applyTripObservations(ctx: MutationCtx, options: TripFactOptions)
   // example, choosing the base it is parked in) has not departed toward it.
   // Ignore in-radius readings until the vehicle is seen outside the
   // destination, so the trip neither arrives nor auto-returns while parked.
+  const startsInsideDestination =
+    options.startPoint !== null &&
+    isInsideRadius(options.startPoint, destination, destination.radiusMeters);
   let arrivalObservations: readonly Observation[] = observations;
-  if (
-    options.startPoint &&
-    isInsideRadius(options.startPoint, destination, destination.radiusMeters)
-  ) {
+  if (startsInsideDestination) {
     const departureIndex = observations.findIndex(
       (observation) => !isInsideRadius(observation, destination, destination.radiusMeters),
     );
@@ -377,6 +377,11 @@ async function applyTripObservations(ctx: MutationCtx, options: TripFactOptions)
       );
     }
   }
+
+  // A trip that began inside its destination has no base→destination
+  // corridor; measuring deviation from any other base would raise a false
+  // off-route alert once the vehicle leaves.
+  if (startsInsideDestination) return;
 
   let basePlaceId = trip.basePlaceId;
   if (!basePlaceId && options.startPoint) {

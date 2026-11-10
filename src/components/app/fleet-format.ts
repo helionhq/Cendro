@@ -421,6 +421,13 @@ export type FleetVehicleTimelineTrackerTrip = {
     status: "open" | "returned";
     departedAt: number;
     returnedAt: number | null;
+    placeId: Id<"fleetPlaces"> | null;
+    driverName: string | null;
+    notes: string | null;
+    arrivedAt: number | null;
+    autoReturned: boolean;
+    offRoute: boolean;
+    maxDeviationKm: number | null;
   } | null;
 };
 
