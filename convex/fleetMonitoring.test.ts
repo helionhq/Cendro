@@ -1096,9 +1096,47 @@ describe("review regressions", () => {
     });
     const moved = await f.t.run((ctx) => ctx.db.get(tripId));
     expect(moved?.placeId).toBe(otherPlaceId);
+    expect(moved?.destination).toBe("Other destination");
     expect(moved?.arrivedAt).toBeUndefined();
     expect(moved?.maxDeviationMeters).toBeUndefined();
     expect(moved?.basePlaceId).toBeUndefined();
+  });
+
+  test("editing an unchanged place keeps the trip's destination label snapshot", async () => {
+    const f = await createAuthzFixture();
+    const base = { lat: 31.4623, lng: 74.458 };
+    await connect(f, [rawVehicle("APL-079", base.lat, base.lng)]);
+    const vehicleId = await vehicleIdOf(f);
+    const driverId = await driverIdOf(f);
+    const placeId = await createPlace(f, {
+      name: "Saggian Plant (Achha Dairies)",
+      kind: "destination",
+      lat: 31.6,
+      lng: 74.4,
+    });
+    const started = await f.asUser("adminA").action(api.fleet.startTrip, {
+      companyId: f.companyA,
+      vehicleId,
+      driverId,
+      placeId,
+      departedAt: pinnedNow - 2 * HOUR,
+    });
+
+    await f.asUser("adminA").mutation(api.fleetPlaces.updatePlace, {
+      companyId: f.companyA,
+      placeId,
+      name: "Saggian Plant",
+    });
+    await f.asUser("adminA").mutation(api.fleet.updateTrip, {
+      companyId: f.companyA,
+      tripId: started.tripId,
+      placeId,
+      notes: "Corrected driver notes.",
+    });
+
+    const trip = await f.t.run((ctx) => ctx.db.get(started.tripId));
+    expect(trip?.destination).toBe("Saggian Plant (Achha Dairies)");
+    expect(trip?.notes).toBe("Corrected driver notes.");
   });
 
   test("returning or deleting a trip resolves its overdue alert", async () => {

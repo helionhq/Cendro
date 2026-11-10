@@ -1325,7 +1325,11 @@ export const updateTrip = mutation({
           patch.arrivedAt = undefined;
           patch.maxDeviationMeters = undefined;
         }
-        if (args.destination === undefined) patch.destination = place.name;
+        // Keep the old label when the place did not change: a rename must not
+        // rewrite a trip's historical destination snapshot.
+        if (args.destination === undefined && place._id !== trip.placeId) {
+          patch.destination = place.name;
+        }
       }
     }
     if (args.destination !== undefined) {
