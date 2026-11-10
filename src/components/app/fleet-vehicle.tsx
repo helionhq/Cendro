@@ -473,7 +473,7 @@ function VehicleContent({
           id="fleet-vehicle-timeline"
           action={<SectionLink href={`/fleet/trips?vehicle=${vehicleId}`}>View trips</SectionLink>}
         />
-        {!timeline ? (
+        {timelineResult.status === "error" ? null : !timeline ? (
           <div className="space-y-2" aria-busy="true" aria-label="Loading movements">
             <SkeletonBlock className="h-16" />
             <SkeletonBlock className="h-16" />

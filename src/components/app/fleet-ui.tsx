@@ -194,6 +194,15 @@ export function FleetNotice({
       <div className="alert-error flex flex-wrap items-center gap-2 rounded-md px-3 py-2 text-[13px]" role="alert">
         <span className="min-w-0 flex-1">{message}</span>
         {action}
+        {onDismiss && (
+          <button
+            type="button"
+            className="text-[12px] font-medium underline-offset-2 hover:underline"
+            onClick={onDismiss}
+          >
+            Dismiss
+          </button>
+        )}
       </div>
     );
   }

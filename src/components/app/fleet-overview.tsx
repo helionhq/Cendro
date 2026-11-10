@@ -27,11 +27,14 @@ import {
 } from "./fleet-dialogs";
 import {
   alertDisplayTitle,
+  formatAmount,
   formatDayLabel,
   formatInteger,
   formatKm,
+  formatKmPerL,
   formatTime,
   formatTimeRange,
+  monthOverMonthLabel,
   relativeTime,
   tripOverdueHours,
   type FleetAlertFeedRow,
@@ -40,6 +43,7 @@ import {
   type FleetDashboardKpis,
   type FleetDestinationCount,
   type FleetDriverRow,
+  type FleetFuelInsights,
   type FleetKmDay,
   type FleetPlace,
   type FleetPlaceSuggestion,
@@ -129,6 +133,10 @@ function OverviewContent() {
     query: api.fleet.listDrivers,
     args: activeCompanyId && canView ? { companyId: activeCompanyId, includeInactive: true } : "skip",
   });
+  const fuelResult = useQuery_experimental({
+    query: api.fleet.fuelInsights,
+    args: activeCompanyId && canView ? { companyId: activeCompanyId, now } : "skip",
+  });
 
   // Cache the last successful payload per company so a workspace switch can
   // never show another tenant's fleet.
@@ -177,6 +185,8 @@ function OverviewContent() {
     driversResult.status === "success"
       ? (driversResult.data.drivers as FleetDriverRow[])
       : [];
+  const fuel =
+    fuelResult.status === "success" ? (fuelResult.data as FleetFuelInsights) : undefined;
 
   const queryError =
     overviewResult.status === "error" ||
@@ -193,7 +203,11 @@ function OverviewContent() {
     (!overview && overviewResult.status === "pending") ||
     (!activity && activityResult.status === "pending");
 
-  const connected = connection?.connected === true;
+  // A pending or failed connection query says nothing about the tracker; only a
+  // successful response may show the disconnected UI or hide Sync now.
+  const connectionKnown = connectionResult.status === "success";
+  const connected = connectionKnown && connection?.connected === true;
+  const disconnected = connectionKnown && connection?.connected === false;
   const board = overview?.vehicleBoard ?? [];
   // Prefer the loaded board: a failed connection query must not replace a
   // loaded dashboard with the "Connect your tracker" empty state.
@@ -245,7 +259,7 @@ function OverviewContent() {
       ) : canLog && allOnTrip ? (
         <span className="text-[13px] text-[var(--ink-muted)]">All vehicles are out</span>
       ) : null}
-      {connected && (
+      {!disconnected && (
         <Button
           type="button"
           variant="secondary"
@@ -300,7 +314,7 @@ function OverviewContent() {
         <OverviewSkeleton />
       ) : (
         <>
-          {!connected && hasVehicles && (
+          {disconnected && hasVehicles && (
             <FleetNotice
               tone="warning"
               message="Tracker disconnected. Positions and automatic trips are paused; logged history still works."
@@ -314,30 +328,40 @@ function OverviewContent() {
             />
           )}
 
-          <SetupCard
-            connection={connection}
-            bases={bases}
-            destinations={destinations}
-            suggestionCount={suggestions.length}
-            driverCount={activeDrivers.length}
-            canManage={canManage}
-            canLog={canLog}
-            onConnectHref="/fleet/settings"
-            onAddWarehouse={() => setWarehouseOpen(true)}
-            onStartTrip={() => setStartOpen(true)}
-          />
+          {connectionKnown && (
+            <SetupCard
+              connection={connection}
+              bases={bases}
+              destinations={destinations}
+              suggestionCount={suggestions.length}
+              driverCount={activeDrivers.length}
+              canManage={canManage}
+              canLog={canLog}
+              onConnectHref="/fleet/settings"
+              onAddWarehouse={() => setWarehouseOpen(true)}
+              onStartTrip={() => setStartOpen(true)}
+            />
+          )}
 
           {!hasVehicles ? (
             <EmptyPanel
               icon={Truck}
-              title={connected ? "No vehicles yet" : "Connect your tracker"}
+              title={
+                !connectionKnown
+                  ? "Tracker status unavailable"
+                  : connected
+                    ? "No vehicles yet"
+                    : "Connect your tracker"
+              }
               body={
-                connected
-                  ? "Sync to bring them in."
-                  : "Add your TrackWorld / portalxs secret key to bring in vehicles, positions and trips."
+                !connectionKnown
+                  ? "Check your connection and try again."
+                  : connected
+                    ? "Sync to bring them in."
+                    : "Add your TrackWorld / portalxs secret key to bring in vehicles, positions and trips."
               }
               action={
-                connected ? (
+                !connectionKnown ? undefined : connected ? (
                   <Button
                     type="button"
                     variant="primary"
@@ -394,6 +418,28 @@ function OverviewContent() {
                     danger={overview.kpis.openAlerts > 0}
                   />
                 </div>
+              )}
+
+              {fuel && (
+                <FleetCard className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                  <span className="flex items-center gap-2 text-[13px] font-medium text-[var(--ink)]">
+                    <Fuel className="h-4 w-4 text-[var(--ink-faint)]" aria-hidden="true" />
+                    Fuel this month
+                  </span>
+                  <span className="text-[15px] font-semibold tabular-nums text-[var(--ink)]">
+                    {fuel.fleet.currentMonthSpend > 0
+                      ? formatAmount(fuel.fleet.currentMonthSpend)
+                      : "—"}
+                  </span>
+                  <span className="text-[12px] text-[var(--ink-muted)]">
+                    {fuel.fleet.currentMonthSpend > 0
+                      ? `${monthOverMonthLabel(fuel.fleet.monthOverMonthChange)} · ${formatKmPerL(fuel.fleetKmPerL)}`
+                      : "No fill-ups this month"}
+                  </span>
+                  <span className="ml-auto">
+                    <SectionLink href="/fleet/costs">View costs</SectionLink>
+                  </span>
+                </FleetCard>
               )}
 
               <section aria-labelledby="fleet-needs-attention">
@@ -471,7 +517,7 @@ function OverviewContent() {
                   </div>
                 )}
                 {overview?.isTruncated && (
-                  <p className="mt-2 text-[12px] text-[var(--ink-faint)]">Showing the first 500 vehicles.</p>
+                  <p className="mt-2 text-[12px] text-[var(--ink-faint)]">Some results are truncated.</p>
                 )}
               </section>
 
@@ -560,7 +606,7 @@ function OverviewContent() {
 
               {activity?.isTruncated && (
                 <p className="text-[12px] text-[var(--ink-faint)]">
-                  Showing the most recent activity and fuel data.
+                  Some trend data may be incomplete.
                 </p>
               )}
             </>

@@ -928,6 +928,42 @@ describe("review regressions", () => {
     });
   });
 
+  test("a trip to the base the vehicle is parked in does not arrive while parked", async () => {
+    const f = await createAuthzFixture();
+    const base = { lat: 31.4623, lng: 74.458 };
+    await connect(f, [rawVehicle("APL-079", base.lat, base.lng)]);
+    const vehicleId = await vehicleIdOf(f);
+    const driverId = await driverIdOf(f);
+    const basePlaceId = await createPlace(f, { name: "Warehouse", kind: "base", ...base });
+
+    const started = await f.asUser("adminA").action(api.fleet.startTrip, {
+      companyId: f.companyA,
+      vehicleId,
+      driverId,
+      placeId: basePlaceId,
+      departedAt: pinnedNow,
+    });
+
+    for (const minutes of [10, 20]) {
+      const at = pinnedNow + minutes * MINUTE;
+      await patchVehicleReading(f, vehicleId, {
+        lat: base.lat,
+        lng: base.lng,
+        recordedAt: at,
+        address: "Warehouse",
+      });
+      await f.t.mutation(internal.fleetMonitoring.reconcileLivePositions, {
+        companyId: f.companyA,
+        now: at,
+      });
+    }
+
+    const trip = await f.t.run((ctx) => ctx.db.get(started.tripId));
+    expect(trip?.status).toBe("open");
+    expect(trip?.arrivedAt).toBeUndefined();
+    expect(trip?.returnedAt).toBeUndefined();
+  });
+
   test("editing the departure time clears derived arrival and deviation", async () => {
     const f = await createAuthzFixture();
     const base = { lat: 31.4623, lng: 74.458 };

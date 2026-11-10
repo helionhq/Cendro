@@ -677,6 +677,55 @@ describe("fleet fuel", () => {
     });
   });
 
+  test("a future-dated fill-up is excluded from current-month efficiency", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    await connectVehicles(f, [rawVehicle("APL-079", 100_500_000)]);
+    await f.t.run(async (ctx) => {
+      await ctx.db.patch(f.companyA, { timeZone: "UTC" });
+    });
+    const ids = await vehicleIdsByName(f);
+    const vehicleId = ids.get("APL-079")!;
+
+    const fills = [
+      { filledAt: pinnedNow - DAY_MS, odometerMeters: 100_000_000, amount: 1_000 },
+      { filledAt: pinnedNow + DAY_MS, odometerMeters: 100_500_000, amount: 2_000 },
+    ];
+    await f.t.run(async (ctx) => {
+      for (let index = 0; index < fills.length; index += 1) {
+        const storageId = await ctx.storage.store(
+          new Blob([`future-${index}`], { type: "image/jpeg" }),
+        );
+        await ctx.db.insert("fleetFuelEntries", {
+          companyId: f.companyA,
+          vehicleId,
+          filledAt: fills[index].filledAt,
+          litres: 50,
+          amount: fills[index].amount,
+          odometerMeters: fills[index].odometerMeters,
+          photoStorageId: storageId,
+          photoFileName: `future-${index}.jpg`,
+          photoContentType: "image/jpeg",
+          photoSize: 8,
+          createdByMembershipId: f.adminM,
+          createdAt: pinnedNow,
+          updatedAt: pinnedNow,
+        });
+      }
+    });
+
+    const insights = await admin.query(api.fleet.fuelInsights, {
+      companyId: f.companyA,
+      now: pinnedNow,
+    });
+    // The 500 km odometer jump belongs to the future fill, so neither the
+    // distance nor its litres may enter this month's efficiency.
+    expect(insights.currentMonthKm).toBe(0);
+    expect(insights.currentMonthLitres).toBe(0);
+    expect(insights.fleetKmPerL).toBeNull();
+    expect(insights.fleet.currentMonthSpend).toBe(1_000);
+  });
+
   test("three months of history makes a spiking current month visible and alerts", async () => {
     const f = await createAuthzFixture();
     const admin = f.asUser("adminA");

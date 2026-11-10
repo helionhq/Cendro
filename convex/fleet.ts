@@ -397,7 +397,11 @@ export async function buildFuelInsights(
       })),
     );
     for (const point of series) {
-      if (point.filledAt >= windows.currentStart && point.kmSincePrevious !== null) {
+      if (
+        point.filledAt >= windows.currentStart &&
+        point.filledAt <= now &&
+        point.kmSincePrevious !== null
+      ) {
         currentMonthKm += point.kmSincePrevious;
         currentMonthLitres += point.litres;
       }

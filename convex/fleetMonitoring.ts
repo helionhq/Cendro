@@ -325,7 +325,21 @@ async function applyTripObservations(ctx: MutationCtx, options: TripFactOptions)
     .sort((a, b) => a.at - b.at);
 
   let arrivedAt = trip.arrivedAt;
-  const arrival = earliestInside(observations, destination, destination.radiusMeters);
+  // A trip logged while the vehicle is already inside its destination (for
+  // example, choosing the base it is parked in) has not departed toward it.
+  // Ignore in-radius readings until the vehicle is seen outside the
+  // destination, so the trip neither arrives nor auto-returns while parked.
+  let arrivalObservations: readonly Observation[] = observations;
+  if (
+    options.startPoint &&
+    isInsideRadius(options.startPoint, destination, destination.radiusMeters)
+  ) {
+    const departureIndex = observations.findIndex(
+      (observation) => !isInsideRadius(observation, destination, destination.radiusMeters),
+    );
+    arrivalObservations = departureIndex === -1 ? [] : observations.slice(departureIndex);
+  }
+  const arrival = earliestInside(arrivalObservations, destination, destination.radiusMeters);
   if (arrival && (arrivedAt === undefined || arrival.at < arrivedAt)) {
     arrivedAt = arrival.at;
     trip.arrivedAt = arrivedAt;
