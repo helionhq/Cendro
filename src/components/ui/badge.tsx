@@ -8,6 +8,6 @@ const tones = {
   yellow: "bg-[var(--badge-yellow-bg)] text-[var(--badge-yellow-fg)]",
 };
 
-export function Badge({ className, tone = "neutral", children }: { className?: string; tone?: keyof typeof tones; children: React.ReactNode }) {
-  return <span className={cn("inline-flex items-center rounded-sm px-1.5 py-0.5 text-xs font-medium", tones[tone], className)}>{children}</span>;
+export function Badge({ className, tone = "neutral", children, title }: { className?: string; tone?: keyof typeof tones; children: React.ReactNode; title?: string }) {
+  return <span title={title} className={cn("inline-flex items-center rounded-sm px-1.5 py-0.5 text-xs font-medium", tones[tone], className)}>{children}</span>;
 }

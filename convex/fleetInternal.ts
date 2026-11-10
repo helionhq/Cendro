@@ -12,6 +12,8 @@ import { nonEmpty } from "./validation";
 import { takeWithOverflow } from "./queryLimits";
 import { trackerVehicleValidator, type TrackerVehicle, EMPTY_TRACKER_RESPONSE_MESSAGE } from "./fleetTracker";
 import { isStorageBlobOwned } from "./uploadOwnership";
+import { loadCompanyPlaces } from "./fleetPlaces";
+import { selectBasePlace } from "./fleetDetection";
 
 export const MAX_FLEET_VEHICLES = 500;
 export const MAX_FLEET_DRIVERS = 200;
@@ -110,6 +112,13 @@ async function upsertTrackerVehicles(
         ...(incomingVehicle.address !== undefined ? { address: incomingVehicle.address } : {}),
         ...(incomingVehicle.speed !== undefined ? { speed: incomingVehicle.speed } : {}),
         ...(incomingVehicle.ignitionOn !== undefined ? { ignitionOn: incomingVehicle.ignitionOn } : {}),
+        ...(incomingVehicle.ignitionChangedAt !== undefined
+          ? { ignitionChangedAt: incomingVehicle.ignitionChangedAt }
+          : {}),
+        ...(incomingVehicle.reason !== undefined ? { reason: incomingVehicle.reason } : {}),
+        ...(incomingVehicle.directionDegree !== undefined
+          ? { directionDegree: incomingVehicle.directionDegree }
+          : {}),
         ...(incomingVehicle.recordedAt !== undefined ? { recordedAt: incomingVehicle.recordedAt } : {}),
         lastSeenAt: now,
         createdAt: now,
@@ -147,6 +156,21 @@ async function upsertTrackerVehicles(
         incomingVehicle.ignitionOn !== existing.ignitionOn
       ) {
         patch.ignitionOn = incomingVehicle.ignitionOn;
+      }
+      if (
+        incomingVehicle.ignitionChangedAt !== undefined &&
+        incomingVehicle.ignitionChangedAt !== existing.ignitionChangedAt
+      ) {
+        patch.ignitionChangedAt = incomingVehicle.ignitionChangedAt;
+      }
+      if (incomingVehicle.reason !== undefined && incomingVehicle.reason !== existing.reason) {
+        patch.reason = incomingVehicle.reason;
+      }
+      if (
+        incomingVehicle.directionDegree !== undefined &&
+        incomingVehicle.directionDegree !== existing.directionDegree
+      ) {
+        patch.directionDegree = incomingVehicle.directionDegree;
       }
       if (
         incomingVehicle.recordedAt !== undefined &&
@@ -214,7 +238,6 @@ export const listConnectionsPage = internalQuery({
     return {
       connections: page.page.map((connection) => ({
         companyId: connection.companyId,
-        secretKey: connection.secretKey,
       })),
       isDone: page.isDone,
       continueCursor: page.continueCursor,
@@ -406,7 +429,8 @@ export const applyStartTrip = internalMutation({
     companyId: v.id("companies"),
     vehicleId: v.id("fleetVehicles"),
     driverId: v.id("fleetDrivers"),
-    destination: v.string(),
+    destination: v.optional(v.string()),
+    placeId: v.optional(v.id("fleetPlaces")),
     notes: v.optional(v.string()),
     departedAt: v.optional(v.number()),
     now: v.number(),
@@ -435,25 +459,51 @@ export const applyStartTrip = internalMutation({
       .first();
     if (driverOpenTrip) throw new ConvexError("This driver is already on a trip.");
 
+    const place = args.placeId ? await ctx.db.get(args.placeId) : null;
+    // A supplied place that no longer exists must not silently become an
+    // "Other" text trip, or route checks would be dropped without warning.
+    if (args.placeId && (!place || place.companyId !== args.companyId)) {
+      throw new ConvexError("Place not found.");
+    }
+    if (place?.archived) throw new ConvexError("This place is archived.");
+    const destination = nonEmpty(
+      args.destination?.trim() || place?.name || "",
+      "Destination",
+    );
+    if (destination.length > MAX_DESTINATION) throw new ConvexError("Destination is too long.");
+
     const departedAt = args.departedAt ?? args.now;
     if (!Number.isFinite(departedAt)) throw new ConvexError("Departure time is invalid.");
-    const destination = nonEmpty(args.destination, "Destination");
-    if (destination.length > MAX_DESTINATION) throw new ConvexError("Destination is too long.");
     const notes = args.notes?.trim();
     // Only borrow the tracker reading if no newer reading could include driving
     // after the departure. Otherwise leave it for correction.
+    const readingUsable =
+      vehicle.recordedAt !== undefined && vehicle.recordedAt <= departedAt;
     const startOdometerMeters =
-      vehicle.odometerMeters !== undefined &&
-      vehicle.recordedAt !== undefined &&
-      vehicle.recordedAt <= departedAt
-        ? vehicle.odometerMeters
-        : undefined;
+      vehicle.odometerMeters !== undefined && readingUsable ? vehicle.odometerMeters : undefined;
+    const startLat = vehicle.lat !== undefined && readingUsable ? vehicle.lat : undefined;
+    const startLng = vehicle.lng !== undefined && readingUsable ? vehicle.lng : undefined;
+
+    // Off-route checks need a straight corridor base→destination. Pick the
+    // nearest base to the start observation; reconcile fills it in later when
+    // the start position was not known at logging time.
+    let basePlaceId: Id<"fleetPlaces"> | undefined;
+    if (place && startLat !== undefined && startLng !== undefined) {
+      const places = await loadCompanyPlaces(ctx, args.companyId, false);
+      const bases = places.rows.filter((candidate) => candidate.kind === "base");
+      basePlaceId =
+        selectBasePlace({ lat: startLat, lng: startLng }, bases, place._id)?._id ?? undefined;
+    }
 
     const tripId = await ctx.db.insert("fleetTrips", {
       companyId: args.companyId,
       vehicleId: args.vehicleId,
       driverId: args.driverId,
       destination,
+      ...(place ? { placeId: place._id } : {}),
+      ...(basePlaceId ? { basePlaceId } : {}),
+      ...(startLat !== undefined ? { startLat } : {}),
+      ...(startLng !== undefined ? { startLng } : {}),
       ...(notes ? { notes } : {}),
       status: "open",
       departedAt,
@@ -461,6 +511,11 @@ export const applyStartTrip = internalMutation({
       createdByMembershipId: membership._id,
       createdAt: args.now,
       updatedAt: args.now,
+    });
+    await ctx.scheduler.runAfter(0, internal.fleetMonitoring.reconcileVehicle, {
+      companyId: args.companyId,
+      vehicleId: args.vehicleId,
+      now: args.now,
     });
     return { tripId, startOdometerMeters: startOdometerMeters ?? null };
   },
@@ -505,6 +560,26 @@ export const applyReturnTrip = internalMutation({
       returnedAt,
       ...(endOdometerMeters !== undefined ? { endOdometerMeters } : {}),
       updatedAt: args.now,
+    });
+    // The overdue alert is a live condition, not a historical fact: once the
+    // car is back it needs no review.
+    const tripAlerts = await ctx.db
+      .query("fleetAlerts")
+      .withIndex("by_tripId", (q) => q.eq("tripId", trip._id))
+      .take(10);
+    for (const alert of tripAlerts) {
+      if (alert.kind !== "trip_overdue" || alert.status === "resolved") continue;
+      await ctx.db.patch(alert._id, {
+        status: "resolved",
+        resolvedAt: returnedAt,
+        resolutionNote: "The trip returned.",
+        updatedAt: args.now,
+      });
+    }
+    await ctx.scheduler.runAfter(0, internal.fleetMonitoring.reconcileVehicle, {
+      companyId: args.companyId,
+      vehicleId: trip.vehicleId,
+      now: args.now,
     });
     return {
       tripId: trip._id,

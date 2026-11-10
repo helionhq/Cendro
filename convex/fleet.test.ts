@@ -454,6 +454,14 @@ describe("fleet trips", () => {
       vehicle: { registrationNumber: "APL-079" },
     });
 
+    // The period filter is applied server-side, before pagination.
+    const afterTrip = await admin.query(api.fleet.listTrips, {
+      companyId: f.companyA,
+      since: pinnedNow + 60_000,
+      paginationOpts: { numItems: 10, cursor: null },
+    });
+    expect(afterTrip.page).toEqual([]);
+
     const open = await admin.query(api.fleet.listOpenTrips, { companyId: f.companyA });
     expect(open.trips).toEqual([]);
 

@@ -43,9 +43,11 @@ import {
   trackerSafeMessage,
   type TrackerVehicle,
 } from "./fleetTracker";
-import { requireCapability, requireMembership } from "./permissions";
+import { requireFleetLogOrManage } from "./fleetAuth";
+import { requireCapability } from "./permissions";
 import { takeWithOverflow } from "./queryLimits";
 import { nonEmpty } from "./validation";
+import { OFF_ROUTE_CORRIDOR_METERS, TRACKER_OFFLINE_MS } from "./fleetDetection";
 
 const SYNC_NOW_COOLDOWN_MS = 60_000;
 const TRACKER_STALE_MS = 60 * 60 * 1000;
@@ -57,15 +59,6 @@ const photoInputValidator = v.object({
   claimId: v.id("fleetUploadClaims"),
   fileName: v.string(),
 });
-
-function requireFleetLogOrManage(ctx: MutationCtx, companyId: Id<"companies">) {
-  return requireMembership(ctx, companyId).then((auth) => {
-    if (!auth.capabilities.has("fleet:log") && !auth.capabilities.has("fleet:manage")) {
-      throw new ConvexError("You do not have access to do that.");
-    }
-    return auth;
-  });
-}
 
 async function requireFleetVehicle(
   ctx: QueryCtx | MutationCtx,
@@ -95,6 +88,28 @@ async function requireFleetTrip(
   const trip = await ctx.db.get(tripId);
   if (!trip || trip.companyId !== companyId) throw new ConvexError("Trip not found.");
   return trip;
+}
+
+/** An overdue alert is a live condition; close it when the trip stops being open. */
+async function resolveTripOverdueAlerts(
+  ctx: MutationCtx,
+  tripId: Id<"fleetTrips">,
+  note: string,
+  at: number,
+) {
+  const alerts = await ctx.db
+    .query("fleetAlerts")
+    .withIndex("by_tripId", (q) => q.eq("tripId", tripId))
+    .take(10);
+  for (const alert of alerts) {
+    if (alert.kind !== "trip_overdue" || alert.status === "resolved") continue;
+    await ctx.db.patch(alert._id, {
+      status: "resolved",
+      resolvedAt: at,
+      resolutionNote: note,
+      updatedAt: at,
+    });
+  }
 }
 
 function validateOdometer(value: number | null | undefined, label: string): number | null {
@@ -187,6 +202,7 @@ function publicVehicle(
   trip: Doc<"fleetTrips"> | null,
   driverName: string | null,
   serviceStatus: ServiceStatus,
+  now: number,
 ) {
   const status: VehicleStatus = trip
     ? "on_trip"
@@ -197,6 +213,10 @@ function publicVehicle(
         : (vehicle.speed ?? 0) > 0
           ? "moving"
           : "parked";
+  const offline =
+    vehicle.missingFromTrackerAt !== undefined ||
+    vehicle.recordedAt === undefined ||
+    now - vehicle.recordedAt > TRACKER_OFFLINE_MS;
   return {
     _id: vehicle._id,
     registrationNumber: vehicle.registrationNumber,
@@ -209,9 +229,17 @@ function publicVehicle(
     address: vehicle.address ?? null,
     speed: vehicle.speed ?? null,
     ignitionOn: vehicle.ignitionOn ?? null,
+    ignitionChangedAt: vehicle.ignitionChangedAt ?? null,
+    reason: vehicle.reason ?? null,
+    directionDegree: vehicle.directionDegree ?? null,
     recordedAt: vehicle.recordedAt ?? null,
     lastSeenAt: vehicle.lastSeenAt ?? null,
     missingFromTrackerAt: vehicle.missingFromTrackerAt ?? null,
+    requiresTripLogging: vehicle.requiresTripLogging ?? true,
+    offline,
+    offlineSince: offline
+      ? vehicle.missingFromTrackerAt ?? vehicle.recordedAt ?? null
+      : null,
     status,
     openTrip: trip
       ? {
@@ -219,7 +247,9 @@ function publicVehicle(
           driverId: trip.driverId,
           driverName: driverName ?? "Unknown driver",
           destination: trip.destination,
+          placeId: trip.placeId ?? null,
           departedAt: trip.departedAt,
+          arrivedAt: trip.arrivedAt ?? null,
         }
       : null,
     serviceStatus,
@@ -239,7 +269,7 @@ async function driverNameFor(
   return name;
 }
 
-async function buildVehicleRows(ctx: QueryCtx, companyId: Id<"companies">, now: number) {
+export async function buildVehicleRows(ctx: QueryCtx, companyId: Id<"companies">, now: number) {
   const { rows: vehicles, isTruncated } = await loadCompanyVehicles(ctx, companyId);
   const open = await loadOpenTrips(ctx, companyId);
   const openByVehicle = new Map(open.rows.map((trip) => [trip.vehicleId, trip]));
@@ -257,7 +287,7 @@ async function buildVehicleRows(ctx: QueryCtx, companyId: Id<"companies">, now: 
       currentOdometerMeters: vehicle.odometerMeters ?? null,
       now,
     });
-    rows.push(publicVehicle(vehicle, trip, driverName, serviceStatus));
+    rows.push(publicVehicle(vehicle, trip, driverName, serviceStatus, now));
   }
   rows.sort((a, b) => a.name.localeCompare(b.name));
   return { vehicles: rows, isTruncated: isTruncated || open.isTruncated };
@@ -302,7 +332,7 @@ async function buildMaintenanceRows(ctx: QueryCtx, companyId: Id<"companies">, n
   return { rows, isTruncated };
 }
 
-async function buildFuelInsights(
+export async function buildFuelInsights(
   ctx: QueryCtx,
   companyId: Id<"companies">,
   timeZone: string | null,
@@ -351,6 +381,10 @@ async function buildFuelInsights(
     amount: number;
   }[] = [];
   const byVehicleSpend = [];
+  // Current-month efficiency: distance since the previous fill-up divided by
+  // the litres bought at each fill-up inside the month.
+  let currentMonthKm = 0;
+  let currentMonthLitres = 0;
 
   for (const [vehicleId, vehicleFills] of byVehicle) {
     const vehicle = await ctx.db.get(vehicleId);
@@ -384,6 +418,10 @@ async function buildFuelInsights(
       })),
     );
     for (const point of series) {
+      if (point.filledAt >= windows.currentStart && point.kmSincePrevious !== null) {
+        currentMonthKm += point.kmSincePrevious;
+        currentMonthLitres += point.litres;
+      }
       if (point.anomaly && point.filledAt >= now - FUEL_ANOMALY_WINDOW_MS) {
         anomalies.push({
           entryId: point.id as Id<"fleetFuelEntries">,
@@ -420,6 +458,9 @@ async function buildFuelInsights(
     previousMonthStart: windows.previousStart,
     threeMonthsAgoStart: windows.threeMonthsAgoStart,
     fleet,
+    fleetKmPerL: currentMonthLitres > 0 ? currentMonthKm / currentMonthLitres : null,
+    currentMonthKm,
+    currentMonthLitres,
     byVehicle: byVehicleSpend,
     anomalies,
     isTruncated,
@@ -439,7 +480,7 @@ function alertServiceMessage(prefix: string, status: ServiceStatus) {
   return parts.length ? `${prefix} (${parts.join(", ")}).` : `${prefix}.`;
 }
 
-async function buildAlerts(
+export async function buildDerivedAlerts(
   ctx: QueryCtx,
   companyId: Id<"companies">,
   now: number,
@@ -797,10 +838,20 @@ export const getVehicle = query({
         status: trip.status,
         departedAt: trip.departedAt,
         returnedAt: trip.returnedAt ?? null,
+        placeId: trip.placeId ?? null,
+        arrivedAt: trip.arrivedAt ?? null,
+        autoReturned: trip.autoReturned ?? false,
         startOdometerMeters: trip.startOdometerMeters ?? null,
         endOdometerMeters: trip.endOdometerMeters ?? null,
         distanceMeters,
         distanceKm: metersToKm(distanceMeters),
+        actualDistanceMeters: trip.actualDistanceMeters ?? null,
+        actualDistanceKm: metersToKm(trip.actualDistanceMeters),
+        maxDeviationMeters: trip.maxDeviationMeters ?? null,
+        maxDeviationKm: metersToKm(trip.maxDeviationMeters),
+        offRoute:
+          trip.maxDeviationMeters !== undefined &&
+          trip.maxDeviationMeters > OFF_ROUTE_CORRIDOR_METERS,
         driverId: trip.driverId,
         driverName: driver?.name ?? null,
       });
@@ -854,7 +905,7 @@ export const getVehicle = query({
     }
 
     return {
-      vehicle: publicVehicle(vehicle, openTrip, driverName, serviceStatus),
+      vehicle: publicVehicle(vehicle, openTrip, driverName, serviceStatus, args.now),
       recentTrips: trips,
       recentFuel: fuelEntries,
       recentServices: services,
@@ -1037,7 +1088,9 @@ export const startTrip = action({
     companyId: v.id("companies"),
     vehicleId: v.id("fleetVehicles"),
     driverId: v.id("fleetDrivers"),
-    destination: v.string(),
+    // Required unless `placeId` supplies the display label from the place.
+    destination: v.optional(v.string()),
+    placeId: v.optional(v.id("fleetPlaces")),
     notes: v.optional(v.string()),
     departedAt: v.optional(v.number()),
   },
@@ -1058,6 +1111,7 @@ export const startTrip = action({
       vehicleId: args.vehicleId,
       driverId: args.driverId,
       destination: args.destination,
+      placeId: args.placeId,
       notes: args.notes,
       departedAt: args.departedAt,
       now: Date.now(),
@@ -1126,10 +1180,21 @@ async function tripPublicRow(
     status: trip.status,
     departedAt: trip.departedAt,
     returnedAt: trip.returnedAt ?? null,
+    placeId: trip.placeId ?? null,
+    basePlaceId: trip.basePlaceId ?? null,
+    arrivedAt: trip.arrivedAt ?? null,
+    autoReturned: trip.autoReturned ?? false,
     startOdometerMeters: trip.startOdometerMeters ?? null,
     endOdometerMeters: trip.endOdometerMeters ?? null,
     distanceMeters,
     distanceKm: metersToKm(distanceMeters),
+    actualDistanceMeters: trip.actualDistanceMeters ?? null,
+    actualDistanceKm: metersToKm(trip.actualDistanceMeters),
+    maxDeviationMeters: trip.maxDeviationMeters ?? null,
+    maxDeviationKm: metersToKm(trip.maxDeviationMeters),
+    offRoute:
+      trip.maxDeviationMeters !== undefined &&
+      trip.maxDeviationMeters > OFF_ROUTE_CORRIDOR_METERS,
     vehicle: vehicle
       ? {
           _id: vehicle._id,
@@ -1148,19 +1213,26 @@ export const listTrips = query({
   args: {
     companyId: v.id("companies"),
     vehicleId: v.optional(v.id("fleetVehicles")),
+    // URL-backed period filters page server-side; 0 means "no cutoff".
+    since: v.optional(v.number()),
     paginationOpts: paginationOptsValidator,
   },
   handler: async (ctx, args) => {
     await requireCapability(ctx, args.companyId, "fleet:view");
     if (args.vehicleId) await requireFleetVehicle(ctx, args.companyId, args.vehicleId);
+    const since = args.since ?? 0;
     const page = await (
       args.vehicleId
         ? ctx.db
             .query("fleetTrips")
-            .withIndex("by_vehicleId_and_departedAt", (q) => q.eq("vehicleId", args.vehicleId!))
+            .withIndex("by_vehicleId_and_departedAt", (q) =>
+              q.eq("vehicleId", args.vehicleId!).gte("departedAt", since),
+            )
         : ctx.db
             .query("fleetTrips")
-            .withIndex("by_companyId_and_departedAt", (q) => q.eq("companyId", args.companyId))
+            .withIndex("by_companyId_and_departedAt", (q) =>
+              q.eq("companyId", args.companyId).gte("departedAt", since),
+            )
     )
       .order("desc")
       .paginate(args.paginationOpts);
@@ -1196,6 +1268,7 @@ export const updateTrip = mutation({
     companyId: v.id("companies"),
     tripId: v.id("fleetTrips"),
     destination: v.optional(v.string()),
+    placeId: v.optional(v.union(v.id("fleetPlaces"), v.null())),
     notes: v.optional(v.union(v.string(), v.null())),
     driverId: v.optional(v.id("fleetDrivers")),
     departedAt: v.optional(v.number()),
@@ -1251,10 +1324,40 @@ export const updateTrip = mutation({
       returnedAt: nextReturnedAt ?? undefined,
       updatedAt: Date.now(),
     };
+    if (args.placeId !== undefined) {
+      if (args.placeId === null) {
+        // "Other" trips keep their free-text label and get no route checks.
+        patch.placeId = undefined;
+        patch.basePlaceId = undefined;
+        patch.arrivedAt = undefined;
+        patch.maxDeviationMeters = undefined;
+      } else {
+        const place = await ctx.db.get(args.placeId);
+        if (!place || place.companyId !== args.companyId) throw new ConvexError("Place not found.");
+        if (place.archived) throw new ConvexError("This place is archived.");
+        patch.placeId = place._id;
+        // A new destination invalidates the old corridor and arrival.
+        if (place._id !== trip.placeId) {
+          patch.basePlaceId = undefined;
+          patch.arrivedAt = undefined;
+          patch.maxDeviationMeters = undefined;
+        }
+        if (args.destination === undefined) patch.destination = place.name;
+      }
+    }
     if (args.destination !== undefined) {
       const destination = nonEmpty(args.destination, "Destination");
       if (destination.length > MAX_DESTINATION) throw new ConvexError("Destination is too long.");
       patch.destination = destination;
+    }
+    if (args.departedAt !== undefined && args.departedAt !== trip.departedAt) {
+      // The old start observation and every derived fact belong to the old
+      // departure time; reconcile derives them again.
+      patch.startLat = undefined;
+      patch.startLng = undefined;
+      patch.basePlaceId = undefined;
+      patch.arrivedAt = undefined;
+      patch.maxDeviationMeters = undefined;
     }
     if (args.notes !== undefined) {
       patch.notes = args.notes?.trim() || undefined;
@@ -1267,11 +1370,29 @@ export const updateTrip = mutation({
       patch.endOdometerMeters =
         validateOdometer(args.endOdometerMeters, "End odometer") ?? undefined;
     } else if (trip.status === "returned" && nextStatus === "open") {
-      // Reopening a trip makes the old end reading meaningless.
+      // Reopening a trip makes the old end reading and detected arrival
+      // meaningless; the next reconcile derives them again.
       patch.endOdometerMeters = undefined;
+      patch.arrivedAt = undefined;
+      patch.autoReturned = undefined;
     }
 
     await ctx.db.patch(trip._id, patch);
+    if (nextStatus === "returned") {
+      await resolveTripOverdueAlerts(
+        ctx,
+        trip._id,
+        "The trip was returned.",
+        nextReturnedAt ?? Date.now(),
+      );
+    }
+    // Re-derive tracker-trip coverage and any resulting alerts. Scheduling
+    // keeps the edit transaction small; internal reconcile needs no auth.
+    await ctx.scheduler.runAfter(0, internal.fleetMonitoring.reconcileVehicle, {
+      companyId: args.companyId,
+      vehicleId: nextVehicleId,
+      now: Date.now(),
+    });
     return null;
   },
 });
@@ -1281,7 +1402,13 @@ export const deleteTrip = mutation({
   handler: async (ctx, args) => {
     await requireCapability(ctx, args.companyId, "fleet:manage");
     const trip = await requireFleetTrip(ctx, args.companyId, args.tripId);
+    await resolveTripOverdueAlerts(ctx, trip._id, "Trip deleted.", Date.now());
     await ctx.db.delete(trip._id);
+    await ctx.scheduler.runAfter(0, internal.fleetMonitoring.reconcileVehicle, {
+      companyId: args.companyId,
+      vehicleId: trip.vehicleId,
+      now: Date.now(),
+    });
     return null;
   },
 });
@@ -1863,6 +1990,6 @@ export const alerts = query({
   args: { companyId: v.id("companies"), now: v.number() },
   handler: async (ctx, args) => {
     const { company } = await requireCapability(ctx, args.companyId, "fleet:view");
-    return await buildAlerts(ctx, args.companyId, args.now, company.timeZone ?? null);
+    return await buildDerivedAlerts(ctx, args.companyId, args.now, company.timeZone ?? null);
   },
 });

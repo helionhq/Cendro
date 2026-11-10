@@ -12,6 +12,7 @@ const APPROVED_HELPERS = new Set([
   "requireCompanyAccess",
   "requireMembership",
   "requireCapability",
+  "requireFleetLogOrManage",
   "requireCan",
   "assertCan",
   "assertTaskAction",

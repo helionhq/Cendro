@@ -114,6 +114,18 @@ export async function fetchAndApplyCompanyVehicles(
       counts: null,
     };
   }
+  // Apply the new snapshot to open trips (arrival, auto-return, off-route).
+  // Detection is retried by the ingestion cron, so a failure here must not
+  // make a successful tracker sync look failed.
+  try {
+    await ctx.runMutation(internal.fleetMonitoring.reconcileLivePositions, {
+      companyId,
+      now,
+    });
+  } catch (error) {
+    console.error("Fleet live reconcile failed", error);
+  }
+
   return {
     connected: true,
     ok: true,
@@ -132,7 +144,7 @@ export const syncAllTrackers = internalAction({
     args,
   ): Promise<{ processed: number; succeeded: number; failed: number; stale: number }> => {
     const page: {
-      connections: { companyId: Id<"companies">; secretKey: string }[];
+      connections: { companyId: Id<"companies"> }[];
       isDone: boolean;
       continueCursor: string;
     } = await ctx.runQuery(internal.fleetInternal.listConnectionsPage, {
