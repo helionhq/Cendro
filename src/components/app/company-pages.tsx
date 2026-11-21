@@ -81,7 +81,14 @@ type InvitationRow = {
 type Overview = {
   isTruncated: boolean;
   truncated: { branches: boolean; departments: boolean; users: boolean; invitations: boolean; userDetails: boolean };
-  company?: { _id: Id<"companies">; name: string; timeZone: string; hasTimeZone: boolean };
+  company?: {
+    _id: Id<"companies">;
+    name: string;
+    timeZone: string;
+    hasTimeZone: boolean;
+    preferredAdminMembershipId: Id<"companyMemberships"> | null;
+    preferredAdmin: { _id: Id<"companyMemberships">; name: string; canConfirm: boolean } | null;
+  };
   currentMembership: MembershipCore;
   branches: BranchRow[];
   departments: DepartmentRow[];
@@ -333,6 +340,8 @@ function GeneralTab({
   savingName,
   onSaveName,
   onSaveTimeZone,
+  preferredAdminOptions,
+  onSavePreferredAdmin,
   calendar,
   canManageCalendar,
   onSetWorkingDays,
@@ -351,6 +360,8 @@ function GeneralTab({
   savingName: boolean;
   onSaveName: () => Promise<void> | void;
   onSaveTimeZone: (timeZone: string) => Promise<void> | void;
+  preferredAdminOptions?: { _id: Id<"companyMemberships">; name: string }[];
+  onSavePreferredAdmin: (membershipId: Id<"companyMemberships"> | null) => void;
   calendar?: WorkCalendarData;
   canManageCalendar: boolean;
   onSetWorkingDays: (workingDays: number[]) => Promise<void> | void;
@@ -359,6 +370,13 @@ function GeneralTab({
   onRemoveHoliday: (holidayId: Id<"companyHolidays">) => Promise<void> | void;
 }) {
   const options = timeZoneOptions(timeZone);
+  // The saved preferred admin stays visible after they lose the ability to
+  // confirm, so the setting reads truthfully and can be cleared.
+  const savedPreferredAdminId = data.company?.preferredAdminMembershipId ?? null;
+  const savedPreferredAdmin = data.company?.preferredAdmin?._id === savedPreferredAdminId ? data.company?.preferredAdmin : null;
+  const preferredAdminChoices = preferredAdminOptions && savedPreferredAdminId && !preferredAdminOptions.some((option) => option._id === savedPreferredAdminId)
+    ? [{ _id: savedPreferredAdminId, name: `${savedPreferredAdmin?.name ?? "Saved admin"}${savedPreferredAdmin?.canConfirm ? "" : " (can no longer confirm)"}` }, ...preferredAdminOptions]
+    : preferredAdminOptions;
   const savedTimeZone = data.company?.timeZone ?? DEFAULT_TIME_ZONE;
   const timeZoneDirty = timeZone !== savedTimeZone;
 
@@ -410,6 +428,23 @@ function GeneralTab({
                 </SelectField>
                 {timeZoneDirty && canManageSettings && <span className="text-[12px] text-[var(--ink-muted)]">Saving…</span>}
               </div>
+            </div>
+          </div>
+          <div className="company-settings-row">
+            <div className="min-w-0">
+              <div className="company-settings-label">Preferred admin</div>
+              <p className="company-settings-help">Confirms completed tasks for people who don&apos;t report to anyone. Everyone else&apos;s tasks go to their manager.</p>
+            </div>
+            <div className="company-settings-control">
+              <SelectField
+                value={savedPreferredAdminId ?? ""}
+                onChange={(value) => onSavePreferredAdmin(value ? value as Id<"companyMemberships"> : null)}
+                disabled={!canManageSettings || !preferredAdminChoices}
+                className="min-w-[220px]"
+              >
+                <option value="">None</option>
+                {preferredAdminChoices?.map((option) => <option key={option._id} value={option._id}>{option.name}</option>)}
+              </SelectField>
             </div>
           </div>
           <div className="company-settings-row">
@@ -2593,6 +2628,24 @@ export default function Company() {
       });
     }
   });
+  const updatePreferredAdmin = useMutation(api.companyManagement.updatePreferredAdmin).withOptimisticUpdate((localStore, args) => {
+    const current = localStore.getQuery(api.companyManagement.overview, { companyId: args.companyId }) as Overview | undefined;
+    if (current?.company) {
+      localStore.setQuery(api.companyManagement.overview, { companyId: args.companyId }, {
+        ...current,
+        company: { ...current.company, preferredAdminMembershipId: args.membershipId },
+      } as any);
+    }
+  });
+  // Only members who can confirm tasks can be the preferred admin.
+  const confirmers = useQuery(
+    api.tasks.eligibleConfirmers,
+    activeCompanyId && active?.capabilities.includes("company:manage_settings") ? { companyId: activeCompanyId } : "skip",
+  );
+  const preferredAdminOptions = useMemo(
+    () => confirmers?.users.map((row) => ({ _id: row.membership._id, name: row.user.name || row.user.email })),
+    [confirmers],
+  );
   const workCalendar = useQuery(
     api.workCalendar.get,
     activeCompanyId && canAccessCompanyManagement(active?.capabilities) ? { companyId: activeCompanyId } : "skip"
@@ -2768,12 +2821,18 @@ export default function Company() {
   const [error, setError] = useState<string | null>(null);
   const autoTimeZoneAttempts = useRef<Set<string>>(new Set());
 
+  // Each draft follows only its own stored field (and the company), so saving
+  // another setting such as the preferred admin keeps an unsaved draft.
+  const overviewLoaded = data !== undefined;
+  const loadedCompanyId = data?.company?._id;
+  const storedCompanyName = data?.company?.name ?? active?.company.name ?? "";
+  const storedTimeZone = data?.company?.timeZone ?? active?.company.timeZone ?? DEFAULT_TIME_ZONE;
   useEffect(() => {
-    if (data) {
-      setCompanyName(data.company?.name ?? active?.company.name ?? "");
-      setCompanyTimeZone(data.company?.timeZone ?? active?.company.timeZone ?? DEFAULT_TIME_ZONE);
-    }
-  }, [active?.company.name, active?.company.timeZone, data]);
+    if (overviewLoaded) setCompanyName(storedCompanyName);
+  }, [overviewLoaded, loadedCompanyId, storedCompanyName]);
+  useEffect(() => {
+    if (overviewLoaded) setCompanyTimeZone(storedTimeZone);
+  }, [overviewLoaded, loadedCompanyId, storedTimeZone]);
 
   const rolesMissing = Boolean(data && data.roles.length === 0);
   const canSeedRoles = Boolean(active?.capabilities.includes("company:manage_roles"));
@@ -2971,6 +3030,8 @@ export default function Company() {
                 canManageSettings={canManageSettings}
                 onSaveName={saveCompanyName}
                 onSaveTimeZone={saveCompanyTimeZone}
+                preferredAdminOptions={preferredAdminOptions}
+                onSavePreferredAdmin={(membershipId) => { if (activeCompanyId) void run(async () => updatePreferredAdmin({ companyId: activeCompanyId, membershipId }), "Could not update the preferred admin."); }}
                 calendar={workCalendar}
                 canManageCalendar={canManageCalendar}
                 onSetWorkingDays={(workingDays) => { if (activeCompanyId) void run(async () => setWorkingDays({ companyId: activeCompanyId, workingDays }), "Could not update working days."); }}
