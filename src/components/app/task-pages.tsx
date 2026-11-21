@@ -124,6 +124,9 @@ type AssignableUsersResult = {
   users: TaskRowAssignee[];
   isTruncated: boolean;
 };
+type ConfirmersResult = AssignableUsersResult & {
+  suggestion: { source: "managers" | "preferred_admin"; membershipIds: string[] } | null;
+};
 
 type AwaitingConfirmationRow = {
   _id: string;
@@ -1775,18 +1778,24 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
   // Only the open dialog needs the confirmer list.
   const confirmersResult = useQuery(
     api.tasks.eligibleConfirmers,
-    activeCompanyId && open ? { companyId: activeCompanyId } : "skip",
-  ) as AssignableUsersResult | undefined;
-  const confirmerOptions = (confirmersResult?.users ?? []).map((user) => ({
+    activeCompanyId && open ? { companyId: activeCompanyId, assigneeMembershipIds: values.assigneeMembershipIds as Id<"companyMemberships">[] } : "skip",
+  ) as ConfirmersResult | undefined;
+  const eligibleConfirmerOptions = (confirmersResult?.users ?? []).map((user) => ({
     value: user.membership._id,
     label: assigneeDisplayName(user),
     helper: user.membership.role,
   }));
+  // The assignees' managers (or the preferred admin when they report to
+  // nobody) confirm their work; without either, any eligible confirmer can.
+  const suggestion = confirmersResult?.suggestion ?? null;
+  const confirmerOptions = suggestion ? eligibleConfirmerOptions.filter((option) => suggestion.membershipIds.includes(option.value)) : eligibleConfirmerOptions;
+  const autoConfirmerId = suggestion && confirmerOptions.length === 1 ? confirmerOptions[0].value : null;
+  const confirmerId = values.confirmerMembershipId ?? autoConfirmerId;
   // A saved confirmer may no longer hold tasks:confirm; the backend keeps them
   // so their pending approval still resolves. Show that person rather than a
   // blank "Select confirmer" that hides who the task is actually waiting on.
   const savedConfirmerId = values.confirmerMembershipId;
-  const savedConfirmerIsIneligible = Boolean(savedConfirmerId) && confirmersResult !== undefined && !confirmerOptions.some((option) => option.value === savedConfirmerId);
+  const savedConfirmerIsIneligible = Boolean(savedConfirmerId) && confirmersResult !== undefined && !eligibleConfirmerOptions.some((option) => option.value === savedConfirmerId);
   const savedConfirmer = savedConfirmerIsIneligible
     ? [
         task?.confirmer?.membership?._id === savedConfirmerId ? task.confirmer : null,
@@ -1794,9 +1803,14 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
         task?.assignees?.find((candidate: any) => candidate.membership?._id === savedConfirmerId) ?? null,
       ].find(Boolean) ?? null
     : null;
-  const confirmerSelectOptions = savedConfirmerIsIneligible
-    ? [{ value: savedConfirmerId!, label: `${savedConfirmer ? assigneeDisplayName(savedConfirmer) : "Saved confirmer"} (can no longer confirm)` }, ...confirmerOptions]
-    : confirmerOptions;
+  // A saved confirmer outside the suggestion stays selectable next to it.
+  const savedConfirmerOption = savedConfirmerIsIneligible
+    ? { value: savedConfirmerId!, label: `${savedConfirmer ? assigneeDisplayName(savedConfirmer) : "Saved confirmer"} (can no longer confirm)` }
+    : savedConfirmerId && !confirmerOptions.some((option) => option.value === savedConfirmerId)
+      ? eligibleConfirmerOptions.find((option) => option.value === savedConfirmerId)
+      : undefined;
+  const confirmerSelectOptions = savedConfirmerOption ? [savedConfirmerOption, ...confirmerOptions] : confirmerOptions;
+  const fixedConfirmer = suggestion && confirmerSelectOptions.length === 1 && confirmerSelectOptions[0].value === confirmerId ? confirmerSelectOptions[0] : null;
 
   const titleId = useId();
   const taskAssignees = task?.assignees;
@@ -1847,13 +1861,13 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
     if (!values.title.trim()) { setError("Task title is required."); return; }
     if (mode === "create" && values.assigneeMembershipIds.length === 0) { setError("Assignee is required."); return; }
     if (kind === "jd" && !values.recurrence) { setError("Frequency is required."); return; }
-    if (values.confirmationRequired && !values.confirmerMembershipId) { setError("Select a confirmer."); return; }
+    if (values.confirmationRequired && !confirmerId) { setError("Select a confirmer."); return; }
     setSaving(true);
     setError(null);
     try {
       let taskId = task?._id as string | undefined;
       // Turning confirmation off clears the confirmer on edit.
-      const confirmerMembershipId = values.confirmationRequired ? values.confirmerMembershipId as Id<"companyMemberships"> : null;
+      const confirmerMembershipId = values.confirmationRequired ? confirmerId as Id<"companyMemberships"> : null;
       const common = { companyId: activeCompanyId, title: values.title.trim(), description: values.description, notes: values.notes, time: values.time, quantity: quantityFromInput(values.quantity), evidenceRequired: values.evidenceRequired, confirmerMembershipId, assigneeMembershipIds: values.assigneeMembershipIds as Id<"companyMemberships">[] };
       if (kind === "jd") {
         if (mode === "create") taskId = await createJd({ ...common, recurrence: values.recurrence });
@@ -1901,7 +1915,7 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
               <div className="mt-4 divide-y divide-[var(--hairline)] border-y border-[var(--hairline)]">
                 <div className="grid grid-cols-[120px_1fr] items-center gap-3 py-2">
                   <span className="text-[13px] text-[var(--ink-muted)]">Assigned To{mode === "create" && <RequiredIndicator />}</span>
-                  <div className="min-w-0"><AssigneePicker assignable={dialogAssignable} assignableIsTruncated={assignableIsTruncated} selected={values.assigneeMembershipIds} onChange={(ids) => patch({ assigneeMembershipIds: ids })} companyId={activeCompanyId ?? undefined} kind={kind} required={mode === "create"} /></div>
+                  <div className="min-w-0"><AssigneePicker assignable={dialogAssignable} assignableIsTruncated={assignableIsTruncated} selected={values.assigneeMembershipIds} onChange={(ids) => patch({ assigneeMembershipIds: ids, confirmerMembershipId: null })} companyId={activeCompanyId ?? undefined} kind={kind} required={mode === "create"} /></div>
                 </div>
                 {kind === "jd" ? (
                   <div className="grid grid-cols-[120px_1fr] items-center gap-3 py-2">
@@ -1944,14 +1958,21 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
                     </Switch>
                     {values.confirmationRequired && (
                       <div className="mt-1.5">
-                        <SelectPicker
-                          ariaLabel="Confirmer"
-                          required
-                          value={values.confirmerMembershipId ?? ""}
-                          options={confirmerSelectOptions}
-                          onChange={(confirmerMembershipId) => patch({ confirmerMembershipId })}
-                          placeholder="Select confirmer"
-                        />
+                        {fixedConfirmer ? (
+                          <p className="px-2 py-1.5 text-[13px] text-[var(--ink)]" aria-label={`Confirmer: ${fixedConfirmer.label}`}>
+                            {fixedConfirmer.label}
+                            <span className="ml-1.5 text-[var(--ink-muted)]">{suggestion?.source === "preferred_admin" ? "Preferred admin" : "Manager"}</span>
+                          </p>
+                        ) : (
+                          <SelectPicker
+                            ariaLabel="Confirmer"
+                            required
+                            value={confirmerId ?? ""}
+                            options={confirmerSelectOptions}
+                            onChange={(confirmerMembershipId) => patch({ confirmerMembershipId })}
+                            placeholder="Select confirmer"
+                          />
+                        )}
                       </div>
                     )}
                   </div>

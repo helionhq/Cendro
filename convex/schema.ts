@@ -16,7 +16,8 @@ const jdReportCount = v.object({ segmentStart: v.number(), recurrence: rec, done
 
 export default defineSchema({
   appUsers: defineTable({ clerkSubject: v.string(), email: v.string(), firstName: v.string(), secondName: v.optional(v.string()), imageUrl: v.optional(v.string()), createdAt: v.number(), updatedAt: v.number() }).index("by_subject", ["clerkSubject"]).index("by_email", ["email"]),
-  companies: defineTable({ name: v.string(), timeZone: v.optional(v.string()), createdAt: v.number(), createdBy: v.optional(v.id("appUsers")), deletedAt: v.optional(v.number()), authVersion: v.optional(v.number()) }).index("by_deleted", ["deletedAt"]),
+  // `preferredAdminMembershipId` confirms task work for members who report to nobody.
+  companies: defineTable({ name: v.string(), timeZone: v.optional(v.string()), preferredAdminMembershipId: v.optional(v.id("companyMemberships")), createdAt: v.number(), createdBy: v.optional(v.id("appUsers")), deletedAt: v.optional(v.number()), authVersion: v.optional(v.number()) }).index("by_deleted", ["deletedAt"]),
   companyMemberships: defineTable({ companyId: v.id("companies"), userId: v.id("appUsers"), role, active: v.boolean(), firstName: v.optional(v.string()), secondName: v.optional(v.string()), createdAt: v.number(), updatedAt: v.number() }).index("by_company", ["companyId"]).index("by_user", ["userId"]).index("by_company_user", ["companyId", "userId"]).index("by_companyId_and_role", ["companyId", "role"]),
   branches: defineTable({ companyId: v.id("companies"), name: v.string(), order: v.optional(v.number()), createdAt: v.number(), updatedAt: v.number() }).index("by_company", ["companyId"]),
   departments: defineTable({ companyId: v.id("companies"), branchId: v.id("branches"), name: v.string(), order: v.optional(v.number()), createdAt: v.number(), updatedAt: v.number() }).index("by_company", ["companyId"]).index("by_branch", ["branchId"]),

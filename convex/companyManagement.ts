@@ -17,6 +17,7 @@ import {
 } from "./permissions";
 import { baselineInvitationCapabilities, companyManagementCapabilities, isKnownCapability, type Capability } from "../src/lib/permissions";
 import { defaultTimeZone } from "./taskCycles";
+import { assertConfirmerInCompany } from "./tasks";
 import { nonEmpty, normalizeEmail } from "./validation";
 import { takeWithOverflow } from "./queryLimits";
 
@@ -191,7 +192,7 @@ export const overview = query({
     return {
       isTruncated,
       truncated,
-      company: { _id: company._id, name: company.name, timeZone: company.timeZone ?? defaultTimeZone, hasTimeZone: Boolean(company.timeZone) },
+      company: { _id: company._id, name: company.name, timeZone: company.timeZone ?? defaultTimeZone, hasTimeZone: Boolean(company.timeZone), preferredAdminMembershipId: company.preferredAdminMembershipId ?? null },
       currentMembership: { _id: membership._id, role: membership.role, active: membership.active, createdAt: membership.createdAt },
       branches: branches.map((b) => ({ _id: b._id, name: b.name, order: b.order })),
       departments: departments.map((d) => ({ _id: d._id, branchId: d.branchId, name: d.name, order: d.order })),
@@ -228,6 +229,16 @@ export const updateCompanyTimeZone = mutation({
     const timeZone = cleanTimeZone(args.timeZone);
     await ctx.db.patch(args.companyId, { timeZone });
     await ctx.db.insert("auditEvents", { companyId: args.companyId, actorUserId: user._id, action: "company.time_zone_update", targetType: "company", targetId: args.companyId, createdAt: Date.now() });
+  },
+});
+
+export const updatePreferredAdmin = mutation({
+  args: { companyId: v.id("companies"), membershipId: v.union(v.id("companyMemberships"), v.null()) },
+  handler: async (ctx, args) => {
+    const { user } = await requireCapability(ctx, args.companyId, "company:manage_settings");
+    if (args.membershipId) await assertConfirmerInCompany(ctx, args.companyId, args.membershipId);
+    await ctx.db.patch(args.companyId, { preferredAdminMembershipId: args.membershipId ?? undefined });
+    await ctx.db.insert("auditEvents", { companyId: args.companyId, actorUserId: user._id, action: "company.preferred_admin_update", targetType: "company", targetId: args.companyId, createdAt: Date.now() });
   },
 });
 

@@ -588,6 +588,36 @@ export async function isManagedMembership(
   return false;
 }
 
+/**
+ * The members a person reports to: managers whose scope covers them directly
+ * or through one of their branches or departments. Never includes the person.
+ */
+export async function managerMembershipIdsOf(
+  ctx: Ctx,
+  companyId: Id<"companies">,
+  membershipId: Id<"companyMemberships">,
+) {
+  const [direct, branches, departments] = await Promise.all([
+    takeScopeRows((limit) => ctx.db.query("managerUserScopes").withIndex("by_user", (q) => q.eq("userMembershipId", membershipId)).take(limit)),
+    takeScopeRows((limit) => ctx.db.query("userBranchAssignments").withIndex("by_membershipId_and_branchId", (q) => q.eq("membershipId", membershipId)).take(limit)),
+    takeScopeRows((limit) => ctx.db.query("userDepartmentAssignments").withIndex("by_membershipId_and_departmentId", (q) => q.eq("membershipId", membershipId)).take(limit)),
+  ]);
+  const [branchScopes, departmentScopes] = await Promise.all([
+    Promise.all(branches.filter((row) => row.companyId === companyId).map((row) =>
+      takeScopeRows((limit) => ctx.db.query("managerBranchScopes").withIndex("by_branch", (q) => q.eq("branchId", row.branchId)).take(limit)),
+    )),
+    Promise.all(departments.filter((row) => row.companyId === companyId).map((row) =>
+      takeScopeRows((limit) => ctx.db.query("managerDepartmentScopes").withIndex("by_department", (q) => q.eq("departmentId", row.departmentId)).take(limit)),
+    )),
+  ]);
+  const ids = new Set<Id<"companyMemberships">>();
+  for (const row of [...direct, ...branchScopes.flat(), ...departmentScopes.flat()]) {
+    if (row.companyId === companyId) ids.add(row.managerMembershipId);
+  }
+  ids.delete(membershipId);
+  return ids;
+}
+
 export async function hasAnyManagedMembership(
   ctx: Ctx,
   companyId: Id<"companies">,

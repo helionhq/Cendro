@@ -23,12 +23,14 @@ function BucketTooltip({
   total,
   done,
   mode,
+  future,
   align,
 }: {
   title: string;
   total: number;
   done: number;
   mode: DashboardChartMode;
+  future: boolean;
   align: "start" | "center" | "end";
 }) {
   return (
@@ -39,7 +41,9 @@ function BucketTooltip({
       )}
     >
       <div className="text-[12px] font-medium text-[var(--ink)]">{title}</div>
-      {total === 0 ? (
+      {future ? (
+        <div className="mt-0.5 text-[12px] text-[var(--ink-muted)]">Not started yet</div>
+      ) : total === 0 ? (
         <div className="mt-0.5 text-[12px] text-[var(--ink-muted)]">{mode === "jd" ? "No JDs due" : "No tasks assigned"}</div>
       ) : (
         <div className="mt-0.5 flex items-center justify-between gap-4 text-[12px] text-[var(--ink-muted)]">
@@ -110,8 +114,10 @@ export function DashboardBarChart({
                   const selected = unit === "week" && index === count - 1;
                   const dimmed = unit === "week" && !selected;
                   const striped = bucket.state === "current";
-                  const ariaLabel =
-                    total === 0
+                  const future = bucket.state === "future";
+                  const ariaLabel = future
+                    ? `${label.aria}: not started yet`
+                    : total === 0
                       ? `${label.aria}: ${mode === "jd" ? "no JDs due" : "no tasks assigned"}`
                       : `${label.aria}: ${rate}%, ${done} of ${total} done`;
                   return (
@@ -126,6 +132,7 @@ export function DashboardBarChart({
                         total={total}
                         done={done}
                         mode={mode}
+                        future={future}
                         align={index === 0 ? "start" : index === count - 1 ? "end" : "center"}
                       />
                       {rate === null ? (

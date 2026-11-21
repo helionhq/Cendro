@@ -20,6 +20,28 @@ async function useUtcAllWeekCalendar(f: Awaited<ReturnType<typeof createAuthzFix
 }
 
 describe("task completion confirmation", () => {
+  test("the suggested confirmer is who the assignee reports to, else the preferred admin", async () => {
+    const f = await createAuthzFixture();
+    const admin = f.asUser("adminA");
+    const suggest = async (assignee: typeof f.employee1M) =>
+      (await admin.query(api.tasks.eligibleConfirmers, { companyId: f.companyA, assigneeMembershipIds: [assignee] })).suggestion;
+
+    // Employee A1 reports only to Manager A.
+    expect(await suggest(f.employee1M)).toEqual({ source: "managers", membershipIds: [f.managerM] });
+
+    // A second manager over A1's department makes it a choice between both.
+    await f.t.run(async (ctx) => { await ctx.db.insert("managerDepartmentScopes", { companyId: f.companyA, managerMembershipId: f.adminM, departmentId: f.deptA1, updatedAt: Date.now() }); });
+    const both = await suggest(f.employee1M);
+    expect(both?.source).toBe("managers");
+    expect(new Set(both?.membershipIds)).toEqual(new Set([f.managerM, f.adminM]));
+
+    // Employee A2 reports to nobody: no suggestion until a preferred admin is set.
+    expect(await suggest(f.employee2M)).toBeNull();
+    await expect(admin.mutation(api.companyManagement.updatePreferredAdmin, { companyId: f.companyA, membershipId: f.employee1M })).rejects.toThrow("cannot confirm");
+    await admin.mutation(api.companyManagement.updatePreferredAdmin, { companyId: f.companyA, membershipId: f.adminM });
+    expect(await suggest(f.employee2M)).toEqual({ source: "preferred_admin", membershipIds: [f.adminM] });
+  });
+
   test("a non-confirmer submission waits, and confirming completes it with the submission time and author", async () => {
     const f = await createAuthzFixture();
     const admin = f.asUser("adminA");

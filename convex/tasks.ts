@@ -6,7 +6,7 @@ import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { currentJdCycle, defaultTimeZone, nextJdCycleStart, type JdRecurrence } from "./taskCycles";
 import { effectiveCurrentJdCycle, elapsedJdOccurrences, loadWorkCalendar, occurrenceDeadline, type WorkCalendar } from "./workCalendar";
-import { activeCompanyMembershipIds, assertCanAssign, assertCanChangeTaskConfirmer, assertCanDeleteTask, assertCanUpdateTask, canViewTask, getManagedMembershipIds, hasAllManagedMemberships, hasAnyManagedMembership, memberFirstName, memberFullName, membershipCapabilities, requireCapability, requireMembership, roleNameCapabilities, scanManagedMembershipIds, scopedMembershipIds } from "./permissions";
+import { activeCompanyMembershipIds, assertCanAssign, assertCanChangeTaskConfirmer, assertCanDeleteTask, assertCanUpdateTask, canViewTask, getManagedMembershipIds, hasAllManagedMemberships, hasAnyManagedMembership, managerMembershipIdsOf, memberFirstName, memberFullName, membershipCapabilities, requireCapability, requireMembership, roleNameCapabilities, scanManagedMembershipIds, scopedMembershipIds } from "./permissions";
 import type { Capability } from "../src/lib/permissions";
 import { nonEmpty } from "./validation";
 import {
@@ -2690,11 +2690,35 @@ export const filterableAssignees = query({
   },
 });
 
+// Bounds the reporting-line lookup; a larger assignee set gets no suggestion.
+const CONFIRMER_SUGGESTION_ASSIGNEE_LIMIT = 50;
+
+/**
+ * Who should confirm work for these assignees: the people they report to, or
+ * the company's preferred admin when they report to nobody. Assignees never
+ * confirm their own work, and only members who can confirm are suggested.
+ */
+async function suggestConfirmers(
+  ctx: QueryCtx,
+  company: Doc<"companies">,
+  assigneeIds: Id<"companyMemberships">[],
+  eligibleIds: Set<Id<"companyMemberships">>,
+) {
+  if (assigneeIds.length === 0 || assigneeIds.length > CONFIRMER_SUGGESTION_ASSIGNEE_LIMIT) return null;
+  const managerSets = await Promise.all(assigneeIds.map((id) => managerMembershipIdsOf(ctx, company._id, id)));
+  const managers = [...new Set(managerSets.flatMap((ids) => [...ids]))].filter((id) => eligibleIds.has(id) && !assigneeIds.includes(id));
+  if (managers.length > 0) return { source: "managers" as const, membershipIds: managers };
+  const preferred = company.preferredAdminMembershipId;
+  if (preferred && eligibleIds.has(preferred) && !assigneeIds.includes(preferred)) return { source: "preferred_admin" as const, membershipIds: [preferred] };
+  return null;
+}
+
 export const eligibleConfirmers = query({
-  args: { companyId: v.id("companies") },
+  args: { companyId: v.id("companies"), assigneeMembershipIds: v.optional(v.array(v.id("companyMemberships"))) },
   handler: async (ctx, args) => {
-    const { capabilities } = await requireMembership(ctx, args.companyId);
-    const canConfigureTask = ["tasks:jd:create", "tasks:one_time:create", "tasks:jd:update:any", "tasks:jd:update:managed", "tasks:jd:update:self", "tasks:one_time:update:any", "tasks:one_time:update:managed", "tasks:one_time:update:self"].some((capability) => capabilities.has(capability as Capability));
+    const { capabilities, company } = await requireMembership(ctx, args.companyId);
+    // Company settings choose the preferred admin from the same list.
+    const canConfigureTask = ["tasks:jd:create", "tasks:one_time:create", "tasks:jd:update:any", "tasks:jd:update:managed", "tasks:jd:update:self", "tasks:one_time:update:any", "tasks:one_time:update:managed", "tasks:one_time:update:self", "company:manage_settings"].some((capability) => capabilities.has(capability as Capability));
     if (!canConfigureTask) throw new ConvexError("You do not have access to do that.");
     const result = await takeWithOverflow(
       (limit) => ctx.db.query("companyMemberships").withIndex("by_company", (q) => q.eq("companyId", args.companyId)).take(limit),
@@ -2704,7 +2728,8 @@ export const eligibleConfirmers = query({
     for (const candidate of result.rows) {
       if (candidate.active && (await roleNameCapabilities(ctx, args.companyId, candidate.role, roleCache)).has("tasks:confirm")) ids.push(candidate._id);
     }
-    return { users: await enrich(ctx, ids), isTruncated: result.isTruncated };
+    const suggestion = await suggestConfirmers(ctx, company, args.assigneeMembershipIds ?? [], new Set(ids));
+    return { users: await enrich(ctx, ids), isTruncated: result.isTruncated, suggestion };
   },
 });
 

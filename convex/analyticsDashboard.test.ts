@@ -941,11 +941,11 @@ describe("dashboard period breakdowns", () => {
     // still counts it as done inside the selected period.
     expect(dashboard.jd).toMatchObject({ due: 1, done: 1, missed: 0, waiting: 0, completionRate: 100 });
     expect(dashboard.jd.byFrequency.find((row) => row.recurrence === "monthly")?.upcoming).toBeNull();
-    const bucketTotals = dashboard.buckets.reduce(
-      (sum, bucket) => ({ due: sum.due + bucket.jd.due, done: sum.done + bucket.jd.done }),
-      { due: 0, done: 0 },
-    );
-    expect(bucketTotals).toEqual({ due: 1, done: 1 });
+    // The deadline's week has not started, so its bar stays empty rather than
+    // showing 100% ahead of time; no bar carries the early completion yet.
+    const deadlineBucket = dashboard.buckets.find((bucket) => bucket.endDate === lastDayOfMonthField(now));
+    expect(deadlineBucket).toMatchObject({ state: "future", jd: { due: 0, done: 0, completionRate: null } });
+    expect(dashboard.buckets.every((bucket) => bucket.jd.due === 0)).toBe(true);
   });
 
   test("previousCompletionRate compares the month before the selected one", { timeout: 15_000 }, async () => {

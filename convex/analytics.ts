@@ -611,14 +611,21 @@ export const dashboard = query({
       jd: { due: 0, done: 0, completionRate: null },
       tasks: { assigned: 0, done: 0, completionRate: null },
     }));
+    // A bar stays empty until its dates arrive: work finished ahead of a later
+    // deadline would otherwise show a future bar as complete. Period totals
+    // above still count it.
+    const openBucketIndex = (at: number) => {
+      const index = bucketIndexFor(period.buckets, at);
+      return index === -1 || bucketRows[index].state === "future" ? -1 : index;
+    };
     for (const count of jdCounts) {
-      const index = bucketIndexFor(period.buckets, count.at);
+      const index = openBucketIndex(count.at);
       if (index === -1) continue;
       bucketRows[index].jd.due += jdCountDue(count);
       bucketRows[index].jd.done += count.done;
     }
     for (const item of taskItems) {
-      const index = bucketIndexFor(period.buckets, item.at);
+      const index = openBucketIndex(item.at);
       if (index === -1) continue;
       bucketRows[index].tasks.assigned += 1;
       if (item.status === "done") bucketRows[index].tasks.done += 1;
