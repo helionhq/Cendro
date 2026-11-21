@@ -696,8 +696,10 @@ function ShellInner({ children, isPlatformAdmin }: { children: React.ReactNode; 
   const clockNow = useMinuteNow();
   const canUseFleet = Boolean(active?.capabilities.includes("fleet:view"));
   const fleetAlerts = useQuery(
-    api.fleet.alerts,
-    activeCompanyId && canUseFleet ? { companyId: activeCompanyId, now: clockNow } : "skip",
+    api.fleetMonitoring.alertsFeed,
+    activeCompanyId && canUseFleet
+      ? { companyId: activeCompanyId, now: clockNow, status: "open" }
+      : "skip",
   );
 
   useEffect(() => {
@@ -722,8 +724,8 @@ function ShellInner({ children, isPlatformAdmin }: { children: React.ReactNode; 
   }, []);
 
   const visibleNav = useMemo(
-    () => navForCapabilities(active, fleetAlerts?.count ?? 0),
-    [active, fleetAlerts?.count],
+    () => navForCapabilities(active, fleetAlerts?.openCount ?? 0),
+    [active, fleetAlerts?.openCount],
   );
 
   if (accessStatus === "loading") {

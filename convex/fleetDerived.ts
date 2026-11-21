@@ -114,6 +114,8 @@ export type FuelFill = {
 
 export type FuelPoint = FuelFill & {
   kmPerL: number | null;
+  /** Odometer distance since the previous fill-up, in km. */
+  kmSincePrevious: number | null;
   medianKmPerL: number | null;
   anomaly: boolean;
 };
@@ -131,6 +133,7 @@ export function computeFuelSeries(fills: readonly FuelFill[]): FuelPoint[] {
       : a.filledAt - b.filledAt,
   );
   const efficiencies: (number | null)[] = sorted.map(() => null);
+  const distances: (number | null)[] = sorted.map(() => null);
 
   for (let index = 1; index < sorted.length; index += 1) {
     const current = sorted[index];
@@ -139,6 +142,7 @@ export function computeFuelSeries(fills: readonly FuelFill[]): FuelPoint[] {
     if (!(current.litres > 0)) continue;
     const km = (current.odometerMeters - previous.odometerMeters) / 1000;
     if (!(km > 0)) continue;
+    distances[index] = km;
     efficiencies[index] = km / current.litres;
   }
 
@@ -151,6 +155,7 @@ export function computeFuelSeries(fills: readonly FuelFill[]): FuelPoint[] {
     return {
       ...fill,
       kmPerL,
+      kmSincePrevious: distances[index],
       medianKmPerL,
       anomaly:
         kmPerL !== null && medianKmPerL !== null && kmPerL < medianKmPerL * FUEL_ANOMALY_RATIO,

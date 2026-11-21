@@ -1761,6 +1761,7 @@ button:disabled { cursor: not-allowed; }
 
   /* iOS Safari zooms the page when a focused input is below 16px. */
   input,
+  select,
   textarea { font-size: 16px; }
 }
 
