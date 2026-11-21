@@ -32,6 +32,7 @@ const state = vi.hoisted(() => ({
   statusWrites: [] as { taskId: string; status: string; evidence?: unknown }[],
   assignable: [] as unknown[],
   confirmers: [] as unknown[],
+  confirmerSuggestion: null as null | { source: string; membershipIds: string[] },
   confirmersByTask: {} as Record<string, string>,
   awaitingRows: [] as unknown[],
   createWrites: [] as Record<string, unknown>[],
@@ -81,7 +82,7 @@ vi.mock("convex/react", () => {
         case "tasks:getCustomView": return state.view;
         case "tasks:getListPreference": return { sort: { mode: "default" }, customOrder: null, revision: 0 };
         case "tasks:assignableUsers": return { users: state.assignable, isTruncated: false };
-        case "tasks:eligibleConfirmers": return { users: state.confirmers, isTruncated: false };
+        case "tasks:eligibleConfirmers": return { users: state.confirmers, isTruncated: false, suggestion: state.confirmerSuggestion };
         case "tasks:listAwaitingConfirmation": return { isTruncated: false, rows: state.awaitingRows };
         default: return [];
       }
@@ -250,6 +251,7 @@ afterEach(async () => {
   state.statusWrites = [];
   state.assignable = [];
   state.confirmers = [];
+  state.confirmerSuggestion = null;
   state.confirmersByTask = {};
   state.awaitingRows = [];
   state.createWrites = [];
@@ -1041,6 +1043,41 @@ test("the edit dialog shows a saved confirmer who is no longer eligible", async 
   const dialog = descendants(container).find((node) => node.getAttribute?.("role") === "dialog");
   const trigger = descendants(dialog).find((node) => node.getAttribute?.("aria-label")?.startsWith("Confirmer (required):"));
   expect(trigger?.getAttribute("aria-label")).toBe("Confirmer (required): Casey (can no longer confirm)");
+});
+
+test("editing keeps the saved confirmer next to the assignee's suggested manager", async () => {
+  const managerUser = { membership: { _id: "manager", role: "Manager" }, user: { name: "Morgan", email: "morgan@example.com" } };
+  state.capabilities = ["tasks:one_time:update:any"];
+  state.assignable = [assigneeUser];
+  state.confirmers = [confirmerUser, managerUser];
+  state.confirmerSuggestion = { source: "managers", membershipIds: ["manager"] };
+  state.detail = {
+    task: {
+      _id: "A", title: "A", createdAt: 1, priority: "low", dueDate: Date.now() + 86_400_000,
+      assigneeMembershipIds: ["assignee"], confirmerMembershipId: "confirmer", confirmer: confirmerUser,
+      state: { status: "Pending", rawStatus: "due" },
+    },
+    canUpdate: true,
+  };
+  container = createMockElement();
+  root = createRoot(container);
+  await act(async () => root!.render(React.createElement(OneTimeTasksLayout, null, React.createElement(TaskDetail, { kind: "one", id: "A" }))));
+  await clickButton("Edit task");
+  const dialog = descendants(container).find((node) => node.getAttribute?.("role") === "dialog");
+  const form = descendants(dialog).find((node) => node.tagName === "FORM");
+
+  // Re-picking the same assignee is not a change: the saved confirmer stays.
+  const assigneeTrigger = descendants(dialog).find((node) => node.getAttribute?.("aria-label") === "Assigned To: Ada");
+  await act(async () => assigneeTrigger.dispatchEvent(new Event("click", { bubbles: true, cancelable: true })));
+  const sameAssignee = descendants(dialog).find((node) => node.tagName === "BUTTON" && !node.getAttribute?.("aria-label") && descendants(node).some((child) => child.nodeValue === "Ada" || child.textContent === "Ada"));
+  await act(async () => reactProps(sameAssignee).onClick());
+  await act(async () => { reactProps(form).onSubmit({ preventDefault: () => {} }); await Promise.resolve(); });
+  expect(state.updateWrites.at(-1)).toMatchObject({ confirmerMembershipId: "confirmer" });
+
+  // Choosing the manager keeps the saved confirmer as a choice.
+  await clickButton("Edit task");
+  await act(async () => state.selects.get("Morgan")!());
+  expect(state.selects.has("Casey")).toBe(true);
 });
 
 test("the awaiting confirmation view appears only with tasks:confirm", async () => {

@@ -588,6 +588,18 @@ export async function isManagedMembership(
   return false;
 }
 
+/** Whether this member is an active part of the company who can confirm task completion. */
+export async function canConfirmTasks(
+  ctx: Ctx,
+  companyId: Id<"companies">,
+  membershipId: Id<"companyMemberships">,
+  roleCache?: Map<string, Promise<Set<Capability>>>,
+) {
+  const membership = await ctx.db.get(membershipId);
+  if (!membership || membership.companyId !== companyId || !membership.active) return false;
+  return (await roleNameCapabilities(ctx, companyId, membership.role, roleCache)).has("tasks:confirm");
+}
+
 /**
  * The members a person reports to: managers whose scope covers them directly
  * or through one of their branches or departments. Never includes the person.

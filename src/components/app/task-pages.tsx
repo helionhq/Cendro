@@ -1791,10 +1791,12 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
   const confirmerOptions = suggestion ? eligibleConfirmerOptions.filter((option) => suggestion.membershipIds.includes(option.value)) : eligibleConfirmerOptions;
   const autoConfirmerId = suggestion && confirmerOptions.length === 1 ? confirmerOptions[0].value : null;
   const confirmerId = values.confirmerMembershipId ?? autoConfirmerId;
-  // A saved confirmer may no longer hold tasks:confirm; the backend keeps them
-  // so their pending approval still resolves. Show that person rather than a
-  // blank "Select confirmer" that hides who the task is actually waiting on.
-  const savedConfirmerId = values.confirmerMembershipId;
+  // The task's saved confirmer stays selectable next to the suggestion, so an
+  // edit never silently replaces them. They may no longer hold tasks:confirm;
+  // the backend keeps them so their pending approval still resolves. Show that
+  // person rather than a blank "Select confirmer" that hides who the task is
+  // actually waiting on.
+  const savedConfirmerId: string | null = task?.confirmerMembershipId ?? null;
   const savedConfirmerIsIneligible = Boolean(savedConfirmerId) && confirmersResult !== undefined && !eligibleConfirmerOptions.some((option) => option.value === savedConfirmerId);
   const savedConfirmer = savedConfirmerIsIneligible
     ? [
@@ -1803,7 +1805,6 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
         task?.assignees?.find((candidate: any) => candidate.membership?._id === savedConfirmerId) ?? null,
       ].find(Boolean) ?? null
     : null;
-  // A saved confirmer outside the suggestion stays selectable next to it.
   const savedConfirmerOption = savedConfirmerIsIneligible
     ? { value: savedConfirmerId!, label: `${savedConfirmer ? assigneeDisplayName(savedConfirmer) : "Saved confirmer"} (can no longer confirm)` }
     : savedConfirmerId && !confirmerOptions.some((option) => option.value === savedConfirmerId)
@@ -1915,7 +1916,11 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
               <div className="mt-4 divide-y divide-[var(--hairline)] border-y border-[var(--hairline)]">
                 <div className="grid grid-cols-[120px_1fr] items-center gap-3 py-2">
                   <span className="text-[13px] text-[var(--ink-muted)]">Assigned To{mode === "create" && <RequiredIndicator />}</span>
-                  <div className="min-w-0"><AssigneePicker assignable={dialogAssignable} assignableIsTruncated={assignableIsTruncated} selected={values.assigneeMembershipIds} onChange={(ids) => patch({ assigneeMembershipIds: ids, confirmerMembershipId: null })} companyId={activeCompanyId ?? undefined} kind={kind} required={mode === "create"} /></div>
+                  <div className="min-w-0"><AssigneePicker assignable={dialogAssignable} assignableIsTruncated={assignableIsTruncated} selected={values.assigneeMembershipIds} onChange={(ids) => {
+                    // A new assignee set re-derives the confirmer; an edit falls back to the saved one.
+                    const changed = ids.length !== values.assigneeMembershipIds.length || ids.some((id) => !values.assigneeMembershipIds.includes(id));
+                    patch(changed ? { assigneeMembershipIds: ids, confirmerMembershipId: task?.confirmerMembershipId ?? null } : { assigneeMembershipIds: ids });
+                  }} companyId={activeCompanyId ?? undefined} kind={kind} required={mode === "create"} /></div>
                 </div>
                 {kind === "jd" ? (
                   <div className="grid grid-cols-[120px_1fr] items-center gap-3 py-2">

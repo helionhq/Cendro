@@ -81,7 +81,14 @@ type InvitationRow = {
 type Overview = {
   isTruncated: boolean;
   truncated: { branches: boolean; departments: boolean; users: boolean; invitations: boolean; userDetails: boolean };
-  company?: { _id: Id<"companies">; name: string; timeZone: string; hasTimeZone: boolean; preferredAdminMembershipId: Id<"companyMemberships"> | null };
+  company?: {
+    _id: Id<"companies">;
+    name: string;
+    timeZone: string;
+    hasTimeZone: boolean;
+    preferredAdminMembershipId: Id<"companyMemberships"> | null;
+    preferredAdmin: { _id: Id<"companyMemberships">; name: string; canConfirm: boolean } | null;
+  };
   currentMembership: MembershipCore;
   branches: BranchRow[];
   departments: DepartmentRow[];
@@ -363,6 +370,13 @@ function GeneralTab({
   onRemoveHoliday: (holidayId: Id<"companyHolidays">) => Promise<void> | void;
 }) {
   const options = timeZoneOptions(timeZone);
+  // The saved preferred admin stays visible after they lose the ability to
+  // confirm, so the setting reads truthfully and can be cleared.
+  const savedPreferredAdminId = data.company?.preferredAdminMembershipId ?? null;
+  const savedPreferredAdmin = data.company?.preferredAdmin?._id === savedPreferredAdminId ? data.company?.preferredAdmin : null;
+  const preferredAdminChoices = preferredAdminOptions && savedPreferredAdminId && !preferredAdminOptions.some((option) => option._id === savedPreferredAdminId)
+    ? [{ _id: savedPreferredAdminId, name: `${savedPreferredAdmin?.name ?? "Saved admin"}${savedPreferredAdmin?.canConfirm ? "" : " (can no longer confirm)"}` }, ...preferredAdminOptions]
+    : preferredAdminOptions;
   const savedTimeZone = data.company?.timeZone ?? DEFAULT_TIME_ZONE;
   const timeZoneDirty = timeZone !== savedTimeZone;
 
@@ -423,13 +437,13 @@ function GeneralTab({
             </div>
             <div className="company-settings-control">
               <SelectField
-                value={data.company?.preferredAdminMembershipId ?? ""}
+                value={savedPreferredAdminId ?? ""}
                 onChange={(value) => onSavePreferredAdmin(value ? value as Id<"companyMemberships"> : null)}
-                disabled={!canManageSettings || !preferredAdminOptions}
+                disabled={!canManageSettings || !preferredAdminChoices}
                 className="min-w-[220px]"
               >
                 <option value="">None</option>
-                {preferredAdminOptions?.map((option) => <option key={option._id} value={option._id}>{option.name}</option>)}
+                {preferredAdminChoices?.map((option) => <option key={option._id} value={option._id}>{option.name}</option>)}
               </SelectField>
             </div>
           </div>
@@ -2807,12 +2821,18 @@ export default function Company() {
   const [error, setError] = useState<string | null>(null);
   const autoTimeZoneAttempts = useRef<Set<string>>(new Set());
 
+  // Each draft follows only its own stored field (and the company), so saving
+  // another setting such as the preferred admin keeps an unsaved draft.
+  const overviewLoaded = data !== undefined;
+  const loadedCompanyId = data?.company?._id;
+  const storedCompanyName = data?.company?.name ?? active?.company.name ?? "";
+  const storedTimeZone = data?.company?.timeZone ?? active?.company.timeZone ?? DEFAULT_TIME_ZONE;
   useEffect(() => {
-    if (data) {
-      setCompanyName(data.company?.name ?? active?.company.name ?? "");
-      setCompanyTimeZone(data.company?.timeZone ?? active?.company.timeZone ?? DEFAULT_TIME_ZONE);
-    }
-  }, [active?.company.name, active?.company.timeZone, data]);
+    if (overviewLoaded) setCompanyName(storedCompanyName);
+  }, [overviewLoaded, loadedCompanyId, storedCompanyName]);
+  useEffect(() => {
+    if (overviewLoaded) setCompanyTimeZone(storedTimeZone);
+  }, [overviewLoaded, loadedCompanyId, storedTimeZone]);
 
   const rolesMissing = Boolean(data && data.roles.length === 0);
   const canSeedRoles = Boolean(active?.capabilities.includes("company:manage_roles"));

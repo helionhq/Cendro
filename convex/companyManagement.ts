@@ -5,6 +5,7 @@ import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import {
   assertRoleManagerRemains,
+  canConfirmTasks,
   ensureDefaultRoles,
   memberFirstName,
   memberFullName,
@@ -189,10 +190,16 @@ export const overview = query({
       userDetails: userDetailsTruncated,
     };
     const isTruncated = Object.values(truncated).some(Boolean);
+    // Reported even after they lose access, so settings can show and clear them.
+    const preferredAdminMembership = company.preferredAdminMembershipId ? await ctx.db.get(company.preferredAdminMembershipId) : null;
+    const preferredAdminUser = preferredAdminMembership?.companyId === company._id ? await ctx.db.get(preferredAdminMembership.userId) : null;
+    const preferredAdmin = preferredAdminMembership && preferredAdminUser
+      ? { _id: preferredAdminMembership._id, name: memberFullName(preferredAdminMembership, preferredAdminUser), canConfirm: await canConfirmTasks(ctx, company._id, preferredAdminMembership._id) }
+      : null;
     return {
       isTruncated,
       truncated,
-      company: { _id: company._id, name: company.name, timeZone: company.timeZone ?? defaultTimeZone, hasTimeZone: Boolean(company.timeZone), preferredAdminMembershipId: company.preferredAdminMembershipId ?? null },
+      company: { _id: company._id, name: company.name, timeZone: company.timeZone ?? defaultTimeZone, hasTimeZone: Boolean(company.timeZone), preferredAdminMembershipId: company.preferredAdminMembershipId ?? null, preferredAdmin },
       currentMembership: { _id: membership._id, role: membership.role, active: membership.active, createdAt: membership.createdAt },
       branches: branches.map((b) => ({ _id: b._id, name: b.name, order: b.order })),
       departments: departments.map((d) => ({ _id: d._id, branchId: d.branchId, name: d.name, order: d.order })),

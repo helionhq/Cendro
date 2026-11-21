@@ -6,7 +6,7 @@ import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { currentJdCycle, defaultTimeZone, nextJdCycleStart, type JdRecurrence } from "./taskCycles";
 import { effectiveCurrentJdCycle, elapsedJdOccurrences, loadWorkCalendar, occurrenceDeadline, type WorkCalendar } from "./workCalendar";
-import { activeCompanyMembershipIds, assertCanAssign, assertCanChangeTaskConfirmer, assertCanDeleteTask, assertCanUpdateTask, canViewTask, getManagedMembershipIds, hasAllManagedMemberships, hasAnyManagedMembership, managerMembershipIdsOf, memberFirstName, memberFullName, membershipCapabilities, requireCapability, requireMembership, roleNameCapabilities, scanManagedMembershipIds, scopedMembershipIds } from "./permissions";
+import { activeCompanyMembershipIds, assertCanAssign, assertCanChangeTaskConfirmer, assertCanDeleteTask, assertCanUpdateTask, canViewTask, getManagedMembershipIds, hasAllManagedMemberships, hasAnyManagedMembership, canConfirmTasks, managerMembershipIdsOf, memberFirstName, memberFullName, membershipCapabilities, requireCapability, requireMembership, roleNameCapabilities, scanManagedMembershipIds, scopedMembershipIds } from "./permissions";
 import type { Capability } from "../src/lib/permissions";
 import { nonEmpty } from "./validation";
 import {
@@ -2702,14 +2702,18 @@ async function suggestConfirmers(
   ctx: QueryCtx,
   company: Doc<"companies">,
   assigneeIds: Id<"companyMemberships">[],
-  eligibleIds: Set<Id<"companyMemberships">>,
+  roleCache: Map<string, Promise<Set<Capability>>>,
 ) {
   if (assigneeIds.length === 0 || assigneeIds.length > CONFIRMER_SUGGESTION_ASSIGNEE_LIMIT) return null;
   const managerSets = await Promise.all(assigneeIds.map((id) => managerMembershipIdsOf(ctx, company._id, id)));
-  const managers = [...new Set(managerSets.flatMap((ids) => [...ids]))].filter((id) => eligibleIds.has(id) && !assigneeIds.includes(id));
+  const candidates = [...new Set(managerSets.flatMap((ids) => [...ids]))].filter((id) => !assigneeIds.includes(id));
+  const confirmable = await Promise.all(candidates.map((id) => canConfirmTasks(ctx, company._id, id, roleCache)));
+  const managers = candidates.filter((_, index) => confirmable[index]);
   if (managers.length > 0) return { source: "managers" as const, membershipIds: managers };
   const preferred = company.preferredAdminMembershipId;
-  if (preferred && eligibleIds.has(preferred) && !assigneeIds.includes(preferred)) return { source: "preferred_admin" as const, membershipIds: [preferred] };
+  if (preferred && !assigneeIds.includes(preferred) && (await canConfirmTasks(ctx, company._id, preferred, roleCache))) {
+    return { source: "preferred_admin" as const, membershipIds: [preferred] };
+  }
   return null;
 }
 
@@ -2728,8 +2732,11 @@ export const eligibleConfirmers = query({
     for (const candidate of result.rows) {
       if (candidate.active && (await roleNameCapabilities(ctx, args.companyId, candidate.role, roleCache)).has("tasks:confirm")) ids.push(candidate._id);
     }
-    const suggestion = await suggestConfirmers(ctx, company, args.assigneeMembershipIds ?? [], new Set(ids));
-    return { users: await enrich(ctx, ids), isTruncated: result.isTruncated, suggestion };
+    // Suggested people are checked on their own, so the bounded list above
+    // never hides a manager; their records join the returned users.
+    const suggestion = await suggestConfirmers(ctx, company, args.assigneeMembershipIds ?? [], roleCache);
+    const userIds = [...new Set([...ids, ...(suggestion?.membershipIds ?? [])])];
+    return { users: await enrich(ctx, userIds), isTruncated: result.isTruncated, suggestion };
   },
 });
 
