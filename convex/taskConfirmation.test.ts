@@ -42,9 +42,9 @@ describe("task completion confirmation", () => {
     expect(await suggest(f.employee2M)).toEqual({ source: "preferred_admin", membershipIds: [f.adminM] });
   });
 
-  test("a manager beyond the bounded member list is still suggested", async () => {
+  test("a confirmer who joined after 500 other members is still listed and suggested", async () => {
     const f = await createAuthzFixture();
-    // Fill the company past the 500-member list, then add Employee A2's manager.
+    // Fill the company past 500 members, then add Employee A2's manager.
     const lateManagerM = await f.t.run(async (ctx) => {
       const now = Date.now();
       for (let i = 0; i < 500; i++) {
@@ -58,10 +58,13 @@ describe("task completion confirmation", () => {
       return membershipId;
     });
 
+    // The preferred admin picker lists every confirmer, with no assignees.
+    const list = await f.asUser("adminA").query(api.tasks.eligibleConfirmers, { companyId: f.companyA });
+    expect(list.isTruncated).toBe(false);
+    expect(list.users.some((row) => row.membership._id === lateManagerM)).toBe(true);
+
     const result = await f.asUser("adminA").query(api.tasks.eligibleConfirmers, { companyId: f.companyA, assigneeMembershipIds: [f.employee2M] });
-    expect(result.isTruncated).toBe(true);
     expect(result.suggestion).toEqual({ source: "managers", membershipIds: [lateManagerM] });
-    expect(result.users.some((row) => row.membership._id === lateManagerM)).toBe(true);
   });
 
   test("a non-confirmer submission waits, and confirming completes it with the submission time and author", async () => {

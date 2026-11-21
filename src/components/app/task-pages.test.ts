@@ -1064,20 +1064,19 @@ test("editing keeps the saved confirmer next to the assignee's suggested manager
   await act(async () => root!.render(React.createElement(OneTimeTasksLayout, null, React.createElement(TaskDetail, { kind: "one", id: "A" }))));
   await clickButton("Edit task");
   const dialog = descendants(container).find((node) => node.getAttribute?.("role") === "dialog");
-  const form = descendants(dialog).find((node) => node.tagName === "FORM");
+  const confirmerLabel = () => descendants(dialog).find((node) => node.getAttribute?.("aria-label")?.startsWith("Confirmer (required):"))?.getAttribute("aria-label");
 
   // Re-picking the same assignee is not a change: the saved confirmer stays.
   const assigneeTrigger = descendants(dialog).find((node) => node.getAttribute?.("aria-label") === "Assigned To: Ada");
   await act(async () => assigneeTrigger.dispatchEvent(new Event("click", { bubbles: true, cancelable: true })));
   const sameAssignee = descendants(dialog).find((node) => node.tagName === "BUTTON" && !node.getAttribute?.("aria-label") && descendants(node).some((child) => child.nodeValue === "Ada" || child.textContent === "Ada"));
   await act(async () => reactProps(sameAssignee).onClick());
-  await act(async () => { reactProps(form).onSubmit({ preventDefault: () => {} }); await Promise.resolve(); });
-  expect(state.updateWrites.at(-1)).toMatchObject({ confirmerMembershipId: "confirmer" });
+  expect(confirmerLabel()).toBe("Confirmer (required): Casey");
 
-  // Choosing the manager keeps the saved confirmer as a choice.
-  await clickButton("Edit task");
+  // Choosing the manager keeps the saved confirmer as a rendered choice.
   await act(async () => state.selects.get("Morgan")!());
-  expect(state.selects.has("Casey")).toBe(true);
+  expect(confirmerLabel()).toBe("Confirmer (required): Morgan");
+  expect(descendants(dialog).some((node) => node.textContent === "Casey")).toBe(true);
 });
 
 test("the awaiting confirmation view appears only with tasks:confirm", async () => {
