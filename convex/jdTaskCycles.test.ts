@@ -409,6 +409,8 @@ describe("JD task cycle behavior", () => {
     const detail = await admin.query(api.tasks.getJd, { companyId, taskId });
     const records = await admin.query(api.tasks.listJdCycleRecords, { companyId, taskId });
     expect(detail.task.state).toMatchObject({ rawStatus: "due", currentCycleStart: utc(2026, 10, 26), currentCycleEnd: utc(2026, 11, 26) });
+    // The old schedule's misses are history, so none can stand in for a new-grid cycle.
+    expect(records.every((record) => record.retiredAt !== undefined)).toBe(true);
     expect(records.map((record) => [record.cycleStart, record.cycleEnd]).sort()).toEqual([
       [utc(2026, 8, 1), utc(2026, 9, 1)],
       [utc(2026, 9, 1), utc(2026, 10, 1)],

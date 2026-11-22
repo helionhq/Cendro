@@ -1128,12 +1128,12 @@ function AwaitingConfirmationTable({
   );
 }
 
-function SelectPicker<T extends string>({ ariaLabel, value, options, onChange, placeholder = "Select", required = false, menuClassName }: { ariaLabel: string; required?: boolean; value: T; options: { value: T; label: string; helper?: string }[]; onChange: (value: T) => void; placeholder?: string; menuClassName?: string }) {
+function SelectPicker<T extends string>({ ariaLabel, value, options, onChange, placeholder = "Select", required = false, menuClassName, disabled = false }: { ariaLabel: string; required?: boolean; value: T; options: { value: T; label: string; helper?: string }[]; onChange: (value: T) => void; placeholder?: string; menuClassName?: string; disabled?: boolean }) {
   const selectedOption = options.find((option) => option.value === value);
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
-        <button type="button" aria-label={`${ariaLabel}${required ? " (required)" : ""}: ${selectedOption?.label ?? placeholder}`} className="task-inline-control" data-interactive="true" onClick={(event) => event.stopPropagation()}>
+        <button type="button" aria-label={`${ariaLabel}${required ? " (required)" : ""}: ${selectedOption?.label ?? placeholder}`} className="task-inline-control" data-interactive="true" disabled={disabled} onClick={(event) => event.stopPropagation()}>
           <span className={cn("truncate", !selectedOption && "text-[var(--ink-faint)]")}>{selectedOption?.label ?? placeholder}</span>
           <ChevronDown className="h-4 w-4 shrink-0 text-[var(--ink-faint)]" />
         </button>
@@ -1160,7 +1160,7 @@ function SelectPicker<T extends string>({ ariaLabel, value, options, onChange, p
  * quarterly task picks "Mar, Jun, Sep, Dec"), and the line below shows the
  * cycle the choice puts today in. Without `onChange` it only describes.
  */
-function CycleEndPicker({ recurrence, value, onChange }: { recurrence: CycleEndRecurrence; value: number | null | undefined; onChange?: (value: number) => void }) {
+function CycleEndPicker({ recurrence, value, onChange, disabled = false }: { recurrence: CycleEndRecurrence; value: number | null | undefined; onChange?: (value: number) => void; disabled?: boolean }) {
   const monthDay = normalizeCycleEnd(recurrence, value ?? undefined) ?? DEFAULT_CYCLE_END;
   const month = cycleEndMonth(monthDay);
   const day = cycleEndDay(monthDay);
@@ -1174,11 +1174,11 @@ function CycleEndPicker({ recurrence, value, onChange }: { recurrence: CycleEndR
       {!onChange ? <span>{dayLabel} of {monthLabel}</span> : <div className="flex min-w-0 items-center gap-1">
         {recurrence !== "monthly" && (
           <div className="min-w-0 flex-1">
-            <SelectPicker ariaLabel="Cycle end month" value={String(month)} options={cycleEndMonthOptions(recurrence)} onChange={(next) => onChange(Number(next) * 100 + day)} menuClassName={scrollingMenu} />
+            <SelectPicker ariaLabel="Cycle end month" value={String(month)} options={cycleEndMonthOptions(recurrence)} onChange={(next) => onChange(Number(next) * 100 + day)} menuClassName={scrollingMenu} disabled={disabled} />
           </div>
         )}
         <div className={recurrence === "monthly" ? "min-w-0 flex-1" : "w-32 shrink-0"}>
-          <SelectPicker ariaLabel="Cycle end day" value={String(day)} options={cycleEndDayOptions} onChange={(next) => onChange(month * 100 + Number(next))} menuClassName={scrollingMenu} />
+          <SelectPicker ariaLabel="Cycle end day" value={String(day)} options={cycleEndDayOptions} onChange={(next) => onChange(month * 100 + Number(next))} menuClassName={scrollingMenu} disabled={disabled} />
         </div>
       </div>}
       <p className={cn("text-[12px] text-[var(--ink-muted)]", onChange && "px-2")}>Current cycle: {calendarDateLabel(cycle.start)} – {calendarDateLabel(cycle.end)}</p>
@@ -1828,6 +1828,17 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
   const addAttachment = useMutation(api.tasks.addAttachment);
   const deleteOrphanedUpload = useMutation(api.tasks.deleteOrphanedUpload);
   const [values, setValues] = useState<TaskFormValues>(() => task ? formFromTask(kind, task) : emptyForm(kind));
+  // The task as the dialog last opened on it. A dialog that stays mounted
+  // reloads the latest task each time it opens, and the schedule only counts
+  // as edited when it differs from this snapshot.
+  const [opening, setOpening] = useState<TaskFormValues | null>(null);
+  if (open && opening === null) {
+    const fresh = task ? formFromTask(kind, task) : emptyForm(kind);
+    setOpening(fresh);
+    setValues(fresh);
+  } else if (!open && opening !== null) {
+    setOpening(null);
+  }
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   // Only the open dialog needs the confirmer list.
@@ -1928,8 +1939,12 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
       if (kind === "jd") {
         // An edit that leaves the schedule alone omits the cycle end, so a
         // dialog opened earlier never undoes someone else's newer choice.
-        const scheduleTouched = mode === "create" || values.recurrence !== task.recurrence || values.cycleEndMonthDay !== (task.cycleEndMonthDay ?? null);
-        const schedule = { recurrence: values.recurrence, cycleEndMonthDay: !scheduleTouched ? undefined : hasCycleEnd(values.recurrence) ? values.cycleEndMonthDay : null };
+        // An edit that leaves the schedule alone sends the task's latest one,
+        // so a change saved elsewhere while the dialog was open survives.
+        const scheduleTouched = mode === "create" || values.recurrence !== opening?.recurrence || values.cycleEndMonthDay !== opening?.cycleEndMonthDay;
+        const schedule = scheduleTouched
+          ? { recurrence: values.recurrence, cycleEndMonthDay: hasCycleEnd(values.recurrence) ? values.cycleEndMonthDay : null }
+          : { recurrence: task.recurrence as Frequency };
         if (mode === "create") taskId = await createJd({ ...common, ...schedule });
         else await updateJd({ ...common, taskId: task._id, ...schedule });
       } else {
@@ -3726,7 +3741,7 @@ function TaskDetailContent({ kind, id }: { kind: Kind; id: string }) {
               </PropertyRow>
               {hasCycleEnd(task.recurrence) && (
                 <PropertyRow icon={<CalendarClock className="h-3.5 w-3.5" />} label="Cycle ends">
-                  <CycleEndPicker recurrence={task.recurrence} value={task.cycleEndMonthDay} onChange={canEdit ? (cycleEndMonthDay) => { void saveTaskField({ cycleEndMonthDay }, "cycle end"); } : undefined} />
+                  <CycleEndPicker recurrence={task.recurrence} value={task.cycleEndMonthDay} disabled={pendingTaskField !== null} onChange={canEdit ? (cycleEndMonthDay) => { void saveTaskField({ cycleEndMonthDay }, "cycle end"); } : undefined} />
                 </PropertyRow>
               )}
             </>

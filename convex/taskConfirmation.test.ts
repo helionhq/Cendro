@@ -555,6 +555,43 @@ describe("task completion confirmation", () => {
     expect(completion?.retiredAt).toBe(Date.UTC(2027, 2, 10, 12));
   });
 
+  // A March 2027 submission on the month-end grid, then a move to cycles
+  // ending on the 28th (both start 1 March), and the confirmer finishing the
+  // new cycle with their own evidence.
+  async function sharedStartAfterCycleEndMove() {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.UTC(2027, 2, 10, 12));
+    const f = await createAuthzFixture();
+    await f.t.run(async (ctx) => {
+      await ctx.db.patch(f.companyA, { timeZone: "UTC" });
+      await ctx.db.insert("companyCalendars", { companyId: f.companyA, workingDays: [0, 1, 2, 3, 4, 5, 6], updatedAt: Date.now() });
+    });
+    const admin = f.asUser("adminA");
+    const manager = f.asUser("managerA");
+    const taskId = await admin.mutation(api.tasks.createJd, { companyId: f.companyA, title: "Shared start", recurrence: "monthly", assigneeMembershipIds: [f.employee1M], confirmerMembershipId: f.managerM });
+    await f.asUser("employeeA1").mutation(api.tasks.completeJd, { companyId: f.companyA, taskId, evidence: { text: "Old proof" } });
+    const request = (await manager.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "jd" })).rows[0];
+    await admin.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId, cycleEndMonthDay: 1228 });
+    await manager.mutation(api.tasks.completeJd, { companyId: f.companyA, taskId, evidence: { text: "New proof" } });
+    return { f, manager, taskId, request };
+  }
+
+  test("confirming a superseded request keeps its completion beside the new cycle's", async () => {
+    const { f, manager, taskId, request } = await sharedStartAfterCycleEndMove();
+    await manager.mutation(api.tasks.confirmTaskCompletion, { companyId: f.companyA, requestId: request._id });
+
+    const completions = await f.t.run(async (ctx) => await ctx.db.query("jdTaskCompletions").withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", taskId).eq("cycleStart", request.cycleStart!)).collect());
+    expect(completions.map((row) => [row.completedByMembershipId, row.retiredAt !== undefined]).sort()).toEqual([[f.employee1M, true], [f.managerM, false]].sort());
+  });
+
+  test("sending back a superseded request keeps the new cycle's evidence", async () => {
+    const { f, manager, taskId, request } = await sharedStartAfterCycleEndMove();
+    await manager.mutation(api.tasks.sendBackTaskCompletion, { companyId: f.companyA, requestId: request._id });
+
+    const evidence = await manager.query(api.tasks.getTaskEvidence, { companyId: f.companyA, taskType: "jd", taskId, paginationOpts: { numItems: 10, cursor: null } });
+    expect(evidence.page.filter((entry) => entry.retiredAt == null).map((entry) => entry.text)).toEqual(["New proof"]);
+  });
+
   test("sending back a request from a previous recurrence records its miss as retired history", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(utc(29));

@@ -213,7 +213,9 @@ async function resolveConfirmationRequest(ctx: MutationCtx, request: Doc<"taskCo
     // current one even when their starts coincide. Its confirmation is history:
     // record the work retired and never touch the current grid's status.
     const retired = !sameJdGrid(request, task);
-    if (!(await currentJdCompletion(ctx, taskId, cycleStart))) {
+    // A live completion at the same start belongs to the current grid; it
+    // must not swallow the superseded submission's own history row.
+    if (retired || !(await currentJdCompletion(ctx, taskId, cycleStart))) {
       await ctx.db.insert("jdTaskCompletions", {
         companyId: request.companyId,
         jdTaskId: taskId,
@@ -1738,7 +1740,9 @@ export const catchUpMissedJdCycles = internalMutation({
         const cycle = occurrences[i];
         const [done, recorded, pending] = perCycle[i];
         if (!done && !recorded && !pending) {
-          await ctx.db.insert("jdTaskCycleRecords", { companyId: task.companyId, jdTaskId: task._id, cycleStart: cycle.start, cycleEnd: cycle.deadline, status: "missed", recordedAt: now });
+          // A replaced schedule's misses are history, like the rows retired
+          // when it was replaced; a pause-only snapshot (no stoppedAt) is not.
+          await ctx.db.insert("jdTaskCycleRecords", { companyId: task.companyId, jdTaskId: task._id, cycleStart: cycle.start, cycleEnd: cycle.deadline, status: "missed", recordedAt: now, ...(args.schedule.stoppedAt !== undefined ? { retiredAt: args.schedule.stoppedAt } : {}) });
         }
       }
       // The batch cap may leave elapsed old-grid cycles unprocessed; continue
@@ -2208,10 +2212,14 @@ export const sendBackTaskCompletion = mutation({
     if (!request) return null;
     if (request.companyId !== args.companyId || request.confirmerMembershipId !== membership._id) throw new ConvexError("Confirmation request not found.");
     const now = Date.now();
-    await deleteActiveTaskEvidence(ctx, request.taskType, request.taskId, request.cycleStart);
+    const jdTaskId = request.taskType === "jd" ? ctx.db.normalizeId("jdTasks", request.taskId) : null;
+    const jdTask = jdTaskId ? await ctx.db.get(jdTaskId) : null;
+    // A superseded grid's evidence was retired with its history; active
+    // evidence at the same start belongs to the current grid's cycle.
+    if (!jdTask || sameJdGrid(request, jdTask)) await deleteActiveTaskEvidence(ctx, request.taskType, request.taskId, request.cycleStart);
     if (request.taskType === "jd") {
-      const taskId = ctx.db.normalizeId("jdTasks", request.taskId);
-      const task = taskId ? await ctx.db.get(taskId) : null;
+      const taskId = jdTaskId;
+      const task = jdTask;
       if (taskId && task && task.companyId === args.companyId && request.cycleStart !== undefined) {
         if (!sameJdGrid(request, task)) {
           // A submission from a superseded grid becomes retired missed

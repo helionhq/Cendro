@@ -1126,6 +1126,7 @@ button:disabled { cursor: not-allowed; }
 }
 .task-inline-control:hover { background: var(--surface-muted); }
 .task-inline-control:focus-visible { border-color: var(--focus-ring); outline: none; }
+.task-inline-control:disabled { cursor: default; opacity: 0.6; background: transparent; }
 
 .alert-error {
   border: 1px solid var(--danger-border);
