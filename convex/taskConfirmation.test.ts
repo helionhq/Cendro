@@ -524,6 +524,37 @@ describe("task completion confirmation", () => {
     expect(completion?.retiredAt).toBe(utc(29));
   });
 
+  test("moving a cycle end retires a pending request even when the new cycle starts the same day", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.UTC(2027, 2, 10, 12));
+    const f = await createAuthzFixture();
+    await useUtcAllWeekCalendar(f);
+    const admin = f.asUser("adminA");
+    const manager = f.asUser("managerA");
+    const employee = f.asUser("employeeA1");
+    const taskId = await admin.mutation(api.tasks.createJd, {
+      companyId: f.companyA,
+      title: "Cycle end sign-off",
+      recurrence: "monthly",
+      assigneeMembershipIds: [f.employee1M],
+      confirmerMembershipId: f.managerM,
+    });
+    await employee.mutation(api.tasks.completeJd, { companyId: f.companyA, taskId });
+    const request = (await manager.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "jd" })).rows[0];
+
+    // February 2027 ends on the 28th, so both grids start a cycle on 1 March.
+    await admin.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId, cycleEndMonthDay: 1228 });
+    await manager.mutation(api.tasks.confirmTaskCompletion, { companyId: f.companyA, requestId: request._id });
+
+    const task = await admin.query(api.tasks.getJd, { companyId: f.companyA, taskId });
+    expect(task.task.state).toMatchObject({ rawStatus: "due", currentCycleStart: request.cycleStart, currentCycleEnd: Date.UTC(2027, 2, 29) });
+    const completion = await f.t.run(async (ctx) => await ctx.db
+      .query("jdTaskCompletions")
+      .withIndex("by_task_and_cycleStart", (q) => q.eq("jdTaskId", taskId).eq("cycleStart", request.cycleStart!))
+      .first());
+    expect(completion?.retiredAt).toBe(Date.UTC(2027, 2, 10, 12));
+  });
+
   test("sending back a request from a previous recurrence records its miss as retired history", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(utc(29));

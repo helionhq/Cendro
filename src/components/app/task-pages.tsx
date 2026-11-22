@@ -76,6 +76,7 @@ import { startInteraction } from "@/lib/perf";
 import { getDetailPreview, seedDetailPreview } from "@/lib/detail-preview";
 import { prependToListFirstPage, removeFromListPages, updateInDetailQueries, updateInListPages } from "@/lib/convex-optimistic";
 import { cn, formatDate, initials } from "@/lib/utils";
+import { cycleDatesContaining, cycleEndDay, cycleEndMonth, cycleEndMonthGroups, DEFAULT_CYCLE_END, hasCycleEnd, LAST_DAY_OF_MONTH, MAX_FIXED_CYCLE_END_DAY, normalizeCycleEnd, type CalendarDate, type CycleEndRecurrence } from "@/lib/jd-cycle-end";
 
 // The workbook stack (xlsx readers/writers) is heavy — load it on demand.
 const loadWorkbook = () => import("@/lib/task-import/workbook");
@@ -95,6 +96,8 @@ type TaskFormValues = {
   notes: string;
   assigneeMembershipIds: string[];
   recurrence: Frequency;
+  /** month * 100 + day; null keeps the calendar default. */
+  cycleEndMonthDay: number | null;
   priority: Priority;
   dueDate: string;
   quantity: string;
@@ -152,6 +155,7 @@ type TaskRow = TaskListOrderingRow & {
   canPause?: boolean;
   canResume?: boolean;
   recurrence?: Frequency;
+  cycleEndMonthDay?: number | null;
   priority?: Priority;
   dueDate?: number | null;
   createdAt: number;
@@ -213,7 +217,7 @@ const toneClasses: Record<string, string> = {
 };
 
 function emptyForm(kind: Kind): TaskFormValues {
-  return { title: "", description: "", notes: "", assigneeMembershipIds: [], recurrence: "daily", priority: "medium", dueDate: kind === "one" ? toDateField(Date.now() + 86_400_000) : "", quantity: "", time: "", evidenceRequired: false, confirmationRequired: false, confirmerMembershipId: null, files: [] };
+  return { title: "", description: "", notes: "", assigneeMembershipIds: [], recurrence: "daily", cycleEndMonthDay: null, priority: "medium", dueDate: kind === "one" ? toDateField(Date.now() + 86_400_000) : "", quantity: "", time: "", evidenceRequired: false, confirmationRequired: false, confirmerMembershipId: null, files: [] };
 }
 
 function formFromTask(kind: Kind, task: any): TaskFormValues {
@@ -223,6 +227,7 @@ function formFromTask(kind: Kind, task: any): TaskFormValues {
     notes: task.notes ?? "",
     assigneeMembershipIds: task.assigneeMembershipIds ?? [],
     recurrence: task.recurrence ?? "daily",
+    cycleEndMonthDay: task.cycleEndMonthDay ?? null,
     priority: task.priority ?? "medium",
     dueDate: kind === "one" && task.dueDate ? toDateField(task.dueDate, dateHasExplicitTime(task.dueDate)) : "",
     quantity: task.quantity != null ? String(task.quantity) : "",
@@ -301,6 +306,25 @@ function fromDateInput(value: string) {
 }
 function quantityFromInput(value: string) { const parsed = Number(value); return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined; }
 function frequencyLabel(value?: Frequency) { return frequencies.find((frequency) => frequency.value === value)?.label ?? "—"; }
+const shortMonthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const longMonthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+function ordinalDay(day: number) {
+  const suffix = day % 10 === 1 && day !== 11 ? "st" : day % 10 === 2 && day !== 12 ? "nd" : day % 10 === 3 && day !== 13 ? "rd" : "th";
+  return `${day}${suffix}`;
+}
+const cycleEndDayOptions = [
+  { value: String(LAST_DAY_OF_MONTH), label: "Last day" },
+  ...Array.from({ length: MAX_FIXED_CYCLE_END_DAY }, (_, index) => ({ value: String(index + 1), label: ordinalDay(index + 1) })),
+];
+function cycleEndMonthOptions(recurrence: CycleEndRecurrence) {
+  return cycleEndMonthGroups(recurrence).map((group) => ({
+    value: String(group.month),
+    label: group.months.length === 1 ? longMonthNames[group.month - 1] : group.months.map((month) => shortMonthNames[month - 1]).join(group.months.length === 2 ? " & " : ", "),
+  }));
+}
+function calendarDateLabel(date: CalendarDate) {
+  return formatDateOnly(new Date(date.year, date.month - 1, date.day), "short");
+}
 function priorityLabel(value?: Priority) { return value ? value[0].toUpperCase() + value.slice(1) : "—"; }
 function statusText(task: any) { return typeof task.state === "string" ? task.state : task.state?.status ?? "Pending"; }
 function rawStatus(task: any): ManualStatus | "overdue" | "paused" | "awaiting_confirmation" { return task.state?.rawStatus ?? (statusText(task) === "Completed" ? "completed" : statusText(task) === "In Progress" ? "in_progress" : statusText(task) === "Awaiting confirmation" ? "awaiting_confirmation" : statusText(task) === "Overdue" ? "overdue" : statusText(task) === "Pending" ? "due" : "due"); }
@@ -1104,7 +1128,7 @@ function AwaitingConfirmationTable({
   );
 }
 
-function SelectPicker<T extends string>({ ariaLabel, value, options, onChange, placeholder = "Select", required = false }: { ariaLabel: string; required?: boolean; value: T; options: { value: T; label: string; helper?: string }[]; onChange: (value: T) => void; placeholder?: string }) {
+function SelectPicker<T extends string>({ ariaLabel, value, options, onChange, placeholder = "Select", required = false, menuClassName }: { ariaLabel: string; required?: boolean; value: T; options: { value: T; label: string; helper?: string }[]; onChange: (value: T) => void; placeholder?: string; menuClassName?: string }) {
   const selectedOption = options.find((option) => option.value === value);
   return (
     <DropdownMenu.Root>
@@ -1115,7 +1139,7 @@ function SelectPicker<T extends string>({ ariaLabel, value, options, onChange, p
         </button>
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
-        <DropdownMenu.Content align="start" sideOffset={6} className="task-menu w-[var(--radix-dropdown-menu-trigger-width)]" aria-label={ariaLabel}>
+        <DropdownMenu.Content align="start" sideOffset={6} className={cn("task-menu w-[var(--radix-dropdown-menu-trigger-width)]", menuClassName)} aria-label={ariaLabel}>
           {options.map((option) => (
             <DropdownMenu.Item key={option.value} onSelect={() => onChange(option.value)} className="task-menu-item">
               <span className="min-w-0 flex-1">
@@ -1128,6 +1152,37 @@ function SelectPicker<T extends string>({ ariaLabel, value, options, onChange, p
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
+  );
+}
+
+/**
+ * When a month-based JD task's cycles end. Months are offered per grid (a
+ * quarterly task picks "Mar, Jun, Sep, Dec"), and the line below shows the
+ * cycle the choice puts today in. Without `onChange` it only describes.
+ */
+function CycleEndPicker({ recurrence, value, onChange }: { recurrence: CycleEndRecurrence; value: number | null | undefined; onChange?: (value: number) => void }) {
+  const monthDay = normalizeCycleEnd(recurrence, value ?? undefined) ?? DEFAULT_CYCLE_END;
+  const month = cycleEndMonth(monthDay);
+  const day = cycleEndDay(monthDay);
+  const now = new Date();
+  const cycle = cycleDatesContaining(recurrence, monthDay, { year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate() });
+  const scrollingMenu = "max-h-[min(320px,var(--radix-dropdown-menu-content-available-height))] overflow-y-auto";
+  const dayLabel = cycleEndDayOptions.find((option) => option.value === String(day))?.label;
+  const monthLabel = recurrence === "monthly" ? "each month" : cycleEndMonthOptions(recurrence).find((option) => option.value === String(month))?.label;
+  return (
+    <div className="min-w-0">
+      {!onChange ? <span>{dayLabel} of {monthLabel}</span> : <div className="flex min-w-0 items-center gap-1">
+        {recurrence !== "monthly" && (
+          <div className="min-w-0 flex-1">
+            <SelectPicker ariaLabel="Cycle end month" value={String(month)} options={cycleEndMonthOptions(recurrence)} onChange={(next) => onChange(Number(next) * 100 + day)} menuClassName={scrollingMenu} />
+          </div>
+        )}
+        <div className={recurrence === "monthly" ? "min-w-0 flex-1" : "w-32 shrink-0"}>
+          <SelectPicker ariaLabel="Cycle end day" value={String(day)} options={cycleEndDayOptions} onChange={(next) => onChange(month * 100 + Number(next))} menuClassName={scrollingMenu} />
+        </div>
+      </div>}
+      <p className={cn("text-[12px] text-[var(--ink-muted)]", onChange && "px-2")}>Current cycle: {calendarDateLabel(cycle.start)} – {calendarDateLabel(cycle.end)}</p>
+    </div>
   );
 }
 
@@ -1871,8 +1926,12 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
       const confirmerMembershipId = values.confirmationRequired ? confirmerId as Id<"companyMemberships"> : null;
       const common = { companyId: activeCompanyId, title: values.title.trim(), description: values.description, notes: values.notes, time: values.time, quantity: quantityFromInput(values.quantity), evidenceRequired: values.evidenceRequired, confirmerMembershipId, assigneeMembershipIds: values.assigneeMembershipIds as Id<"companyMemberships">[] };
       if (kind === "jd") {
-        if (mode === "create") taskId = await createJd({ ...common, recurrence: values.recurrence });
-        else await updateJd({ ...common, taskId: task._id, recurrence: values.recurrence });
+        // An edit that leaves the schedule alone omits the cycle end, so a
+        // dialog opened earlier never undoes someone else's newer choice.
+        const scheduleTouched = mode === "create" || values.recurrence !== task.recurrence || values.cycleEndMonthDay !== (task.cycleEndMonthDay ?? null);
+        const schedule = { recurrence: values.recurrence, cycleEndMonthDay: !scheduleTouched ? undefined : hasCycleEnd(values.recurrence) ? values.cycleEndMonthDay : null };
+        if (mode === "create") taskId = await createJd({ ...common, ...schedule });
+        else await updateJd({ ...common, taskId: task._id, ...schedule });
       } else {
         const payload = { ...common, dueDate: fromDateInput(values.dueDate), priority: values.priority };
         if (mode === "create") taskId = await createOne(payload);
@@ -1923,10 +1982,18 @@ function TaskDialog({ kind, mode, open, onOpenChange, task, assignable, assignab
                   }} companyId={activeCompanyId ?? undefined} kind={kind} required={mode === "create"} /></div>
                 </div>
                 {kind === "jd" ? (
-                  <div className="grid grid-cols-[120px_1fr] items-center gap-3 py-2">
-                    <span className="text-[13px] text-[var(--ink-muted)]">Frequency{mode === "create" && <RequiredIndicator />}</span>
-                    <div className="min-w-0"><SelectPicker ariaLabel="Frequency" required={mode === "create"} value={values.recurrence} options={frequencies} onChange={(recurrence) => patch({ recurrence })} /></div>
-                  </div>
+                  <>
+                    <div className="grid grid-cols-[120px_1fr] items-center gap-3 py-2">
+                      <span className="text-[13px] text-[var(--ink-muted)]">Frequency{mode === "create" && <RequiredIndicator />}</span>
+                      <div className="min-w-0"><SelectPicker ariaLabel="Frequency" required={mode === "create"} value={values.recurrence} options={frequencies} onChange={(recurrence) => patch({ recurrence })} /></div>
+                    </div>
+                    {hasCycleEnd(values.recurrence) && (
+                      <div className="grid grid-cols-[120px_1fr] items-start gap-3 py-2">
+                        <span className="pt-2 text-[13px] text-[var(--ink-muted)]">Cycle ends</span>
+                        <CycleEndPicker recurrence={values.recurrence} value={values.cycleEndMonthDay} onChange={(cycleEndMonthDay) => patch({ cycleEndMonthDay })} />
+                      </div>
+                    )}
+                  </>
                 ) : (
                   <>
                     <div className="grid grid-cols-[120px_1fr] items-center gap-3 py-2">
@@ -3494,6 +3561,7 @@ function TaskDetailContent({ kind, id }: { kind: Kind; id: string }) {
           time: patch.time,
           quantity: patch.quantity !== undefined ? quantityFromInput(patch.quantity) ?? null : undefined,
           recurrence: patch.recurrence,
+          cycleEndMonthDay: patch.cycleEndMonthDay,
           assigneeMembershipIds: patch.assigneeMembershipIds as Id<"companyMemberships">[] | undefined,
         });
       } else {
@@ -3648,13 +3716,20 @@ function TaskDetailContent({ kind, id }: { kind: Kind; id: string }) {
             <StatusBadge kind={kind} task={task} size="md" canUpdateOverride={canEdit} cellTrigger={canEdit} />
           </PropertyRow>
           {kind === "jd" ? (
-            <PropertyRow icon={<FrequencyIcon className="h-3.5 w-3.5" />} label="Frequency">
-              {canEdit ? (
-                <InlineSelectCell value={task.recurrence as Frequency} options={frequencies} ariaLabel="Change frequency" pending={fieldPending("frequency")} onSave={(recurrence) => saveTaskField({ recurrence }, "frequency")} />
-              ) : (
-                <span className="inline-flex items-center gap-1.5">{frequencyLabel(task.recurrence)}</span>
+            <>
+              <PropertyRow icon={<FrequencyIcon className="h-3.5 w-3.5" />} label="Frequency">
+                {canEdit ? (
+                  <InlineSelectCell value={task.recurrence as Frequency} options={frequencies} ariaLabel="Change frequency" pending={fieldPending("frequency")} onSave={(recurrence) => saveTaskField({ recurrence }, "frequency")} />
+                ) : (
+                  <span className="inline-flex items-center gap-1.5">{frequencyLabel(task.recurrence)}</span>
+                )}
+              </PropertyRow>
+              {hasCycleEnd(task.recurrence) && (
+                <PropertyRow icon={<CalendarClock className="h-3.5 w-3.5" />} label="Cycle ends">
+                  <CycleEndPicker recurrence={task.recurrence} value={task.cycleEndMonthDay} onChange={canEdit ? (cycleEndMonthDay) => { void saveTaskField({ cycleEndMonthDay }, "cycle end"); } : undefined} />
+                </PropertyRow>
               )}
-            </PropertyRow>
+            </>
           ) : (
             <PropertyRow icon={<Flag className="h-3.5 w-3.5" />} label="Priority">
               {canEdit ? (

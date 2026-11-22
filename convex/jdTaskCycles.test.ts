@@ -384,6 +384,60 @@ describe("JD task cycle behavior", () => {
     expect(records).toEqual([]);
   }, 15000);
 
+  test("a yearly task can end its cycle on 30 June instead of 31 December", async () => {
+    vi.setSystemTime(utc(2026, 11, 22, 12));
+    const { t, companyId, adminMembershipId } = await seedCompany();
+
+    const taskId = await t.withIdentity(identity("admin")).mutation(api.tasks.createJd, { companyId, title: "Tax closing", recurrence: "annually", cycleEndMonthDay: 631, assigneeMembershipIds: [adminMembershipId] });
+    const detail = await t.withIdentity(identity("admin")).query(api.tasks.getJd, { companyId, taskId });
+
+    expect(detail.task.cycleEndMonthDay).toBe(631);
+    expect(detail.task.state.currentCycleStart).toBe(utc(2026, 7, 1));
+    expect(detail.task.state.currentCycleEnd).toBe(utc(2027, 7, 1));
+  });
+
+  test("moving a cycle end records the old schedule's elapsed cycles and starts the new grid", async () => {
+    vi.setSystemTime(utc(2026, 8, 10, 12));
+    const { t, companyId, adminMembershipId } = await seedCompany();
+    const admin = t.withIdentity(identity("admin"));
+    const taskId = await admin.mutation(api.tasks.createJd, { companyId, title: "Payroll", recurrence: "monthly", assigneeMembershipIds: [adminMembershipId] });
+
+    vi.setSystemTime(utc(2026, 11, 22, 12));
+    await admin.mutation(api.tasks.updateJdFields, { companyId, taskId, cycleEndMonthDay: 1225 });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    const detail = await admin.query(api.tasks.getJd, { companyId, taskId });
+    const records = await admin.query(api.tasks.listJdCycleRecords, { companyId, taskId });
+    expect(detail.task.state).toMatchObject({ rawStatus: "due", currentCycleStart: utc(2026, 10, 26), currentCycleEnd: utc(2026, 11, 26) });
+    expect(records.map((record) => [record.cycleStart, record.cycleEnd]).sort()).toEqual([
+      [utc(2026, 8, 1), utc(2026, 9, 1)],
+      [utc(2026, 9, 1), utc(2026, 10, 1)],
+      [utc(2026, 10, 1), utc(2026, 11, 1)],
+    ]);
+  });
+
+  test("changing only the frequency returns the cycle end to the calendar default", async () => {
+    vi.setSystemTime(utc(2026, 11, 22, 12));
+    const { t, companyId, adminMembershipId } = await seedCompany();
+    const admin = t.withIdentity(identity("admin"));
+    const taskId = await admin.mutation(api.tasks.createJd, { companyId, title: "Tax closing", recurrence: "annually", cycleEndMonthDay: 615, assigneeMembershipIds: [adminMembershipId] });
+
+    await admin.mutation(api.tasks.updateJdFields, { companyId, taskId, recurrence: "monthly" });
+    const detail = await admin.query(api.tasks.getJd, { companyId, taskId });
+
+    expect(detail.task.cycleEndMonthDay).toBeUndefined();
+    expect(detail.task.state).toMatchObject({ currentCycleStart: utc(2026, 11, 1), currentCycleEnd: utc(2026, 12, 1) });
+  });
+
+  test("a cycle end is refused below monthly and on days some months lack", async () => {
+    vi.setSystemTime(utc(2026, 11, 22, 12));
+    const { t, companyId, adminMembershipId } = await seedCompany();
+    const admin = t.withIdentity(identity("admin"));
+
+    await expect(admin.mutation(api.tasks.createJd, { companyId, title: "Weekly", recurrence: "weekly", cycleEndMonthDay: 1225, assigneeMembershipIds: [adminMembershipId] })).rejects.toThrow("Only monthly and longer");
+    await expect(admin.mutation(api.tasks.createJd, { companyId, title: "Monthly", recurrence: "monthly", cycleEndMonthDay: 1230, assigneeMembershipIds: [adminMembershipId] })).rejects.toThrow("1st to the 28th");
+  });
+
   test("one-time task can still become overdue", async () => {
     vi.setSystemTime(utc(2026, 6, 26, 12));
     const { t, companyId, adminMembershipId } = await seedCompany();
@@ -409,6 +463,15 @@ describe("fixed JD calendar cycle boundaries", () => {
     expect(nextJdCycleStart(utc(2026, 4, 1), "quarterly", "UTC")).toBe(utc(2026, 7, 1));
     expect(previousJdCycleStart(utc(2026, 7, 1), "quarterly", "UTC")).toBe(utc(2026, 4, 1));
     expect(currentJdCycle("annually", utc(2026, 12, 31, 23, 59), "UTC")).toEqual({ start: utc(2026, 1, 1), end: utc(2027, 1, 1) });
+  });
+
+  test("a moved cycle end keeps its day each month and clamps the last day to short months", () => {
+    // Monthly cycles closing on the 25th run from the 26th.
+    expect(currentJdCycle({ recurrence: "monthly", cycleEndMonthDay: 1225 }, utc(2026, 11, 22, 12), "UTC")).toEqual({ start: utc(2026, 10, 26), end: utc(2026, 11, 26) });
+    // Quarters closing at the end of Feb/May/Aug/Nov include a leap day.
+    expect(currentJdCycle({ recurrence: "quarterly", cycleEndMonthDay: 231 }, utc(2028, 2, 29, 12), "UTC")).toEqual({ start: utc(2027, 12, 1), end: utc(2028, 3, 1) });
+    expect(nextJdCycleStart(utc(2027, 12, 1), { recurrence: "quarterly", cycleEndMonthDay: 1131 }, "UTC")).toBe(utc(2028, 3, 1));
+    expect(previousJdCycleStart(utc(2027, 12, 1), { recurrence: "quarterly", cycleEndMonthDay: 1131 }, "UTC")).toBe(utc(2027, 9, 1));
   });
 
   test("missing company/browser time zone falls back to GMT+5", () => {

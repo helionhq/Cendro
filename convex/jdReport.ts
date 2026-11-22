@@ -3,7 +3,7 @@ import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx } from "./_generated/server";
 import { internalMutation } from "./functions";
-import { currentJdCycle, nextJdCycleStart } from "./taskCycles";
+import { currentJdCycle, nextJdCycleStart, sameJdGrid } from "./taskCycles";
 
 /**
  * Dashboard JD totals, maintained from the ledger instead of rebuilt per read.
@@ -49,7 +49,7 @@ const rebuildMonthsPerPage = 6;
  * pass every row stored at each cycle start they cover.
  */
 export function jdLedgerOutcomes(
-  task: Pick<Doc<"jdTasks">, "recurrence">,
+  task: Pick<Doc<"jdTasks">, "recurrence" | "cycleEndMonthDay">,
   timeZone: string | null,
   rows: JdLedgerRows,
 ): JdOutcome[] {
@@ -70,22 +70,22 @@ export function jdLedgerOutcomes(
   };
 
   // Legacy rows predate cycleEnd. When the stored start no longer sits on
-  // the task's grid the recurrence or timezone changed since, so the
+  // the task's grid the schedule or timezone changed since, so the
   // recorded instant is the only trustworthy point inside that cycle.
   const cycleEndAt = (storedEnd: number | undefined, start: number, fallbackAt: number) =>
     storedEnd ?? (
-      currentJdCycle(task.recurrence, start, timeZone).start === start
-        ? nextJdCycleStart(start, task.recurrence, timeZone)
+      currentJdCycle(task, start, timeZone).start === start
+        ? nextJdCycleStart(start, task, timeZone)
         : fallbackAt + 1
     );
 
-  // A request from a superseded recurrence is history, not a live hold on
+  // A request from a superseded schedule is history, not a live hold on
   // the current grid's cycle. A live request owns its cycle's dates: the
   // missed-cycle writer advances the task floor past a pending cycle
   // without recording it, so the cycle must come from the request row.
   const pendingStarts = new Set<number>();
   for (const request of rows.pending) {
-    if (request.cycleStart === undefined || request.recurrence !== task.recurrence) continue;
+    if (request.cycleStart === undefined || !sameJdGrid(request, task)) continue;
     pendingStarts.add(request.cycleStart);
     put(request.cycleStart, cycleEndAt(request.cycleEnd, request.cycleStart, request.submittedAt) - 1, false);
   }
