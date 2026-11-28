@@ -592,6 +592,31 @@ describe("task completion confirmation", () => {
     expect(evidence.page.filter((entry) => entry.retiredAt == null).map((entry) => entry.text)).toEqual(["New proof"]);
   });
 
+  test("sending back a request whose start the new schedule does not share removes its proof", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.UTC(2027, 2, 10, 12));
+    const f = await createAuthzFixture();
+    await f.t.run(async (ctx) => {
+      await ctx.db.patch(f.companyA, { timeZone: "UTC" });
+      await ctx.db.insert("companyCalendars", { companyId: f.companyA, workingDays: [0, 1, 2, 3, 4, 5, 6], updatedAt: Date.now() });
+    });
+    const admin = f.asUser("adminA");
+    const manager = f.asUser("managerA");
+    const taskId = await admin.mutation(api.tasks.createJd, { companyId: f.companyA, title: "Moved start", recurrence: "monthly", assigneeMembershipIds: [f.employee1M], confirmerMembershipId: f.managerM });
+    const storageId = await f.t.run(async (ctx) => await ctx.storage.store(new Blob(["proof"])));
+    const claimId = await f.t.run(async (ctx) => await ctx.db.insert("taskUploadClaims", { companyId: f.companyA, membershipId: f.employee1M, storageId, createdAt: Date.now() }));
+    await f.asUser("employeeA1").mutation(api.tasks.completeJd, { companyId: f.companyA, taskId, evidence: { text: "Old proof", files: [{ storageId, fileName: "proof.txt", claimId }] } });
+    const request = (await manager.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "jd" })).rows[0];
+    // Cycles now end on the 25th, so the current one starts 26 February.
+    await admin.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId, cycleEndMonthDay: 1225 });
+
+    await manager.mutation(api.tasks.sendBackTaskCompletion, { companyId: f.companyA, requestId: request._id });
+
+    const evidence = await manager.query(api.tasks.getTaskEvidence, { companyId: f.companyA, taskType: "jd", taskId, paginationOpts: { numItems: 10, cursor: null } });
+    expect(evidence.page).toEqual([]);
+    expect(await f.t.run(async (ctx) => await ctx.db.system.get("_storage", storageId))).toBeNull();
+  });
+
   test("sending back a request from a previous recurrence records its miss as retired history", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(utc(29));

@@ -23,6 +23,7 @@ import { nextReference } from "./references";
 import {
   activeTaskEvidence,
   deleteActiveTaskEvidence,
+  deleteTaskEvidence,
   deleteTaskEvidenceBatch,
   evidenceInputValidator,
   evidenceMatchesSubmission,
@@ -1532,6 +1533,7 @@ async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId:
   const previousStatus: TaskStatus = alreadyCompleted ? "completed" : task.statusCycleStart === cycle.start ? task.status : "due";
   if (status === "completed") {
     const activeEvidence = await activeTaskEvidence(ctx, "jd", taskId, cycle.start);
+    let evidenceId = activeEvidence?._id;
     if (activeEvidence) {
       // Two members can finish the same cycle from dialogs opened before
       // either saved. A retry of the recorded submission is an idempotent
@@ -1542,7 +1544,7 @@ async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId:
       }
     } else if (evidence) {
       const validated = await validateEvidenceInput(ctx, { companyId, membershipId: membership._id, evidence, now });
-      await storeTaskEvidence(ctx, { companyId, taskType: "jd", taskId, cycleStart: cycle.start, createdByMembershipId: membership._id, now, evidence: validated });
+      evidenceId = await storeTaskEvidence(ctx, { companyId, taskType: "jd", taskId, cycleStart: cycle.start, createdByMembershipId: membership._id, now, evidence: validated });
     } else if (task.evidenceRequired === true && !alreadyCompleted) {
       // Reaffirming Completed is an idempotent no-op, so enabling the flag
       // after the fact must not strand the task in an unchangeable state.
@@ -1567,6 +1569,7 @@ async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId:
           cycleEnd: occurrenceDeadline(calendar, task, cycle.end, timeZone) ?? cycle.end,
           recurrence: task.recurrence,
           cycleEndMonthDay: task.cycleEndMonthDay,
+          evidenceId,
           confirmerMembershipId: confirmer,
           submittedByMembershipId: membership._id,
           submittedAt: now,
@@ -2214,9 +2217,11 @@ export const sendBackTaskCompletion = mutation({
     const now = Date.now();
     const jdTaskId = request.taskType === "jd" ? ctx.db.normalizeId("jdTasks", request.taskId) : null;
     const jdTask = jdTaskId ? await ctx.db.get(jdTaskId) : null;
-    // A superseded grid's evidence was retired with its history; active
-    // evidence at the same start belongs to the current grid's cycle.
-    if (!jdTask || sameJdGrid(request, jdTask)) await deleteActiveTaskEvidence(ctx, request.taskType, request.taskId, request.cycleStart);
+    // The rejected proof goes, wherever a schedule change left it. Older rows
+    // without a link fall back to the cycle's active proof, which after a
+    // schedule change may be the current grid's, so they keep theirs.
+    if (request.evidenceId) await deleteTaskEvidence(ctx, request.evidenceId);
+    else if (!jdTask || sameJdGrid(request, jdTask)) await deleteActiveTaskEvidence(ctx, request.taskType, request.taskId, request.cycleStart);
     if (request.taskType === "jd") {
       const taskId = jdTaskId;
       const task = jdTask;
