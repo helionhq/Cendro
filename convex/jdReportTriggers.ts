@@ -1,7 +1,7 @@
 import type { Triggers } from "convex-helpers/server/triggers";
 import type { DataModel, Id } from "./_generated/dataModel";
 import type { MutationCtx } from "./_generated/server";
-import { currentJdCycle } from "./taskCycles";
+import { currentJdCycle, sameJdGrid } from "./taskCycles";
 
 // Kept apart from jdReport.ts: functions.ts loads these triggers before any
 // mutation module, so this file must not import one.
@@ -66,9 +66,9 @@ export function registerJdReportTriggers(triggers: Triggers<DataModel>) {
     const { oldDoc, newDoc } = change;
     // A new task has no ledger yet.
     if (!oldDoc) return;
-    // Pausing, recurrence, and assignees reshape the whole history. Status
+    // Pausing, the schedule, and assignees reshape the whole history. Status
     // changes reach the report through the ledger rows they write.
-    if (!newDoc || oldDoc.pausedAt !== newDoc.pausedAt || oldDoc.recurrence !== newDoc.recurrence || oldDoc.assigneeMembershipIds.join() !== newDoc.assigneeMembershipIds.join()) {
+    if (!newDoc || oldDoc.pausedAt !== newDoc.pausedAt || !sameJdGrid(oldDoc, newDoc) || oldDoc.assigneeMembershipIds.join() !== newDoc.assigneeMembershipIds.join()) {
       pending(ctx).tasks.add(change.id);
     }
   });

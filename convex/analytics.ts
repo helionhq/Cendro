@@ -1,7 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import { query, type QueryCtx } from "./_generated/server";
 import { analyticsScopedMembershipIds, assertAnalyticsViewAccess, buildSopVisibilityContext, requireMembership, sopListScopeAuth, taskHasVisibleAssignee, visibleAssigneeMembershipIds, visibleSop } from "./permissions";
-import { currentJdCycle, jdRecurrences, localDateField, localDayIndexAt, type JdRecurrence } from "./taskCycles";
+import { currentJdCycle, jdRecurrences, localDateField, localDayIndexAt, sameJdGrid, type JdRecurrence } from "./taskCycles";
 import { jdOccurrencesDueBetween, effectiveCurrentJdCycle, loadWorkCalendar, maxHolidaySpanDays, occurrenceDeadline } from "./workCalendar";
 import { bucketIndexFor, dashboardPeriodValidator, resolveDashboardPeriod, type DashboardPeriod } from "./dashboardTime";
 import type { Doc, Id } from "./_generated/dataModel";
@@ -486,7 +486,7 @@ export const dashboard = query({
     // already has a row; the completion stamp's cycle is counted in the totals.
     const unrecordedJdItems: JdItem[] = [];
     await mapInWaves(visibleJdTasks, async ({ task, assignees }) => {
-      const elapsed = jdOccurrencesDueBetween(calendar, task.recurrence, task.cycleStartedAt, now, windowStart, windowEnd, 200, timeZone);
+      const elapsed = jdOccurrencesDueBetween(calendar, task, task.cycleStartedAt, now, windowStart, windowEnd, 200, timeZone);
       if (elapsed.truncated) completeness.isTruncated = true;
       const candidates = elapsed.occurrences.filter((cycle) => cycle.deadline - 1 < now && !(task.status === "completed" && task.statusCycleStart === cycle.start));
       if (candidates.length === 0) return;
@@ -512,7 +512,7 @@ export const dashboard = query({
       }
       const recorded = new Set<number>();
       for (const row of [...completions, ...missed]) if (row.retiredAt === undefined) recorded.add(row.cycleStart);
-      for (const request of pending) if (request.cycleStart !== undefined && request.recurrence === task.recurrence) recorded.add(request.cycleStart);
+      for (const request of pending) if (request.cycleStart !== undefined && sameJdGrid(request, task)) recorded.add(request.cycleStart);
       for (const cycle of candidates) {
         if (recorded.has(cycle.start)) continue;
         unrecordedJdItems.push({ taskId: task._id, title: task.title, reference: task.reference, recurrence: task.recurrence, at: cycle.deadline - 1, status: "missed", assigneeIds: assignees });
@@ -529,9 +529,9 @@ export const dashboard = query({
     const upcomingByRecurrence = new Map<JdRecurrence, number[]>();
     if (period.isCurrent) {
       for (const { task } of visibleJdTasks) {
-        const open = effectiveCurrentJdCycle(calendar, task.recurrence, now, timeZone);
-        const openDeadline = occurrenceDeadline(calendar, task.recurrence, open.end, timeZone);
-        if (openDeadline === null || open.start < currentJdCycle(task.recurrence, task.cycleStartedAt, timeZone).start) continue;
+        const open = effectiveCurrentJdCycle(calendar, task, now, timeZone);
+        const openDeadline = occurrenceDeadline(calendar, task, open.end, timeZone);
+        if (openDeadline === null || open.start < currentJdCycle(task, task.cycleStartedAt, timeZone).start) continue;
         if (task.statusCycleStart === open.start && (task.status === "completed" || task.status === "awaiting_confirmation")) continue;
         const deadline = openDeadline - 1;
         if (now <= deadline && deadline <= period.end) upcomingByRecurrence.set(task.recurrence, [...(upcomingByRecurrence.get(task.recurrence) ?? []), deadline]);

@@ -1,7 +1,26 @@
+import { cycleDatesContaining, hasCycleEnd, type CycleEndRecurrence } from "../src/lib/jd-cycle-end";
+
 export const jdRecurrences = ["daily", "every_other_day", "weekly", "semimonthly", "monthly", "quarterly", "semiannually", "annually"] as const;
 export type JdRecurrence = (typeof jdRecurrences)[number];
 
 export type JdCycle = { start: number; end: number };
+
+/**
+ * A task's cycle grid: its frequency plus, for month-based frequencies, the
+ * day its cycles end (see src/lib/jd-cycle-end.ts). Two schedules share
+ * cycles only when both parts match.
+ */
+export type JdSchedule = { recurrence: JdRecurrence; cycleEndMonthDay?: number };
+/** A bare recurrence is its calendar-aligned schedule. */
+export type JdGrid = JdRecurrence | JdSchedule;
+
+export function jdSchedule(grid: JdGrid): JdSchedule {
+  return typeof grid === "string" ? { recurrence: grid } : grid;
+}
+
+export function sameJdGrid(a: { recurrence: JdRecurrence | null; cycleEndMonthDay?: number }, b: JdSchedule) {
+  return a.recurrence === b.recurrence && a.cycleEndMonthDay === b.cycleEndMonthDay;
+}
 
 export const defaultTimeZone = "Etc/GMT-5"; // GMT+5 fallback when the browser/company timezone is unavailable.
 
@@ -110,82 +129,61 @@ export function localDateField(ms: number, timeZone?: string | null) {
   return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 }
 
-export function nextJdCycleStart(start: number, recurrence: JdRecurrence, timeZone?: string | null) {
+/** The month-based cycle containing `at`, as local calendar dates (end inclusive). */
+function cycleDatesAt(recurrence: CycleEndRecurrence, cycleEndMonthDay: number | undefined, at: number, zone: string) {
+  return cycleDatesContaining(recurrence, cycleEndMonthDay, localParts(at, zone));
+}
+
+/** `start` must be a cycle start on the grid. */
+export function nextJdCycleStart(start: number, grid: JdGrid, timeZone?: string | null) {
   const zone = timeZoneOrDefault(timeZone);
+  const { recurrence, cycleEndMonthDay } = jdSchedule(grid);
+  if (hasCycleEnd(recurrence)) return boundaryUtc(zone, localDateAdd(cycleDatesAt(recurrence, cycleEndMonthDay, start, zone).end, 1));
   const parts = localParts(start, zone);
   switch (recurrence) {
     case "daily": return boundaryUtc(zone, localDateAdd(parts, 1));
     case "every_other_day": return boundaryUtc(zone, localDateAdd(parts, 2));
     case "weekly": return boundaryUtc(zone, localDateAdd(parts, 7));
     case "semimonthly": return boundaryUtc(zone, parts.day === 1 ? { year: parts.year, month: parts.month, day: 16 } : { ...localMonthAdd(parts, 1), day: 1 });
-    case "monthly": return boundaryUtc(zone, localMonthAdd(parts, 1));
-    case "quarterly": return boundaryUtc(zone, localMonthAdd(parts, 3));
-    case "semiannually": return boundaryUtc(zone, localMonthAdd(parts, 6));
-    case "annually": return boundaryUtc(zone, localMonthAdd(parts, 12));
   }
 }
 
-export function previousJdCycleStart(start: number, recurrence: JdRecurrence, timeZone?: string | null) {
+/** `start` must be a cycle start on the grid. */
+export function previousJdCycleStart(start: number, grid: JdGrid, timeZone?: string | null) {
   const zone = timeZoneOrDefault(timeZone);
+  const { recurrence, cycleEndMonthDay } = jdSchedule(grid);
+  if (hasCycleEnd(recurrence)) return boundaryUtc(zone, cycleDatesAt(recurrence, cycleEndMonthDay, start - 1, zone).start);
   const parts = localParts(start, zone);
   switch (recurrence) {
     case "daily": return boundaryUtc(zone, localDateAdd(parts, -1));
     case "every_other_day": return boundaryUtc(zone, localDateAdd(parts, -2));
     case "weekly": return boundaryUtc(zone, localDateAdd(parts, -7));
     case "semimonthly": return boundaryUtc(zone, parts.day === 1 ? { ...localMonthAdd(parts, -1), day: 16 } : { year: parts.year, month: parts.month, day: 1 });
-    case "monthly": return boundaryUtc(zone, localMonthAdd(parts, -1));
-    case "quarterly": return boundaryUtc(zone, localMonthAdd(parts, -3));
-    case "semiannually": return boundaryUtc(zone, localMonthAdd(parts, -6));
-    case "annually": return boundaryUtc(zone, localMonthAdd(parts, -12));
   }
 }
 
-export function currentJdCycle(recurrence: JdRecurrence, now = Date.now(), timeZone?: string | null): JdCycle {
+export function currentJdCycle(grid: JdGrid, now = Date.now(), timeZone?: string | null): JdCycle {
   const zone = timeZoneOrDefault(timeZone);
-  const parts = localParts(now, zone);
-  switch (recurrence) {
-    case "daily": {
-      const start = boundaryUtc(zone, parts);
-      return { start, end: nextJdCycleStart(start, recurrence, zone) };
-    }
-    case "every_other_day": {
-      const dayIndex = localDayIndex(parts);
-      const startParts = localDateFromDayIndex(floorDiv(dayIndex, 2) * 2);
-      const start = boundaryUtc(zone, startParts);
-      return { start, end: nextJdCycleStart(start, recurrence, zone) };
-    }
-    case "weekly": {
-      const dayIndex = localDayIndex(parts);
-      const startParts = localDateFromDayIndex(mondayAnchorDay + floorDiv(dayIndex - mondayAnchorDay, 7) * 7);
-      const start = boundaryUtc(zone, startParts);
-      return { start, end: nextJdCycleStart(start, recurrence, zone) };
-    }
-    case "semimonthly": {
-      const start = boundaryUtc(zone, { year: parts.year, month: parts.month, day: parts.day < 16 ? 1 : 16 });
-      return { start, end: nextJdCycleStart(start, recurrence, zone) };
-    }
-    case "monthly": {
-      const start = boundaryUtc(zone, { year: parts.year, month: parts.month, day: 1 });
-      return { start, end: nextJdCycleStart(start, recurrence, zone) };
-    }
-    case "quarterly": {
-      const start = boundaryUtc(zone, { year: parts.year, month: Math.floor((parts.month - 1) / 3) * 3 + 1, day: 1 });
-      return { start, end: nextJdCycleStart(start, recurrence, zone) };
-    }
-    case "semiannually": {
-      const start = boundaryUtc(zone, { year: parts.year, month: parts.month < 7 ? 1 : 7, day: 1 });
-      return { start, end: nextJdCycleStart(start, recurrence, zone) };
-    }
-    case "annually": {
-      const start = boundaryUtc(zone, { year: parts.year, month: 1, day: 1 });
-      return { start, end: nextJdCycleStart(start, recurrence, zone) };
-    }
+  const { recurrence, cycleEndMonthDay } = jdSchedule(grid);
+  if (hasCycleEnd(recurrence)) {
+    const dates = cycleDatesAt(recurrence, cycleEndMonthDay, now, zone);
+    return { start: boundaryUtc(zone, dates.start), end: boundaryUtc(zone, localDateAdd(dates.end, 1)) };
   }
+  const parts = localParts(now, zone);
+  let startParts: { year: number; month: number; day: number };
+  switch (recurrence) {
+    case "daily": startParts = parts; break;
+    case "every_other_day": startParts = localDateFromDayIndex(floorDiv(localDayIndex(parts), 2) * 2); break;
+    case "weekly": startParts = localDateFromDayIndex(mondayAnchorDay + floorDiv(localDayIndex(parts) - mondayAnchorDay, 7) * 7); break;
+    case "semimonthly": startParts = { year: parts.year, month: parts.month, day: parts.day < 16 ? 1 : 16 }; break;
+  }
+  const start = boundaryUtc(zone, startParts);
+  return { start, end: nextJdCycleStart(start, recurrence, zone) };
 }
 
-export function previousJdCycle(recurrence: JdRecurrence, now = Date.now(), timeZone?: string | null): JdCycle {
-  const current = currentJdCycle(recurrence, now, timeZone);
-  const start = previousJdCycleStart(current.start, recurrence, timeZone);
+export function previousJdCycle(grid: JdGrid, now = Date.now(), timeZone?: string | null): JdCycle {
+  const current = currentJdCycle(grid, now, timeZone);
+  const start = previousJdCycleStart(current.start, grid, timeZone);
   return { start, end: current.start };
 }
 

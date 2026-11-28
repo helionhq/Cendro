@@ -162,6 +162,7 @@ export async function storeTaskEvidence(
   for (const claimId of new Set(args.evidence.files.map((file) => file.claimId))) {
     await ctx.db.delete(claimId);
   }
+  return evidenceId;
 }
 
 /** The submitted evidence for a JD cycle, or for a one-time task's completion. */
@@ -240,6 +241,12 @@ export async function deleteActiveTaskEvidence(
       .filter((q) => q.and(q.eq(q.field("retiredAt"), undefined), q.eq(q.field("cycleStart"), undefined)))
       .take(ACTIVE_EVIDENCE_LIMIT);
   for (const row of rows) await deleteEvidenceRow(ctx, row);
+}
+
+/** Removes one submission's evidence, whether still active or already retired. */
+export async function deleteTaskEvidence(ctx: MutationCtx, evidenceId: Id<"taskEvidence">) {
+  const row = await ctx.db.get(evidenceId);
+  if (row) await deleteEvidenceRow(ctx, row);
 }
 
 /** Deletes one bounded batch of a task's evidence rows and their blobs. */

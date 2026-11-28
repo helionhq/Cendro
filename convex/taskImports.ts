@@ -6,8 +6,8 @@ import type { Doc, Id } from "./_generated/dataModel";
 import { canChangeTaskConfirmer, getManagedMembershipIds, hasAllManagedMemberships, isManagedMembership, membershipCapabilities, requireCapability } from "./permissions";
 import type { Capability } from "../src/lib/permissions";
 import { effectiveCurrentJdCycle, elapsedJdOccurrences, loadWorkCalendar } from "./workCalendar";
-import { defaultTimeZone } from "./taskCycles";
-import { applyConfirmerChange, assertConfirmerInCompany, canManageJdLifecycle, preserveJdCompletionStamp, reconcileOneTimeOverdue, recordMissedJdCycles, retireJdHistoryAtCycle, transitionJdTaskActiveState, type TaskVisibilityAuth } from "./tasks";
+import { defaultTimeZone, sameJdGrid } from "./taskCycles";
+import { applyConfirmerChange, applyJdSchedule, assertConfirmerInCompany, canManageJdLifecycle, preserveJdCompletionStamp, reconcileOneTimeOverdue, recordMissedJdCycles, requestedJdSchedule, retireJdHistoryAtCycle, transitionJdTaskActiveState, type TaskVisibilityAuth } from "./tasks";
 import { syncReferenceCounter } from "./references";
 import { normalizeEmail, nonEmpty } from "./validation";
 
@@ -487,7 +487,7 @@ export const previewTaskImport = mutation({
       if (operation === "create" && !draft.title?.trim()) errors.push("Title is required for new tasks.");
       if (operation === "create" && args.kind === "jd" && !draft.recurrence) errors.push("Frequency is required for new JD tasks.");
       if (operation === "create" && args.kind === "one_time" && !draft.priority) errors.push("Priority is required for new one-time tasks.");
-      if (args.kind === "jd" && task && draft.recurrence && draft.recurrence !== (task as Doc<"jdTasks">).recurrence) warnings.push("Changing recurrence resets the active JD cycle and status.");
+      if (args.kind === "jd" && task && draft.recurrence && draft.recurrence !== (task as Doc<"jdTasks">).recurrence) warnings.push((task as Doc<"jdTasks">).cycleEndMonthDay === undefined ? "Changing recurrence resets the active JD cycle and status." : "Changing recurrence resets the active JD cycle and status, and its cycle end returns to the calendar default.");
       if (args.kind === "jd" && (operation === "update" || operation === "create")) {
         // Authorize the lifecycle change against the post-import assignees so a
         // combined reassign + lifecycle row cannot slip out of a managed scope.
@@ -610,7 +610,7 @@ export const commitTaskImportBatch = mutation({
       estimatedLookups += FIXED_LOOKUPS_PER_ROW;
       const task = args.kind === "jd" ? item.task as Doc<"jdTasks"> | null : null;
       if (task && task.pausedAt === undefined) {
-        estimatedLookups += 3 * elapsedJdOccurrences(calendar, task.recurrence, task.cycleStartedAt, estimateNow, 200, company.timeZone).occurrences.length;
+        estimatedLookups += 3 * elapsedJdOccurrences(calendar, task, task.cycleStartedAt, estimateNow, 200, company.timeZone).occurrences.length;
       }
       if (estimatedLookups > MAX_COMMIT_LOOKUPS) fail("This file needs more work than one import can process. Split it into smaller files and import each.");
     }
@@ -623,9 +623,10 @@ export const commitTaskImportBatch = mutation({
       if (item.task) {
         if (args.kind === "jd") {
           const task = item.task as Doc<"jdTasks">;
-          const recurrence = hasField(item.draft, "recurrence") && item.draft.recurrence ? item.draft.recurrence : task.recurrence;
-          const currentCycle = effectiveCurrentJdCycle(calendar, recurrence, now, company.timeZone);
-          const nextCycleStart = recurrence !== task.recurrence ? currentCycle.start : undefined;
+          // Imports carry no cycle end: the task keeps its own unless the frequency changes.
+          const schedule = requestedJdSchedule(task, hasField(item.draft, "recurrence") && item.draft.recurrence ? item.draft.recurrence : task.recurrence, undefined);
+          const currentCycle = effectiveCurrentJdCycle(calendar, schedule, now, company.timeZone);
+          const nextCycleStart = !sameJdGrid(task, schedule) ? currentCycle.start : undefined;
           await recordMissedJdCycles(ctx, task, now, company.timeZone, calendar);
           const rolled = await ctx.db.get(task._id);
           if (!rolled) fail("One or more import rows became unavailable. Re-preview and try again.");
@@ -653,7 +654,7 @@ export const commitTaskImportBatch = mutation({
             if (item.draft.quantity === null || item.draft.quantity === undefined) delete nextTask.quantity;
             else nextTask.quantity = item.draft.quantity;
           }
-          if (hasField(item.draft, "recurrence") && item.draft.recurrence) nextTask.recurrence = item.draft.recurrence;
+          applyJdSchedule(nextTask, schedule);
           if (item.assigneePatchRequested) nextTask.assigneeMembershipIds = item.assigneeMembershipIds;
           if (hasField(item.draft, "evidenceRequired")) {
             if (item.draft.evidenceRequired === true) nextTask.evidenceRequired = true;

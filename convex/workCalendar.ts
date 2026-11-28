@@ -3,7 +3,7 @@ import { query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { internalMutation, mutation } from "./functions";
 import { internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
-import { currentJdCycle, localDayBoundaryUtc, localDayIndexAt, nextJdCycleStart, previousJdCycleStart, timeZoneOrDefault, type JdRecurrence } from "./taskCycles";
+import { currentJdCycle, jdSchedule, localDayBoundaryUtc, localDayIndexAt, nextJdCycleStart, previousJdCycleStart, timeZoneOrDefault, type JdGrid } from "./taskCycles";
 import { requireCapability, requireMembership } from "./permissions";
 import { companyManagementCapabilities, type Capability } from "../src/lib/permissions";
 import { nonEmpty } from "./validation";
@@ -181,10 +181,11 @@ export function cycleDueDayIndex(cycleEnd: number, timeZone?: string | null) {
  * non-working due date moves the deadline to the end of the next working day;
  * the recurrence grid itself never moves.
  */
-export function occurrenceDeadline(calendar: WorkCalendar, recurrence: JdRecurrence, cycleEnd: number, timeZone?: string | null): number | null {
+export function occurrenceDeadline(calendar: WorkCalendar, grid: JdGrid, cycleEnd: number, timeZone?: string | null): number | null {
   const zone = timeZoneOrDefault(timeZone);
   const dueIndex = cycleDueDayIndex(cycleEnd, zone);
   if (isWorkingDayIndex(calendar, dueIndex)) return cycleEnd;
+  const { recurrence } = jdSchedule(grid);
   if (recurrence === "daily" || recurrence === "every_other_day") return null;
   return localDayBoundaryUtc(nextWorkingDayIndex(calendar, dueIndex) + 1, zone);
 }
@@ -198,23 +199,23 @@ export function occurrenceDeadline(calendar: WorkCalendar, recurrence: JdRecurre
  * non-working due dates, so completing on a skipped day counts toward the
  * next working occurrence.
  */
-export function effectiveCurrentJdCycle(calendar: WorkCalendar, recurrence: JdRecurrence, now = Date.now(), timeZone?: string | null) {
-  const cycle = currentJdCycle(recurrence, now, timeZone);
+export function effectiveCurrentJdCycle(calendar: WorkCalendar, grid: JdGrid, now = Date.now(), timeZone?: string | null) {
+  const cycle = currentJdCycle(grid, now, timeZone);
   // A cycle ends where the next begins, so the deadline of the occurrence
   // ending at `start` decides whether that predecessor is still open. Skipped
   // (null) and on-time (<= now) predecessors always yield to a later one.
   let start = cycle.start;
   for (let i = 0; i < WORKING_DAY_SCAN_LIMIT; i++) {
-    const prevDeadline = occurrenceDeadline(calendar, recurrence, start, timeZone);
+    const prevDeadline = occurrenceDeadline(calendar, grid, start, timeZone);
     if (prevDeadline === null || prevDeadline <= now) break;
-    start = previousJdCycleStart(start, recurrence, timeZone);
+    start = previousJdCycleStart(start, grid, timeZone);
   }
-  if (start !== cycle.start) return { start, end: nextJdCycleStart(start, recurrence, timeZone) };
-  if (occurrenceDeadline(calendar, recurrence, cycle.end, timeZone) !== null) return cycle;
+  if (start !== cycle.start) return { start, end: nextJdCycleStart(start, grid, timeZone) };
+  if (occurrenceDeadline(calendar, grid, cycle.end, timeZone) !== null) return cycle;
   for (let i = 0; i < WORKING_DAY_SCAN_LIMIT; i++) {
-    start = nextJdCycleStart(start, recurrence, timeZone);
-    const end = nextJdCycleStart(start, recurrence, timeZone);
-    if (occurrenceDeadline(calendar, recurrence, end, timeZone) !== null) return { start, end };
+    start = nextJdCycleStart(start, grid, timeZone);
+    const end = nextJdCycleStart(start, grid, timeZone);
+    if (occurrenceDeadline(calendar, grid, end, timeZone) !== null) return { start, end };
   }
   return cycle;
 }
@@ -228,17 +229,17 @@ export type JdOccurrence = { start: number; end: number; deadline: number };
  * longer needs to revisit — it stops at a pending shifted deadline so that
  * cycle is re-evaluated on the next run rather than silently dropped.
  */
-export function elapsedJdOccurrences(calendar: WorkCalendar, recurrence: JdRecurrence, activeAt: number, now = Date.now(), maxCycles = 200, timeZone?: string | null, throughStart?: number): { occurrences: JdOccurrence[]; nextActiveAt: number } {
+export function elapsedJdOccurrences(calendar: WorkCalendar, grid: JdGrid, activeAt: number, now = Date.now(), maxCycles = 200, timeZone?: string | null, throughStart?: number): { occurrences: JdOccurrence[]; nextActiveAt: number } {
   // `throughStart` bounds the walk to cycles that started before it; callers
   // replaying a past schedule pass the grid position where that schedule
   // stopped so cycles it never covered are not re-evaluated.
-  const currentStart = throughStart ?? currentJdCycle(recurrence, now, timeZone).start;
-  let start = currentJdCycle(recurrence, activeAt, timeZone).start;
+  const currentStart = throughStart ?? currentJdCycle(grid, now, timeZone).start;
+  let start = currentJdCycle(grid, activeAt, timeZone).start;
   const occurrences: JdOccurrence[] = [];
   while (start < currentStart && occurrences.length < maxCycles) {
-    const end = nextJdCycleStart(start, recurrence, timeZone);
+    const end = nextJdCycleStart(start, grid, timeZone);
     if (end <= now) {
-      const deadline = occurrenceDeadline(calendar, recurrence, end, timeZone);
+      const deadline = occurrenceDeadline(calendar, grid, end, timeZone);
       if (deadline !== null && deadline <= now) occurrences.push({ start, end, deadline });
       else if (deadline !== null) return { occurrences, nextActiveAt: start };
     }
@@ -253,16 +254,16 @@ export function elapsedJdOccurrences(calendar: WorkCalendar, recurrence: JdRecur
  * recent deadlines past `maxCycles`. Stored deadlines are monotonic along the grid,
  * so the walk stops once a cycle's deadline precedes the range.
  */
-export function jdOccurrencesDueBetween(calendar: WorkCalendar, recurrence: JdRecurrence, activeAt: number, now: number, rangeStart: number, rangeEnd: number, maxCycles = 200, timeZone?: string | null): { occurrences: JdOccurrence[]; truncated: boolean } {
-  const current = currentJdCycle(recurrence, now, timeZone);
-  const floor = currentJdCycle(recurrence, activeAt, timeZone).start;
+export function jdOccurrencesDueBetween(calendar: WorkCalendar, grid: JdGrid, activeAt: number, now: number, rangeStart: number, rangeEnd: number, maxCycles = 200, timeZone?: string | null): { occurrences: JdOccurrence[]; truncated: boolean } {
+  const current = currentJdCycle(grid, now, timeZone);
+  const floor = currentJdCycle(grid, activeAt, timeZone).start;
   const occurrences: JdOccurrence[] = [];
   let truncated = false;
   let end = current.start;
   while (end > floor) {
-    const start = previousJdCycleStart(end, recurrence, timeZone);
+    const start = previousJdCycleStart(end, grid, timeZone);
     if (start < floor) break;
-    const deadline = occurrenceDeadline(calendar, recurrence, end, timeZone);
+    const deadline = occurrenceDeadline(calendar, grid, end, timeZone);
     // A skipped occurrence has no deadline; probe with its grid end, which is
     // still monotonic — once it precedes the range, earlier cycles cannot
     // reach back into it.
