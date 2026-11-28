@@ -592,7 +592,10 @@ describe("task completion confirmation", () => {
     expect(evidence.page.filter((entry) => entry.retiredAt == null).map((entry) => entry.text)).toEqual(["New proof"]);
   });
 
-  test("sending back a request whose start the new schedule does not share removes its proof", async () => {
+  test.each([
+    ["sent with the submission", false],
+    ["added by a retry", true],
+  ])("sending back a request whose start the new schedule does not share removes its proof %s", async (_, addedByRetry) => {
     vi.useFakeTimers();
     vi.setSystemTime(Date.UTC(2027, 2, 10, 12));
     const f = await createAuthzFixture();
@@ -605,7 +608,9 @@ describe("task completion confirmation", () => {
     const taskId = await admin.mutation(api.tasks.createJd, { companyId: f.companyA, title: "Moved start", recurrence: "monthly", assigneeMembershipIds: [f.employee1M], confirmerMembershipId: f.managerM });
     const storageId = await f.t.run(async (ctx) => await ctx.storage.store(new Blob(["proof"])));
     const claimId = await f.t.run(async (ctx) => await ctx.db.insert("taskUploadClaims", { companyId: f.companyA, membershipId: f.employee1M, storageId, createdAt: Date.now() }));
-    await f.asUser("employeeA1").mutation(api.tasks.completeJd, { companyId: f.companyA, taskId, evidence: { text: "Old proof", files: [{ storageId, fileName: "proof.txt", claimId }] } });
+    const employee = f.asUser("employeeA1");
+    if (addedByRetry) await employee.mutation(api.tasks.completeJd, { companyId: f.companyA, taskId });
+    await employee.mutation(api.tasks.completeJd, { companyId: f.companyA, taskId, evidence: { text: "Old proof", files: [{ storageId, fileName: "proof.txt", claimId }] } });
     const request = (await manager.query(api.tasks.listAwaitingConfirmation, { companyId: f.companyA, taskType: "jd" })).rows[0];
     // Cycles now end on the 25th, so the current one starts 26 February.
     await admin.mutation(api.tasks.updateJdFields, { companyId: f.companyA, taskId, cycleEndMonthDay: 1225 });

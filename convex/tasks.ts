@@ -1560,7 +1560,11 @@ async function setJdStatus(ctx: MutationCtx, companyId: Id<"companies">, taskId:
     if (confirmer !== undefined && !isConfirmer && !alreadyCompleted) {
       // Someone other than the designated confirmer submitted: hold the
       // cycle. A retry for the same cycle keeps the original submission time.
-      if (!(await pendingConfirmationRequest(ctx, "jd", taskId, cycle.start, task))) {
+      const pending = await pendingConfirmationRequest(ctx, "jd", taskId, cycle.start, task);
+      if (pending) {
+        // Proof added by the retry belongs to the pending submission.
+        if (!activeEvidence && evidenceId) await ctx.db.patch(pending._id, { evidenceId });
+      } else {
         await ctx.db.insert("taskConfirmationRequests", {
           companyId,
           taskType: "jd",
